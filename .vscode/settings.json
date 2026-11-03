@@ -1,0 +1,8 @@
+{
+  // clangd runs outside the nix env: let it ask the pinned nix compiler
+  // wrappers for their system include dirs (libstdc++, glibc).
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=/nix/store/*-clang-wrapper-*/bin/clang++,/nix/store/*-gcc-wrapper-*/bin/g++"
+  ]
+}

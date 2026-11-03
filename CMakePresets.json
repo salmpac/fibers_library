@@ -1,0 +1,274 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "FIBERS_BUILD_TESTS": "ON",
+        "FIBERS_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "clang",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "FIBERS_LINK_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "gcc",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "clang-debug",
+      "displayName": "Clang Debug",
+      "inherits": "clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "clang-release",
+      "displayName": "Clang Release",
+      "inherits": "clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "clang-tsan",
+      "displayName": "Clang ThreadSanitizer",
+      "inherits": "clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "FIBERS_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "clang-asan",
+      "displayName": "Clang ASan + UBSan",
+      "inherits": "clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "FIBERS_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "twist",
+      "hidden": true,
+      "inherits": "clang",
+      "cacheVariables": {
+        "FIBERS_TWIST": "ON",
+        "FIBERS_BUILD_BENCHMARKS": "OFF",
+        "FIBERS_LINK_COMPILE_COMMANDS": "OFF",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "clang-twist-sim",
+      "displayName": "Clang Twist simulation",
+      "inherits": "twist",
+      "cacheVariables": {
+        "TWIST_FAULTY": "ON",
+        "TWIST_SIM": "ON",
+        "TWIST_SIM_ISOLATION": "ON"
+      }
+    },
+    {
+      "name": "clang-twist-faulty-tsan",
+      "displayName": "Clang Twist fault injection + TSan",
+      "inherits": "twist",
+      "cacheVariables": {
+        "TWIST_FAULTY": "ON",
+        "FIBERS_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "gcc-debug",
+      "displayName": "GCC Debug",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "gcc-release",
+      "displayName": "GCC Release",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "clang-debug",
+      "configurePreset": "clang-debug"
+    },
+    {
+      "name": "clang-release",
+      "configurePreset": "clang-release"
+    },
+    {
+      "name": "clang-tsan",
+      "configurePreset": "clang-tsan"
+    },
+    {
+      "name": "clang-asan",
+      "configurePreset": "clang-asan"
+    },
+    {
+      "name": "gcc-debug",
+      "configurePreset": "gcc-debug"
+    },
+    {
+      "name": "gcc-release",
+      "configurePreset": "gcc-release"
+    },
+    {
+      "name": "clang-twist-sim",
+      "configurePreset": "clang-twist-sim"
+    },
+    {
+      "name": "clang-twist-faulty-tsan",
+      "configurePreset": "clang-twist-faulty-tsan"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "clang-debug",
+      "inherits": "base",
+      "configurePreset": "clang-debug"
+    },
+    {
+      "name": "clang-release",
+      "inherits": "base",
+      "configurePreset": "clang-release"
+    },
+    {
+      "name": "clang-tsan",
+      "inherits": "base",
+      "configurePreset": "clang-tsan"
+    },
+    {
+      "name": "clang-asan",
+      "inherits": "base",
+      "configurePreset": "clang-asan"
+    },
+    {
+      "name": "gcc-debug",
+      "inherits": "base",
+      "configurePreset": "gcc-debug"
+    },
+    {
+      "name": "gcc-release",
+      "inherits": "base",
+      "configurePreset": "gcc-release"
+    },
+    {
+      "name": "clang-twist-sim",
+      "inherits": "base",
+      "configurePreset": "clang-twist-sim"
+    },
+    {
+      "name": "clang-twist-faulty-tsan",
+      "inherits": "base",
+      "configurePreset": "clang-twist-faulty-tsan"
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "clang-debug",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "clang-debug"
+        },
+        {
+          "type": "build",
+          "name": "clang-debug"
+        },
+        {
+          "type": "test",
+          "name": "clang-debug"
+        }
+      ]
+    },
+    {
+      "name": "clang-tsan",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "clang-tsan"
+        },
+        {
+          "type": "build",
+          "name": "clang-tsan"
+        },
+        {
+          "type": "test",
+          "name": "clang-tsan"
+        }
+      ]
+    },
+    {
+      "name": "clang-twist-sim",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "clang-twist-sim"
+        },
+        {
+          "type": "build",
+          "name": "clang-twist-sim"
+        },
+        {
+          "type": "test",
+          "name": "clang-twist-sim"
+        }
+      ]
+    },
+    {
+      "name": "clang-twist-faulty-tsan",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "clang-twist-faulty-tsan"
+        },
+        {
+          "type": "build",
+          "name": "clang-twist-faulty-tsan"
+        },
+        {
+          "type": "test",
+          "name": "clang-twist-faulty-tsan"
+        }
+      ]
+    }
+  ]
+}

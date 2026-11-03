@@ -1,0 +1,133 @@
+{
+  description = "fibers_library: work-stealing thread pool for fibers";
+
+  # Exact revisions of everything below are pinned in flake.lock.
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    # Twist (concurrency testing) and the sources its CMake fetches.
+    # Handed to CMake via FIBERS_DEP_* (see cmake/Twist.cmake): no network needed.
+    #
+    # Twist fetches its own deps at `master`, but its master (2026-05-22) lags
+    # behind them: sure renamed its target (sure -> sure-context) and sure-stack
+    # moved headers afterwards. So Lipovsky's libs are pinned to revisions
+    # contemporary with the Twist commit. Bump them together.
+    twist = { url = "gitlab:Lipovsky/twist/407b44e51a9d53c9fd5cbada08ada7a4a1cf029d"; flake = false; };
+    twist-futex-like = { url = "gitlab:Lipovsky/futex_like/d617dcb44f820476d73d1ea3ca4f987d8971a0e3"; flake = false; };
+    twist-spin-wait = { url = "gitlab:Lipovsky/spin_wait"; flake = false; };
+    twist-sure = { url = "gitlab:Lipovsky/sure/c60cbd9ce2c1dc4bb2e848f35d9e14e42d8c4956"; flake = false; };
+    twist-sure-stack = { url = "gitlab:Lipovsky/sure-stack/0c1fd3bbe12ad51ff8b55fffd0727aecb8e01271"; flake = false; };
+    twist-function2 = { url = "github:Naios/function2"; flake = false; };
+    twist-fmt = { url = "github:fmtlib/fmt"; flake = false; };
+    twist-json = { url = "https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz"; flake = false; };
+    twist-backward = { url = "github:bombela/backward-cpp"; flake = false; };
+  };
+
+  outputs = { self, nixpkgs, ... }@inputs:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+
+      # Pinned toolchains. Bump deliberately, never via the default `gcc`/`clang`.
+      # clang major should match the clangd used by the IDE (llvm21).
+      toolchains = pkgs: {
+        gcc = pkgs.gcc16Stdenv;
+        clang = pkgs.llvmPackages_21.stdenv;
+      };
+
+      # FIBERS_DEP_<NAME> = /nix/store/... for cmake/Twist.cmake
+      twistDepsEnv = {
+        FIBERS_DEP_TWIST = "${inputs.twist}";
+        FIBERS_DEP_FUTEX_LIKE = "${inputs.twist-futex-like}";
+        FIBERS_DEP_SPIN_WAIT = "${inputs.twist-spin-wait}";
+        FIBERS_DEP_SURE = "${inputs.twist-sure}";
+        FIBERS_DEP_SURE_STACK = "${inputs.twist-sure-stack}";
+        FIBERS_DEP_FUNCTION2 = "${inputs.twist-function2}";
+        FIBERS_DEP_FMT = "${inputs.twist-fmt}";
+        FIBERS_DEP_JSON = "${inputs.twist-json}";
+        FIBERS_DEP_BACKWARD = "${inputs.twist-backward}";
+      };
+
+      # twist: null | "sim" (deterministic simulation) | "faulty" (threads + fault injection)
+      mkFibers = pkgs: { compiler ? "gcc", sanitize ? "", twist ? null }:
+        let
+          lib = pkgs.lib;
+          stdenv = (toolchains pkgs).${compiler};
+          suffix = lib.optionalString (compiler != "gcc") "-${compiler}"
+            + lib.optionalString (twist != null) "-twist-${twist}"
+            + lib.optionalString (sanitize != "") "-${builtins.replaceStrings [ "," ] [ "-" ] sanitize}";
+          twistFlags = {
+            sim = [ "-DTWIST_FAULTY=ON" "-DTWIST_SIM=ON" "-DTWIST_SIM_ISOLATION=ON" ];
+            faulty = [ "-DTWIST_FAULTY=ON" ];
+          };
+        in
+        stdenv.mkDerivation ({
+          pname = "fibers${suffix}";
+          version = "0.1.0";
+
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./CMakeLists.txt
+              ./cmake
+              ./include
+              ./tests
+            ];
+          };
+
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja ];
+          checkInputs = [ pkgs.gtest ];
+
+          cmakeFlags = [
+            "-DFIBERS_BUILD_TESTS=ON"
+          ] ++ lib.optional (sanitize != "") "-DFIBERS_SANITIZE=${sanitize}"
+            ++ lib.optionals (twist != null) ([
+              "-DFIBERS_TWIST=ON"
+              "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
+            ] ++ twistFlags.${twist});
+
+          # Sanitizer runtimes do not get along with _FORTIFY_SOURCE.
+          hardeningDisable = lib.optional (sanitize != "") "fortify";
+
+          doCheck = true;
+        } // lib.optionalAttrs (twist != null) twistDepsEnv);
+
+      variants = pkgs: {
+        default = mkFibers pkgs { };
+        tsan = mkFibers pkgs { sanitize = "thread"; };
+        asan = mkFibers pkgs { sanitize = "address,undefined"; };
+        clang = mkFibers pkgs { compiler = "clang"; };
+        clang-tsan = mkFibers pkgs { compiler = "clang"; sanitize = "thread"; };
+        clang-asan = mkFibers pkgs { compiler = "clang"; sanitize = "address,undefined"; };
+        twist-sim = mkFibers pkgs { compiler = "clang"; twist = "sim"; };
+        twist-faulty-tsan = mkFibers pkgs { compiler = "clang"; twist = "faulty"; sanitize = "thread"; };
+      };
+    in
+    {
+      packages = forAllSystems variants;
+
+      checks = forAllSystems (pkgs: self.packages.${pkgs.stdenv.hostPlatform.system});
+
+      devShells = forAllSystems (pkgs:
+        let
+          tc = toolchains pkgs;
+          llvm = pkgs.llvmPackages_21;
+        in
+        {
+          # Both pinned compilers are on PATH: g++ (gcc16) and clang++ (llvm21).
+          # CMake presets pick one explicitly via CMAKE_CXX_COMPILER.
+          default = (pkgs.mkShell.override { stdenv = tc.gcc; }) ({
+            packages = [
+              llvm.clang
+              llvm.clang-tools
+              pkgs.cmake
+              pkgs.ninja
+              pkgs.gtest
+              pkgs.gbenchmark
+              pkgs.gdb
+            ];
+            hardeningDisable = [ "fortify" ];
+          } // twistDepsEnv);
+        });
+    };
+}

@@ -1,0 +1,181 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1793540411,
+        "narHash": "sha256-fiPJ88izTVucjeo2EQ3jk4aWmLg03I1D4vxnX2QjEgE=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "0bb2eedc20e4739f29e8045034f2828ad7054f8f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "twist": "twist",
+        "twist-backward": "twist-backward",
+        "twist-fmt": "twist-fmt",
+        "twist-function2": "twist-function2",
+        "twist-futex-like": "twist-futex-like",
+        "twist-json": "twist-json",
+        "twist-spin-wait": "twist-spin-wait",
+        "twist-sure": "twist-sure",
+        "twist-sure-stack": "twist-sure-stack"
+      }
+    },
+    "twist": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1779458181,
+        "narHash": "sha256-A7sDhG6Dg0KQMwpT8XLQbGY96NHXLuUasgkVRmDc6Qg=",
+        "owner": "Lipovsky",
+        "repo": "twist",
+        "rev": "407b44e51a9d53c9fd5cbada08ada7a4a1cf029d",
+        "type": "gitlab"
+      },
+      "original": {
+        "owner": "Lipovsky",
+        "repo": "twist",
+        "rev": "407b44e51a9d53c9fd5cbada08ada7a4a1cf029d",
+        "type": "gitlab"
+      }
+    },
+    "twist-backward": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792793744,
+        "narHash": "sha256-3ac8k+xHfI091p7h7SxpJfezTRa6y0BSratyJDC0vDs=",
+        "owner": "bombela",
+        "repo": "backward-cpp",
+        "rev": "78b2541c9d3c44bc81e2c5f4f34aa3503ac985de",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bombela",
+        "repo": "backward-cpp",
+        "type": "github"
+      }
+    },
+    "twist-fmt": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793553037,
+        "narHash": "sha256-+N1dahRblysC0bZtcPzoXdd/Elhxa0cMtuagQZW0VQw=",
+        "owner": "fmtlib",
+        "repo": "fmt",
+        "rev": "4ed3535092a96ac9f56fab80df83416d51bcc78e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "fmtlib",
+        "repo": "fmt",
+        "type": "github"
+      }
+    },
+    "twist-function2": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1752784341,
+        "narHash": "sha256-+a8+HHFmAUJouRlmoQyvluZcj3Ebpx2EWw6mMz8wx2o=",
+        "owner": "Naios",
+        "repo": "function2",
+        "rev": "496c20fede5378190fff471fcd7ee3d8705e5096",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Naios",
+        "repo": "function2",
+        "type": "github"
+      }
+    },
+    "twist-futex-like": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777481588,
+        "narHash": "sha256-h+pTCvfRNpBlQMWeUv0xUGIRa02ofoIaNb6dw3pvDz4=",
+        "owner": "Lipovsky",
+        "repo": "futex_like",
+        "rev": "d617dcb44f820476d73d1ea3ca4f987d8971a0e3",
+        "type": "gitlab"
+      },
+      "original": {
+        "owner": "Lipovsky",
+        "repo": "futex_like",
+        "rev": "d617dcb44f820476d73d1ea3ca4f987d8971a0e3",
+        "type": "gitlab"
+      }
+    },
+    "twist-json": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1701200283,
+        "narHash": "sha256-cnGfiVhXzqfj5Fay823wntWcTnbh8r2SefDLslb1Dh0=",
+        "type": "tarball",
+        "url": "https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz"
+      }
+    },
+    "twist-spin-wait": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1740152638,
+        "narHash": "sha256-P1+6mpK248XpcJWZQf7cqtnhwkHFE6nNtKjWgjDFtOk=",
+        "owner": "Lipovsky",
+        "repo": "spin_wait",
+        "rev": "1c558bec396264c031213c37a48bca0e9dca16c5",
+        "type": "gitlab"
+      },
+      "original": {
+        "owner": "Lipovsky",
+        "repo": "spin_wait",
+        "type": "gitlab"
+      }
+    },
+    "twist-sure": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777651429,
+        "narHash": "sha256-O7uIOTJGMgOm8WXyZd/tTQSyQLZgHWKngOqKckKt6ow=",
+        "owner": "Lipovsky",
+        "repo": "sure",
+        "rev": "c60cbd9ce2c1dc4bb2e848f35d9e14e42d8c4956",
+        "type": "gitlab"
+      },
+      "original": {
+        "owner": "Lipovsky",
+        "repo": "sure",
+        "rev": "c60cbd9ce2c1dc4bb2e848f35d9e14e42d8c4956",
+        "type": "gitlab"
+      }
+    },
+    "twist-sure-stack": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777557683,
+        "narHash": "sha256-hZiywSXGhgvqaX/fu6qYSWVjaXQ5GmbwAgpZjda0Dek=",
+        "owner": "Lipovsky",
+        "repo": "sure-stack",
+        "rev": "0c1fd3bbe12ad51ff8b55fffd0727aecb8e01271",
+        "type": "gitlab"
+      },
+      "original": {
+        "owner": "Lipovsky",
+        "repo": "sure-stack",
+        "rev": "0c1fd3bbe12ad51ff8b55fffd0727aecb8e01271",
+        "type": "gitlab"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
