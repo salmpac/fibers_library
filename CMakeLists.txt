@@ -60,8 +60,14 @@ target_include_directories(fibers_thread_pool INTERFACE
 target_compile_features(fibers_thread_pool INTERFACE cxx_std_20)
 target_link_libraries(fibers_thread_pool INTERFACE Threads::Threads)
 
+# Header-only sharded object pools: include/object_pool, namespace object_pool.
+add_library(fibers_object_pool INTERFACE)
+add_library(fibers::object_pool ALIAS fibers_object_pool)
+set_target_properties(fibers_object_pool PROPERTIES EXPORT_NAME object_pool)
+target_link_libraries(fibers_object_pool INTERFACE fibers_thread_pool)  # Sync policy
+
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(TARGETS fibers_thread_pool EXPORT fibersTargets)
+install(TARGETS fibers_thread_pool fibers_object_pool EXPORT fibersTargets)
 install(EXPORT fibersTargets
     NAMESPACE fibers::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fibers)
