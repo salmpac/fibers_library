@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "thread_pool/lock_free_spmc_queue.hpp"
 #include "thread_pool/locked_spsc_queue.hpp"
 #include "thread_pool/sharded_queue.hpp"
 #include "thread_pool/slow_queue.hpp"
@@ -92,7 +93,9 @@ template <class Sync>
 
 }  // namespace detail
 
-template <SyncPolicy Sync = StdSync, MainQueue Q = LockedSPSCQueue<Task, Sync>>
+// main_box defaults to the lock-free SPMC ring (owner push without RMW, one
+// CAS per popped/stolen batch); LockedSPSCQueue remains available as Q.
+template <SyncPolicy Sync = StdSync, MainQueue Q = LockFreeSPMCQueue<Task, Sync>>
 class ThreadPool {
 public:
     explicit ThreadPool(ThreadPoolOptions options = {}) : options_(normalize(options)) {
