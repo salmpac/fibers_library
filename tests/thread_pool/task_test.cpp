@@ -1,7 +1,5 @@
 #include <gtest/gtest.h>
 
-#include <memory>
-
 #include "thread_pool/task.hpp"
 
 using thread_pool::Task;
@@ -73,16 +71,3 @@ TEST(Task, NullDeletePtrIsAllowed) {
     EXPECT_EQ(called, 0);
 }
 
-TEST(Task, MakeOwnsCallable) {
-    auto alive = std::make_shared<int>(0);
-    std::weak_ptr<int> weak = alive;
-    Task t = Task::make([p = std::move(alive)] { ++*p; });
-    EXPECT_FALSE(weak.expired());
-    std::move(t).run();
-    EXPECT_TRUE(weak.expired());  // call_ptr released memo
-
-    auto alive2 = std::make_shared<int>(0);
-    weak = alive2;
-    { Task t2 = Task::make([p = std::move(alive2)] { ++*p; }); }
-    EXPECT_TRUE(weak.expired());  // delete_ptr released memo
-}

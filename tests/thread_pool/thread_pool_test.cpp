@@ -11,11 +11,14 @@
 
 #include "thread_pool/thread_pool.hpp"
 
+#include "heap_task.hpp"
+
 using namespace std::chrono_literals;
 using thread_pool::LockedSPSCQueue;
 using thread_pool::Task;
 using thread_pool::ThreadPool;
 using thread_pool::ThreadPoolOptions;
+using thread_pool::test::heap_task;
 
 static_assert(thread_pool::MainQueue<LockedSPSCQueue<Task>>);
 
@@ -61,8 +64,8 @@ bool wait_for(const std::atomic<std::size_t>& counter, std::size_t expected,
 void spawn_tree(ThreadPool<>& pool, std::atomic<std::size_t>& counter, int depth) {
     counter.fetch_add(1, std::memory_order_relaxed);
     if (depth == 0) return;
-    pool.submit([&pool, &counter, depth] { spawn_tree(pool, counter, depth - 1); });
-    pool.submit([&pool, &counter, depth] { spawn_tree(pool, counter, depth - 1); });
+    pool.submit(heap_task([&pool, &counter, depth] { spawn_tree(pool, counter, depth - 1); }));
+    pool.submit(heap_task([&pool, &counter, depth] { spawn_tree(pool, counter, depth - 1); }));
 }
 
 }  // namespace
@@ -77,7 +80,7 @@ TEST(ThreadPool, RunsTasksFromExternalThreads) {
     for (int p = 0; p < kProducers; ++p) {
         producers.emplace_back([&] {
             for (std::size_t i = 0; i < kPerProducer; ++i) {
-                pool.submit([&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
+                pool.submit(heap_task([&counter] { counter.fetch_add(1, std::memory_order_relaxed); }));
             }
         });
     }
@@ -89,7 +92,7 @@ TEST(ThreadPool, RecursiveSpawnFromWorkers) {
     constexpr int kDepth = 16;
     ThreadPool<> pool(ThreadPoolOptions{.num_workers = 4});
     std::atomic<std::size_t> counter{0};
-    pool.submit([&] { spawn_tree(pool, counter, kDepth); });
+    pool.submit(heap_task([&] { spawn_tree(pool, counter, kDepth); }));
     EXPECT_TRUE(wait_for(counter, (std::size_t{1} << (kDepth + 1)) - 1));
 }
 
@@ -108,7 +111,7 @@ TEST(ThreadPool, TinyQueuesFallBackToOverflow) {
     for (int p = 0; p < 3; ++p) {
         producers.emplace_back([&] {
             for (int i = 0; i < 20'000; ++i) {
-                pool.submit([&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
+                pool.submit(heap_task([&counter] { counter.fetch_add(1, std::memory_order_relaxed); }));
             }
         });
     }
@@ -126,7 +129,7 @@ TEST(ThreadPool, TinyQueuesRecursiveSpawn) {
         .batch_size = 1,
     });
     std::atomic<std::size_t> counter{0};
-    pool.submit([&] { spawn_tree(pool, counter, kDepth); });
+    pool.submit(heap_task([&] { spawn_tree(pool, counter, kDepth); }));
     EXPECT_TRUE(wait_for(counter, (std::size_t{1} << (kDepth + 1)) - 1));
 }
 
@@ -138,18 +141,18 @@ TEST(ThreadPool, WorkIsStolenByIdleWorkers) {
     std::set<std::thread::id> ids;
 
     // All children land in a single worker's main_box.
-    pool.submit([&] {
+    pool.submit(heap_task([&] {
         for (std::size_t i = 0; i < kTasks; ++i) {
-            pool.submit([&] {
+            pool.submit(heap_task([&] {
                 std::this_thread::sleep_for(2ms);
                 {
                     std::lock_guard guard(mutex);
                     ids.insert(std::this_thread::get_id());
                 }
                 counter.fetch_add(1);
-            });
+            }));
         }
-    });
+    }));
     ASSERT_TRUE(wait_for(counter, kTasks));
     std::lock_guard guard(mutex);
     EXPECT_GT(ids.size(), 1u);
@@ -179,7 +182,7 @@ TEST(ThreadPool, StopDropsPendingTasksWithoutLeaks) {
 
     {
         ThreadPool<> pool(ThreadPoolOptions{.num_workers = 2});
-        for (std::size_t i = 0; i < kTasks; ++i) pool.submit(Probe(&ran, &dropped));
+        for (std::size_t i = 0; i < kTasks; ++i) pool.submit(heap_task(Probe(&ran, &dropped)));
         std::this_thread::sleep_for(10ms);
     }
     EXPECT_EQ(ran.load() + dropped.load(), kTasks);
@@ -190,7 +193,7 @@ TEST(ThreadPool, InWorkerThread) {
     ThreadPool<> pool(ThreadPoolOptions{.num_workers = 1});
     EXPECT_FALSE(pool.in_worker_thread());
     std::atomic<std::size_t> inside{0};
-    pool.submit([&] { inside.store(pool.in_worker_thread() ? 1 : 2); });
+    pool.submit(heap_task([&] { inside.store(pool.in_worker_thread() ? 1 : 2); }));
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     while (inside.load() == 0 && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
@@ -209,7 +212,7 @@ TEST(ThreadPool, CustomSyncPolicyIsUsed) {
             .batch_size = 1,
         });
         for (int i = 0; i < 10'000; ++i) {
-            pool.submit([&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
+            pool.submit(heap_task([&counter] { counter.fetch_add(1, std::memory_order_relaxed); }));
         }
         EXPECT_TRUE(wait_for(counter, 10'000));
         // No work left: idle workers must reach Sync::spin_hint soon.
@@ -231,20 +234,20 @@ TEST(ThreadPool, TasksOfBlockedWorkerAreStolen) {
     std::atomic<std::size_t> ran_on_spammer{0};
     std::atomic<std::thread::id> spammer{};
 
-    pool.submit([&] {
+    pool.submit(heap_task([&] {
         spammer.store(std::this_thread::get_id());
         for (std::size_t i = 0; i < kTasks; ++i) {
-            pool.submit([&] {
+            pool.submit(heap_task([&] {
                 if (std::this_thread::get_id() == spammer.load()) ran_on_spammer.fetch_add(1);
                 counter.fetch_add(1, std::memory_order_relaxed);
-            });
+            }));
         }
         // Stay blocked until the others have drained everything (bounded).
         const auto deadline = std::chrono::steady_clock::now() + 60s;
         while (counter.load() < kTasks && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-    });
+    }));
     EXPECT_TRUE(wait_for(counter, kTasks));
     EXPECT_EQ(ran_on_spammer.load(), 0u);
 }
@@ -297,12 +300,12 @@ TEST(ThreadPool, SubmitBatchOverflowsWithTinyQueues) {
     std::atomic<std::size_t> counter{0};
 
     // From a worker: main_box (cap 2) + overflow_box.
-    pool.submit([&] {
+    pool.submit(heap_task([&] {
         for (std::size_t b = 0; b < kBatches; ++b) {
             auto tasks = make_count_tasks(counter, kChunk);
             pool.submit_batch(tasks);
         }
-    });
+    }));
     // From outside: mail_box shards (cap 2) + overflow_box.
     for (std::size_t b = 0; b < kBatches; ++b) {
         auto tasks = make_count_tasks(counter, kChunk);
@@ -315,6 +318,6 @@ TEST(ThreadPool, WorksWithoutStealBackoff) {
     constexpr int kDepth = 14;
     ThreadPool<> pool(ThreadPoolOptions{.num_workers = 4, .max_steal_backoff = 0});
     std::atomic<std::size_t> counter{0};
-    pool.submit([&] { spawn_tree(pool, counter, kDepth); });
+    pool.submit(heap_task([&] { spawn_tree(pool, counter, kDepth); }));
     EXPECT_TRUE(wait_for(counter, (std::size_t{1} << (kDepth + 1)) - 1));
 }

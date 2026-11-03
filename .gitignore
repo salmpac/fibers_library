@@ -3,3 +3,4 @@ result*
 .cache/
 compile_commands.json
 .direnv/
+.claude/

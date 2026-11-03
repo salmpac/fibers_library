@@ -1,7 +1,5 @@
 #pragma once
 
-#include <concepts>
-#include <type_traits>
 #include <utility>
 
 namespace thread_pool {
@@ -16,6 +14,8 @@ namespace thread_pool {
 //   * A Task is empty iff call_ptr == nullptr. memo itself may be nullptr.
 //
 // Task is move-only; destroying a non-empty Task calls delete_ptr.
+// The pool never allocates: where memo lives (object pools, fiber structs,
+// ...) is entirely the caller's business.
 class Task {
 public:
     using CallFn = void (*)(void*) noexcept;
@@ -25,15 +25,6 @@ public:
 
     Task(void* memo, CallFn call_ptr, DeleteFn delete_ptr) noexcept
         : memo_(memo), call_ptr_(call_ptr), delete_ptr_(delete_ptr) {}
-
-    // Heap-allocates a copy of `f`. If `f` throws, std::terminate is called.
-    template <class F>
-        requires(!std::same_as<std::decay_t<F>, Task>) &&
-                std::invocable<std::decay_t<F>&>
-    static Task make(F&& f) {
-        using Fn = std::decay_t<F>;
-        return Task(new Fn(std::forward<F>(f)), &call_impl<Fn>, &delete_impl<Fn>);
-    }
 
     Task(const Task&) = delete;
     Task& operator=(const Task&) = delete;
@@ -68,18 +59,6 @@ public:
     }
 
 private:
-    template <class Fn>
-    static void call_impl(void* memo) noexcept {
-        Fn* fn = static_cast<Fn*>(memo);
-        (*fn)();
-        delete fn;
-    }
-
-    template <class Fn>
-    static void delete_impl(void* memo) noexcept {
-        delete static_cast<Fn*>(memo);
-    }
-
     void* memo_ = nullptr;
     CallFn call_ptr_ = nullptr;
     DeleteFn delete_ptr_ = nullptr;

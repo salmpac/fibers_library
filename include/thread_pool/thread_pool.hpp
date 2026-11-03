@@ -140,12 +140,6 @@ public:
         }
     }
 
-    template <class F>
-        requires(!std::same_as<std::decay_t<F>, Task>) && std::invocable<std::decay_t<F>&>
-    void submit(F&& f) {
-        submit(Task::make(std::forward<F>(f)));
-    }
-
     // Submits tasks[0..count), moving from them. Precondition: none is empty.
     // From a worker of this pool: one batched push into its own main_box.
     // From any other thread: chunks of batch_size go round-robin to the
