@@ -44,14 +44,33 @@ struct PoolOptions {
     std::size_t initial_objects = 1024;  // preallocated, spread over shards
     std::size_t grow_chunk = 256;        // objects allocated when all shards are empty
     ShardSelect select = ShardSelect::kRoundRobin;
+    // Upper bound on threads inside acquire()/release() at the same time.
+    // Sizes per-thread tables of the lock-free variants: AtomicPointer slot
+    // tables (4 * max_threads slots per shard) and hazard slots (min(max_threads,
+    // 16) per shard); the other pools ignore it. Exceeding it is safe (never a
+    // deadlock) but makes extra threads spin until a slot frees.
+    std::size_t max_threads = 64;
 };
 
 namespace detail {
 
 struct PoolThreadState {
     std::uint64_t cursor = 0;
+    std::uint64_t rng = 0;  // xorshift64 state, never 0 once seeded
+    std::size_t hazard_hint = 0;    // hazard-pointer slot that worked last time
+    std::size_t ticket_cursor = 0;  // AtomicPointer slot-bag scan position
     bool seeded = false;
 };
+
+// Cheap per-thread randomness (start positions of table scans).
+inline std::uint64_t next_random(PoolThreadState& state) noexcept {
+    std::uint64_t x = state.rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    state.rng = x;
+    return x;
+}
 
 // Same rules as thread_pool::detail::thread_state(): fibers may migrate
 // between threads, so the thread-local is reached only through a call that is
@@ -62,6 +81,9 @@ template <class Sync>
     PoolThreadState& state = Sync::template thread_local_instance<PoolThreadState>();
     if (!state.seeded) [[unlikely]] {
         state.cursor = static_cast<std::uint64_t>(Sync::random_seed());
+        state.rng = static_cast<std::uint64_t>(Sync::random_seed()) | 1;
+        state.ticket_cursor = static_cast<std::size_t>(next_random(state));
+        state.hazard_hint = static_cast<std::size_t>(next_random(state));
         state.seeded = true;
     }
     return state;
@@ -70,6 +92,7 @@ template <class Sync>
 inline PoolOptions normalize(PoolOptions options) {
     options.shards = std::max<std::size_t>(options.shards, 1);
     options.grow_chunk = std::max<std::size_t>(options.grow_chunk, 1);
+    options.max_threads = std::max<std::size_t>(options.max_threads, 1);
     return options;
 }
 
