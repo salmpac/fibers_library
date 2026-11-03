@@ -5,22 +5,27 @@
 #include <cstddef>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "thread_pool/lock_free_spmc_queue.hpp"
 #include "thread_pool/thread_pool.hpp"
 
 #include "heap_task.hpp"
 
 using namespace std::chrono_literals;
 using thread_pool::LockedSPSCQueue;
+using thread_pool::LockFreeSPMCQueue;
 using thread_pool::Task;
 using thread_pool::ThreadPool;
 using thread_pool::ThreadPoolOptions;
 using thread_pool::test::heap_task;
 
 static_assert(thread_pool::MainQueue<LockedSPSCQueue<Task>>);
+static_assert(thread_pool::MainQueue<LockFreeSPMCQueue<Task>>);
 
 namespace {
 
@@ -61,7 +66,29 @@ bool wait_for(const std::atomic<std::size_t>& counter, std::size_t expected,
     return counter.load() == expected;
 }
 
-void spawn_tree(ThreadPool<>& pool, std::atomic<std::size_t>& counter, int depth) {
+// Every ThreadPool test runs once per main_box implementation.
+struct LockedMainBox {
+    template <class Sync>
+    using Queue = LockedSPSCQueue<Task, Sync>;
+};
+
+struct LockFreeMainBox {
+    template <class Sync>
+    using Queue = LockFreeSPMCQueue<Task, Sync>;
+};
+
+template <class Box, class Sync = thread_pool::StdSync>
+using PoolOf = ThreadPool<Sync, typename Box::template Queue<Sync>>;
+
+struct MainBoxName {
+    template <class Box>
+    static std::string GetName(int) {
+        return std::is_same_v<Box, LockedMainBox> ? "LockedSPSC" : "LockFreeSPMC";
+    }
+};
+
+template <class Pool>
+void spawn_tree(Pool& pool, std::atomic<std::size_t>& counter, int depth) {
     counter.fetch_add(1, std::memory_order_relaxed);
     if (depth == 0) return;
     pool.submit(heap_task([&pool, &counter, depth] { spawn_tree(pool, counter, depth - 1); }));
@@ -70,10 +97,17 @@ void spawn_tree(ThreadPool<>& pool, std::atomic<std::size_t>& counter, int depth
 
 }  // namespace
 
-TEST(ThreadPool, RunsTasksFromExternalThreads) {
+template <class Box>
+class ThreadPoolTest : public ::testing::Test {};
+
+using MainBoxes = ::testing::Types<LockedMainBox, LockFreeMainBox>;
+TYPED_TEST_SUITE(ThreadPoolTest, MainBoxes, MainBoxName);
+
+TYPED_TEST(ThreadPoolTest, RunsTasksFromExternalThreads) {
+    using Pool = PoolOf<TypeParam>;
     constexpr int kProducers = 4;
     constexpr std::size_t kPerProducer = 50'000;
-    ThreadPool<> pool(ThreadPoolOptions{.num_workers = 4});
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
     std::atomic<std::size_t> counter{0};
 
     std::vector<std::thread> producers;
@@ -88,16 +122,18 @@ TEST(ThreadPool, RunsTasksFromExternalThreads) {
     EXPECT_TRUE(wait_for(counter, kProducers * kPerProducer));
 }
 
-TEST(ThreadPool, RecursiveSpawnFromWorkers) {
+TYPED_TEST(ThreadPoolTest, RecursiveSpawnFromWorkers) {
+    using Pool = PoolOf<TypeParam>;
     constexpr int kDepth = 16;
-    ThreadPool<> pool(ThreadPoolOptions{.num_workers = 4});
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
     std::atomic<std::size_t> counter{0};
     pool.submit(heap_task([&] { spawn_tree(pool, counter, kDepth); }));
     EXPECT_TRUE(wait_for(counter, (std::size_t{1} << (kDepth + 1)) - 1));
 }
 
-TEST(ThreadPool, TinyQueuesFallBackToOverflow) {
-    ThreadPool<> pool(ThreadPoolOptions{
+TYPED_TEST(ThreadPoolTest, TinyQueuesFallBackToOverflow) {
+    using Pool = PoolOf<TypeParam>;
+    Pool pool(ThreadPoolOptions{
         .num_workers = 3,
         .main_box_capacity = 2,
         .mail_box_shards = 1,
@@ -119,9 +155,10 @@ TEST(ThreadPool, TinyQueuesFallBackToOverflow) {
     EXPECT_TRUE(wait_for(counter, 60'000));
 }
 
-TEST(ThreadPool, TinyQueuesRecursiveSpawn) {
+TYPED_TEST(ThreadPoolTest, TinyQueuesRecursiveSpawn) {
+    using Pool = PoolOf<TypeParam>;
     constexpr int kDepth = 12;
-    ThreadPool<> pool(ThreadPoolOptions{
+    Pool pool(ThreadPoolOptions{
         .num_workers = 3,
         .main_box_capacity = 2,
         .mail_box_shards = 1,
@@ -133,9 +170,10 @@ TEST(ThreadPool, TinyQueuesRecursiveSpawn) {
     EXPECT_TRUE(wait_for(counter, (std::size_t{1} << (kDepth + 1)) - 1));
 }
 
-TEST(ThreadPool, WorkIsStolenByIdleWorkers) {
+TYPED_TEST(ThreadPoolTest, WorkIsStolenByIdleWorkers) {
+    using Pool = PoolOf<TypeParam>;
     constexpr std::size_t kTasks = 64;
-    ThreadPool<> pool(ThreadPoolOptions{.num_workers = 4});
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
     std::atomic<std::size_t> counter{0};
     std::mutex mutex;
     std::set<std::thread::id> ids;
@@ -158,7 +196,8 @@ TEST(ThreadPool, WorkIsStolenByIdleWorkers) {
     EXPECT_GT(ids.size(), 1u);
 }
 
-TEST(ThreadPool, StopDropsPendingTasksWithoutLeaks) {
+TYPED_TEST(ThreadPoolTest, StopDropsPendingTasksWithoutLeaks) {
+    using Pool = PoolOf<TypeParam>;
     constexpr std::size_t kTasks = 2'000;
     std::atomic<std::size_t> ran{0};
     std::atomic<std::size_t> dropped{0};
@@ -181,7 +220,7 @@ TEST(ThreadPool, StopDropsPendingTasksWithoutLeaks) {
     };
 
     {
-        ThreadPool<> pool(ThreadPoolOptions{.num_workers = 2});
+        Pool pool(ThreadPoolOptions{.num_workers = 2});
         for (std::size_t i = 0; i < kTasks; ++i) pool.submit(heap_task(Probe(&ran, &dropped)));
         std::this_thread::sleep_for(10ms);
     }
@@ -189,8 +228,9 @@ TEST(ThreadPool, StopDropsPendingTasksWithoutLeaks) {
     EXPECT_GT(dropped.load(), 0u);
 }
 
-TEST(ThreadPool, InWorkerThread) {
-    ThreadPool<> pool(ThreadPoolOptions{.num_workers = 1});
+TYPED_TEST(ThreadPoolTest, InWorkerThread) {
+    using Pool = PoolOf<TypeParam>;
+    Pool pool(ThreadPoolOptions{.num_workers = 1});
     EXPECT_FALSE(pool.in_worker_thread());
     std::atomic<std::size_t> inside{0};
     pool.submit(heap_task([&] { inside.store(pool.in_worker_thread() ? 1 : 2); }));
@@ -201,10 +241,13 @@ TEST(ThreadPool, InWorkerThread) {
     EXPECT_EQ(inside.load(), 1u);
 }
 
-TEST(ThreadPool, CustomSyncPolicyIsUsed) {
+TYPED_TEST(ThreadPoolTest, CustomSyncPolicyIsUsed) {
+    // Fresh counts for this instantiation (the globals are shared by all).
+    g_mutex_locks.store(0);
+    g_spin_hints.store(0);
     std::atomic<std::size_t> counter{0};
     {
-        ThreadPool<CountingSync> pool(ThreadPoolOptions{
+        PoolOf<TypeParam, CountingSync> pool(ThreadPoolOptions{
             .num_workers = 2,
             .main_box_capacity = 2,
             .mail_box_shards = 1,
@@ -227,9 +270,10 @@ TEST(ThreadPool, CustomSyncPolicyIsUsed) {
 
 // A worker blocked inside a task that keeps spawning: everything it spawns must
 // be executed by the other workers through work stealing.
-TEST(ThreadPool, TasksOfBlockedWorkerAreStolen) {
+TYPED_TEST(ThreadPoolTest, TasksOfBlockedWorkerAreStolen) {
+    using Pool = PoolOf<TypeParam>;
     constexpr std::size_t kTasks = 200'000;
-    ThreadPool<> pool(ThreadPoolOptions{.num_workers = 4});
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
     std::atomic<std::size_t> counter{0};
     std::atomic<std::size_t> ran_on_spammer{0};
     std::atomic<std::thread::id> spammer{};
@@ -267,10 +311,11 @@ std::vector<Task> make_count_tasks(std::atomic<std::size_t>& counter, std::size_
 
 }  // namespace
 
-TEST(ThreadPool, SubmitBatchFromExternalThreads) {
+TYPED_TEST(ThreadPoolTest, SubmitBatchFromExternalThreads) {
+    using Pool = PoolOf<TypeParam>;
     constexpr std::size_t kPerThread = 100'000;
     constexpr std::size_t kChunk = 1'000;
-    ThreadPool<> pool(ThreadPoolOptions{.num_workers = 4});
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
     std::atomic<std::size_t> counter{0};
 
     std::vector<std::thread> producers;
@@ -287,10 +332,11 @@ TEST(ThreadPool, SubmitBatchFromExternalThreads) {
     EXPECT_TRUE(wait_for(counter, 2 * kPerThread));
 }
 
-TEST(ThreadPool, SubmitBatchOverflowsWithTinyQueues) {
+TYPED_TEST(ThreadPoolTest, SubmitBatchOverflowsWithTinyQueues) {
+    using Pool = PoolOf<TypeParam>;
     constexpr std::size_t kBatches = 500;
     constexpr std::size_t kChunk = 100;
-    ThreadPool<> pool(ThreadPoolOptions{
+    Pool pool(ThreadPoolOptions{
         .num_workers = 3,
         .main_box_capacity = 2,
         .mail_box_shards = 1,
@@ -314,9 +360,10 @@ TEST(ThreadPool, SubmitBatchOverflowsWithTinyQueues) {
     EXPECT_TRUE(wait_for(counter, 2 * kBatches * kChunk));
 }
 
-TEST(ThreadPool, WorksWithoutStealBackoff) {
+TYPED_TEST(ThreadPoolTest, WorksWithoutStealBackoff) {
+    using Pool = PoolOf<TypeParam>;
     constexpr int kDepth = 14;
-    ThreadPool<> pool(ThreadPoolOptions{.num_workers = 4, .max_steal_backoff = 0});
+    Pool pool(ThreadPoolOptions{.num_workers = 4, .max_steal_backoff = 0});
     std::atomic<std::size_t> counter{0};
     pool.submit(heap_task([&] { spawn_tree(pool, counter, kDepth); }));
     EXPECT_TRUE(wait_for(counter, (std::size_t{1} << (kDepth + 1)) - 1));

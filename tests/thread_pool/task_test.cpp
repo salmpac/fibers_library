@@ -71,3 +71,51 @@ TEST(Task, NullDeletePtrIsAllowed) {
     EXPECT_EQ(called, 0);
 }
 
+TEST(Task, ReleaseGivesUpOwnershipWithoutDeleting) {
+    Counters c;
+    Task::Raw raw;
+    {
+        Task t = raw_task(c);
+        raw = t.release();
+        EXPECT_FALSE(t);
+    }  // t is empty: destroying it must not call delete_ptr
+    EXPECT_EQ(c.deleted, 0);
+    EXPECT_EQ(c.called, 0);
+    EXPECT_EQ(raw.memo, &c);
+    EXPECT_NE(raw.call_ptr, nullptr);
+    EXPECT_NE(raw.delete_ptr, nullptr);
+
+    Task back = Task::from_raw(raw);
+    ASSERT_TRUE(back);
+    std::move(back).run();
+    EXPECT_EQ(c.called, 1);
+    EXPECT_EQ(c.deleted, 0);
+}
+
+TEST(Task, FromRawOwnsAndDropsOnDestruction) {
+    Counters c;
+    Task t = raw_task(c);
+    { Task owner = Task::from_raw(t.release()); }
+    EXPECT_EQ(c.deleted, 1);
+    EXPECT_EQ(c.called, 0);
+}
+
+TEST(Task, ReleaseOfEmptyTaskIsEmptyRaw) {
+    Task t;
+    const Task::Raw raw = t.release();
+    EXPECT_EQ(raw.call_ptr, nullptr);
+    EXPECT_FALSE(Task::from_raw(raw));
+    EXPECT_FALSE(Task::from_raw(Task::Raw{}));
+}
+
+TEST(Task, RawRoundTripKeepsFields) {
+    int memo = 0;
+    auto call = [](void* m) noexcept { ++*static_cast<int*>(m); };
+    Task t(&memo, call, nullptr);
+    const Task::Raw raw = t.release();
+    EXPECT_EQ(raw.memo, &memo);
+    EXPECT_EQ(raw.delete_ptr, nullptr);
+    Task back = Task::from_raw(raw);
+    std::move(back).run();
+    EXPECT_EQ(memo, 1);
+}

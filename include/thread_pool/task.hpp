@@ -21,6 +21,17 @@ public:
     using CallFn = void (*)(void*) noexcept;
     using DeleteFn = void (*)(void*) noexcept;
 
+    // The three fields as plain data, without ownership semantics. Lets
+    // lock-free containers keep a task in atomic words (see
+    // LockFreeSPMCQueue): release() hands ownership out as a Raw, from_raw()
+    // takes it back. Copying a Raw does not copy ownership; exactly one copy
+    // may be turned back into a Task.
+    struct Raw {
+        void* memo = nullptr;
+        CallFn call_ptr = nullptr;
+        DeleteFn delete_ptr = nullptr;
+    };
+
     Task() noexcept = default;
 
     Task(void* memo, CallFn call_ptr, DeleteFn delete_ptr) noexcept
@@ -50,6 +61,16 @@ public:
 
     // Executes the task; the Task becomes empty. Precondition: non-empty.
     void run() && noexcept { std::exchange(call_ptr_, nullptr)(memo_); }
+
+    // Gives up ownership WITHOUT calling delete_ptr; the Task becomes empty.
+    // The caller now owns the returned fields (call_ptr == nullptr iff the
+    // Task was empty).
+    [[nodiscard]] Raw release() noexcept {
+        return Raw{memo_, std::exchange(call_ptr_, nullptr), delete_ptr_};
+    }
+
+    // Takes ownership of `raw` (typically obtained from release()).
+    static Task from_raw(Raw raw) noexcept { return Task(raw.memo, raw.call_ptr, raw.delete_ptr); }
 
     // Drops the task without executing it; the Task becomes empty.
     void reset() noexcept {

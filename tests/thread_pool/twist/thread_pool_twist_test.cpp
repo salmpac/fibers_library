@@ -8,6 +8,8 @@
 //
 // Scenarios are tiny on purpose (simulation is slow), but queues are tiny too,
 // so overflow, stealing from mail/main/overflow boxes and stop all get hit.
+// Every pool scenario runs once per main_box implementation; the lock-free
+// main_box also gets a direct owner + thieves scenario.
 
 #include <gtest/gtest.h>
 
@@ -16,9 +18,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include <twist/assist/assert.hpp>
+#include <twist/assist/shared.hpp>
 #include <twist/cross.hpp>
 #include <twist/ed/std/atomic.hpp>
 #include <twist/ed/std/thread.hpp>
@@ -27,6 +32,7 @@
 #include <twist/sim.hpp>
 #endif
 
+#include "thread_pool/lock_free_spmc_queue.hpp"
 #include "thread_pool/thread_pool.hpp"
 #include "thread_pool/twist_sync.hpp"
 
@@ -34,7 +40,6 @@ namespace tp = thread_pool;
 
 namespace {
 
-using Pool = tp::ThreadPool<tp::TwistSync>;
 using Counter = twist::ed::std::atomic<std::size_t>;
 
 std::size_t env_or(const char* name, std::size_t fallback) {
@@ -109,9 +114,26 @@ void count_task(void* memo) noexcept { static_cast<Counter*>(memo)->fetch_add(1)
 
 tp::Task count(Counter& counter) { return tp::Task(&counter, &count_task, nullptr); }
 
+using LockedPool = tp::ThreadPool<tp::TwistSync, tp::LockedSPSCQueue<tp::Task, tp::TwistSync>>;
+using LockFreePool = tp::ThreadPool<tp::TwistSync, tp::LockFreeSPMCQueue<tp::Task, tp::TwistSync>>;
+
+struct PoolName {
+    template <class Pool>
+    static std::string GetName(int) {
+        return std::is_same_v<Pool, LockedPool> ? "LockedSPSC" : "LockFreeSPMC";
+    }
+};
+
 }  // namespace
 
-TEST(ThreadPoolTwist, ExternalSubmitAndBatch) {
+template <class Pool>
+class ThreadPoolTwist : public ::testing::Test {};
+
+using Pools = ::testing::Types<LockedPool, LockFreePool>;
+TYPED_TEST_SUITE(ThreadPoolTwist, Pools, PoolName);
+
+TYPED_TEST(ThreadPoolTwist, ExternalSubmitAndBatch) {
+    using Pool = TypeParam;
     check([] {
         Counter done{0};
         Pool pool(tiny(2));
@@ -129,7 +151,8 @@ TEST(ThreadPoolTwist, ExternalSubmitAndBatch) {
     });
 }
 
-TEST(ThreadPoolTwist, ConcurrentExternalProducers) {
+TYPED_TEST(ThreadPoolTwist, ConcurrentExternalProducers) {
+    using Pool = TypeParam;
     // One mail_box shard per worker: producers have to share it.
     check([] {
         Counter done{0};
@@ -155,7 +178,8 @@ TEST(ThreadPoolTwist, ConcurrentExternalProducers) {
     });
 }
 
-TEST(ThreadPoolTwist, RecursiveSpawnFromWorkers) {
+TYPED_TEST(ThreadPoolTwist, RecursiveSpawnFromWorkers) {
+    using Pool = TypeParam;
     // Binary tree of depth 3 = 15 tasks, spawned from inside the workers.
     check([] {
         Counter done{0};
@@ -193,7 +217,8 @@ TEST(ThreadPoolTwist, RecursiveSpawnFromWorkers) {
     });
 }
 
-TEST(ThreadPoolTwist, TasksOfBlockedWorkerAreStolen) {
+TYPED_TEST(ThreadPoolTwist, TasksOfBlockedWorkerAreStolen) {
+    using Pool = TypeParam;
     check([] {
         static constexpr std::size_t kTasks = 6;
         Counter done{0};
@@ -222,7 +247,8 @@ TEST(ThreadPoolTwist, TasksOfBlockedWorkerAreStolen) {
     });
 }
 
-TEST(ThreadPoolTwist, StopDropsPendingTasks) {
+TYPED_TEST(ThreadPoolTwist, StopDropsPendingTasks) {
+    using Pool = TypeParam;
     check([] {
         static constexpr std::size_t kTasks = 8;
         Counter ran{0};
@@ -249,5 +275,82 @@ TEST(ThreadPoolTwist, StopDropsPendingTasks) {
         }  // queues destroyed: pending tasks dropped
         TWIST_ASSERT_M(ran.load() + dropped.load() == kTasks,
                        "each task is either run or dropped, exactly once");
+    });
+}
+
+// The lock-free main_box on its own: the owner pushes (single and batched) and
+// pops, two thieves steal. Each task's memo is plain shared data (checked for
+// happens-before by the simulator) written by the owner before the push, so a
+// broken publication shows up at the memo too, not only at the queue's probes.
+TEST(LockFreeSPMCQueueTwist, OwnerAndThieves) {
+    check([] {
+        static constexpr std::size_t kTasks = 6;
+        using Queue = tp::LockFreeSPMCQueue<tp::Task, tp::TwistSync>;
+
+        struct Memo {
+            twist::assist::Shared<std::size_t> payload{std::size_t{0}};
+            Counter runs{0};
+        };
+        struct Work {
+            static void run(void* m) noexcept {
+                auto* memo = static_cast<Memo*>(m);
+                TWIST_ASSERT_M(memo->payload.Read() == 7, "memo published");
+                memo->runs.fetch_add(1);
+            }
+            static void drop(void* m) noexcept {
+                auto* memo = static_cast<Memo*>(m);
+                TWIST_ASSERT_M(memo->payload.Read() == 7, "memo published");
+                memo->runs.fetch_add(1);  // dropped counts as consumed once
+            }
+        };
+
+        Memo memos[kTasks];
+        Counter stop{0};
+        {
+            Queue queue(2);
+            auto steal = [&] {
+                tp::Task buf[2];
+                while (stop.load() == 0) {
+                    const std::size_t n = queue.try_steal_batch(buf, 2);
+                    for (std::size_t i = 0; i < n; ++i) std::move(buf[i]).run();
+                    if (n == 0) twist::ed::std::this_thread::yield();
+                }
+            };
+            twist::ed::std::thread thief1(steal);
+            twist::ed::std::thread thief2(steal);
+
+            tp::Task out[2];
+            auto pop = [&] {
+                const std::size_t n = queue.try_pop_batch(out, 2);
+                for (std::size_t i = 0; i < n; ++i) std::move(out[i]).run();
+            };
+            for (std::size_t next = 0; next < kTasks;) {
+                *memos[next].payload = 7;
+                if (next % 2 == 0 && next + 1 < kTasks) {
+                    *memos[next + 1].payload = 7;
+                    tp::Task in[2] = {tp::Task(&memos[next], &Work::run, &Work::drop),
+                                      tp::Task(&memos[next + 1], &Work::run, &Work::drop)};
+                    const std::size_t pushed = queue.try_push_batch(in, 2);
+                    for (std::size_t i = pushed; i < 2; ++i) static_cast<void>(in[i].release());
+                    next += pushed;
+                } else {
+                    tp::Task task(&memos[next], &Work::run, &Work::drop);
+                    if (queue.try_push(std::move(task))) {
+                        ++next;
+                    } else {
+                        static_cast<void>(task.release());
+                    }
+                }
+                if (next == 3) pop();
+                if (queue.free_space() == 0) twist::ed::std::this_thread::yield();
+            }
+            pop();
+            stop.store(1);
+            thief1.join();
+            thief2.join();
+        }  // queue destroyed: whatever is left is dropped
+        for (Memo& memo : memos) {
+            TWIST_ASSERT_M(memo.runs.load() == 1, "each task taken exactly once");
+        }
     });
 }

@@ -15,6 +15,11 @@
 #include <twist/ed/std/thread.hpp>
 #include <twist/ed/wait/spin.hpp>
 
+#if defined(__TWIST_SIM__)
+#include <twist/assist/preempt.hpp>
+#include <twist/assist/shared.hpp>
+#endif
+
 #include <cstdint>
 
 #include "thread_pool/sync.hpp"
@@ -42,6 +47,23 @@ struct TwistSync {
         twist::ed::std::random_device device;
         return (std::uint64_t{device()} << 32) ^ device();
     }
+
+#if defined(__TWIST_SIM__)
+    // Checker hooks for lock-free containers (see detail::HasHbProbe in
+    // lock_free_spmc_queue.hpp). The simulator gives every atomic load the
+    // latest value, so ordering bugs between racy-by-design atomics are only
+    // visible through happens-before checks of plain memory: this probe.
+    class HbProbe {
+    public:
+        void write() noexcept { cell_.Write(0); }
+        void read() const noexcept { static_cast<void>(cell_.Read()); }
+
+    private:
+        twist::assist::Shared<char> cell_{char{0}};
+    };
+
+    using NoPreemption = twist::assist::NoPreemptionGuard;
+#endif
 };
 
 static_assert(SyncPolicy<TwistSync>);

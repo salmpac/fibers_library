@@ -1,6 +1,7 @@
 add_executable(thread_pool_tests
     task_test.cpp
     spsc_queue_test.cpp
+    lock_free_spmc_queue_test.cpp
     sharded_queue_test.cpp
     thread_pool_test.cpp)
 target_link_libraries(thread_pool_tests PRIVATE fibers::thread_pool GTest::gtest_main)

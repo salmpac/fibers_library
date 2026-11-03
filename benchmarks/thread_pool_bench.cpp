@@ -19,6 +19,10 @@
 //
 // In 2 and 3 the queues may overflow by design; overflow_locks reports how
 // often the SlowQueue mutex was taken (per iteration).
+//
+// Each pool benchmark runs for both main_box implementations (LockedPool =
+// LockedSPSCQueue, LockFreePool = LockFreeSPMCQueue). Narrow the argument
+// sets with --benchmark_filter, e.g. 'workers:(4|16)/batch:(1|256)/backoff:256'.
 
 #include <benchmark/benchmark.h>
 
@@ -33,6 +37,7 @@
 #include <thread>
 #include <vector>
 
+#include "thread_pool/lock_free_spmc_queue.hpp"
 #include "thread_pool/thread_pool.hpp"
 
 namespace tp = thread_pool;
@@ -58,8 +63,11 @@ struct BenchSync : tp::StdSync {
     };
 };
 
-using Pool = tp::ThreadPool<BenchSync>;
+// Every pool benchmark runs once per main_box implementation.
+using LockedPool = tp::ThreadPool<BenchSync, tp::LockedSPSCQueue<tp::Task, BenchSync>>;
+using LockFreePool = tp::ThreadPool<BenchSync, tp::LockFreeSPMCQueue<tp::Task, BenchSync>>;
 
+template <class Pool>
 struct alignas(tp::kCacheLineSize) Chain {
     Pool* pool;
     std::atomic<std::size_t>* finished;
@@ -69,10 +77,11 @@ struct alignas(tp::kCacheLineSize) Chain {
 
 // Only one task per chain is alive at a time, so `remaining` needs no atomics:
 // the queue hand-off orders consecutive steps.
+template <class Pool>
 void chain_step(void* memo) noexcept {
-    auto* chain = static_cast<Chain*>(memo);
+    auto* chain = static_cast<Chain<Pool>*>(memo);
     if (--chain->remaining != 0) {
-        chain->pool->submit(tp::Task(chain, &chain_step, nullptr));
+        chain->pool->submit(tp::Task(chain, &chain_step<Pool>, nullptr));
         return;
     }
     if (chain->finished->fetch_add(1, std::memory_order_acq_rel) + 1 == chain->total_chains) {
@@ -80,23 +89,24 @@ void chain_step(void* memo) noexcept {
     }
 }
 
+template <class Pool>
 void BM_ThreadPool_Chains(benchmark::State& state) {
     const auto workers = static_cast<std::size_t>(state.range(0));
     const auto chains = static_cast<std::size_t>(state.range(1));
     const auto steps = static_cast<std::size_t>(state.range(2));
 
     Pool pool(tp::ThreadPoolOptions{.num_workers = workers});
-    std::vector<Chain> memos(chains);
+    std::vector<Chain<Pool>> memos(chains);
     std::atomic<std::size_t> finished{0};
     const std::size_t overflow_before = g_overflow_locks.load();
 
     for (auto _ : state) {
         finished.store(0);
-        for (Chain& c : memos) {
-            c = Chain{&pool, &finished, steps, chains};
+        for (Chain<Pool>& c : memos) {
+            c = Chain<Pool>{&pool, &finished, steps, chains};
         }
-        for (Chain& c : memos) {
-            pool.submit(tp::Task(&c, &chain_step, nullptr));
+        for (Chain<Pool>& c : memos) {
+            pool.submit(tp::Task(&c, &chain_step<Pool>, nullptr));
         }
         for (std::size_t v; (v = finished.load(std::memory_order_acquire)) != chains;) {
             finished.wait(v);
@@ -115,7 +125,12 @@ void BM_ThreadPool_Chains(benchmark::State& state) {
     state.counters["overflow_locks"] = static_cast<double>(overflow);
 }
 
-BENCHMARK(BM_ThreadPool_Chains)
+BENCHMARK_TEMPLATE(BM_ThreadPool_Chains, LockedPool)
+    ->ArgNames({"workers", "chains", "steps"})
+    ->ArgsProduct({{1, 2, 4, 8, 16}, {1000}, {10'000}})
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_TEMPLATE(BM_ThreadPool_Chains, LockFreePool)
     ->ArgNames({"workers", "chains", "steps"})
     ->ArgsProduct({{1, 2, 4, 8, 16}, {1000}, {10'000}})
     ->UseRealTime()
@@ -205,6 +220,7 @@ void wait_for_sum(const ShardedCounter& counter, std::size_t target) {
 void unit_task(void* memo) noexcept { static_cast<ShardedCounter*>(memo)->inc(); }
 
 // Submits `tasks` unit tasks one by one or in batches of `batch`.
+template <class Pool>
 void spam(Pool& pool, ShardedCounter& done, std::size_t tasks, std::size_t batch) {
     if (batch <= 1) {
         for (std::size_t i = 0; i < tasks; ++i) {
@@ -222,6 +238,7 @@ void spam(Pool& pool, ShardedCounter& done, std::size_t tasks, std::size_t batch
     }
 }
 
+template <class Pool>
 struct SpamContext {
     Pool* pool;
     ShardedCounter* done;
@@ -231,8 +248,9 @@ struct SpamContext {
     std::atomic<bool> finished{false};
 };
 
+template <class Pool>
 void spammer_task(void* memo) noexcept {
-    auto* ctx = static_cast<SpamContext*>(memo);
+    auto* ctx = static_cast<SpamContext<Pool>*>(memo);
     const auto start = std::chrono::steady_clock::now();
     spam(*ctx->pool, *ctx->done, ctx->tasks, ctx->batch);
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -251,6 +269,7 @@ void report_spam(benchmark::State& state, std::size_t overflow, double submit_ns
     state.counters["overflow_locks"] = static_cast<double>(overflow) / iterations;
 }
 
+template <class Pool>
 void BM_ThreadPool_BlockedSpammer(benchmark::State& state) {
     const auto workers = static_cast<std::size_t>(state.range(0));
     const auto batch = static_cast<std::size_t>(state.range(1));
@@ -260,13 +279,13 @@ void BM_ThreadPool_BlockedSpammer(benchmark::State& state) {
                                     .main_box_capacity = 4096,
                                     .max_steal_backoff = backoff});
     ShardedCounter done;
-    SpamContext ctx{&pool, &done, kSpamTasks, batch};
+    SpamContext<Pool> ctx{&pool, &done, kSpamTasks, batch};
     const std::size_t overflow_before = g_overflow_locks.load();
 
     for (auto _ : state) {
         done.reset();
         ctx.finished.store(false);
-        pool.submit(tp::Task(&ctx, &spammer_task, nullptr));
+        pool.submit(tp::Task(&ctx, &spammer_task<Pool>, nullptr));
         wait_for_sum(done, kSpamTasks);
         while (!ctx.finished.load(std::memory_order_acquire)) std::this_thread::yield();
     }
@@ -275,12 +294,18 @@ void BM_ThreadPool_BlockedSpammer(benchmark::State& state) {
                 static_cast<double>(ctx.spam_ns.load()));
 }
 
-BENCHMARK(BM_ThreadPool_BlockedSpammer)
+BENCHMARK_TEMPLATE(BM_ThreadPool_BlockedSpammer, LockedPool)
+    ->ArgNames({"workers", "batch", "backoff"})
+    ->ArgsProduct({{2, 4, 8, 16}, {1, 32, 256}, {0, 256}})
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_TEMPLATE(BM_ThreadPool_BlockedSpammer, LockFreePool)
     ->ArgNames({"workers", "batch", "backoff"})
     ->ArgsProduct({{2, 4, 8, 16}, {1, 32, 256}, {0, 256}})
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 
+template <class Pool>
 void BM_ThreadPool_ExternalSpammer(benchmark::State& state) {
     const auto workers = static_cast<std::size_t>(state.range(0));
     const auto batch = static_cast<std::size_t>(state.range(1));
@@ -303,7 +328,12 @@ void BM_ThreadPool_ExternalSpammer(benchmark::State& state) {
     report_spam(state, g_overflow_locks.load() - overflow_before, submit_ns);
 }
 
-BENCHMARK(BM_ThreadPool_ExternalSpammer)
+BENCHMARK_TEMPLATE(BM_ThreadPool_ExternalSpammer, LockedPool)
+    ->ArgNames({"workers", "batch", "backoff"})
+    ->ArgsProduct({{1, 2, 4, 8, 16}, {1, 32, 256}, {0, 256}})
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_TEMPLATE(BM_ThreadPool_ExternalSpammer, LockFreePool)
     ->ArgNames({"workers", "batch", "backoff"})
     ->ArgsProduct({{1, 2, 4, 8, 16}, {1, 32, 256}, {0, 256}})
     ->UseRealTime()

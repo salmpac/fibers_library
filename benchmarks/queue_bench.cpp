@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "thread_pool/lock_free_spmc_queue.hpp"
 #include "thread_pool/locked_spsc_queue.hpp"
 #include "thread_pool/sharded_queue.hpp"
 #include "thread_pool/slow_queue.hpp"
@@ -20,6 +21,10 @@ namespace {
 
 constexpr std::size_t kItems = std::size_t{1} << 20;
 constexpr std::size_t kCapacity = 256;
+
+// The two main_box implementations, compared side by side.
+using LockedSPSC = tp::LockedSPSCQueue<tp::Task>;
+using LockFreeSPMC = tp::LockFreeSPMCQueue<tp::Task>;
 
 void noop(void*) noexcept {}
 tp::Task make_task() noexcept { return tp::Task(nullptr, &noop, nullptr); }
@@ -55,10 +60,12 @@ void BM_SPSC_PushPopBatch(benchmark::State& state) {
 }
 BENCHMARK(BM_SPSC_PushPopBatch)->ArgName("batch")->Arg(1)->Arg(32);
 
-// Owner of a main_box with nobody stealing: cost of the uncontended read lock.
-void BM_LockedSPSC_OwnerPushPopBatch(benchmark::State& state) {
+// Owner of a main_box with nobody stealing: cost of the uncontended read lock
+// (LockedSPSC) vs. the uncontended CAS on head (LockFreeSPMC).
+template <class Q>
+void BM_MainBox_OwnerPushPopBatch(benchmark::State& state) {
     const auto batch = static_cast<std::size_t>(state.range(0));
-    tp::LockedSPSCQueue<tp::Task> q(kCapacity);
+    Q q(kCapacity);
     std::vector<tp::Task> in(batch), out(batch);
     for (auto _ : state) {
         fill(in, batch);
@@ -67,7 +74,8 @@ void BM_LockedSPSC_OwnerPushPopBatch(benchmark::State& state) {
     }
     state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(batch));
 }
-BENCHMARK(BM_LockedSPSC_OwnerPushPopBatch)->ArgName("batch")->Arg(1)->Arg(32);
+BENCHMARK_TEMPLATE(BM_MainBox_OwnerPushPopBatch, LockedSPSC)->ArgName("batch")->Arg(1)->Arg(32);
+BENCHMARK_TEMPLATE(BM_MainBox_OwnerPushPopBatch, LockFreeSPMC)->ArgName("batch")->Arg(1)->Arg(32);
 
 // ---------------------------------------------------------------- N threads
 
@@ -102,10 +110,13 @@ BENCHMARK(BM_SPSC_ProducerConsumer)
     ->UseRealTime()->Unit(benchmark::kMillisecond);
 
 // Owner pushes and pops its main_box while `thieves` threads keep stealing.
-void BM_LockedSPSC_OwnerWithThieves(benchmark::State& state) {
+// owner_share = fraction of the items the owner popped itself.
+template <class Q>
+void BM_MainBox_OwnerWithThieves(benchmark::State& state) {
     const auto thieves = static_cast<std::size_t>(state.range(0));
     constexpr std::size_t kBatch = 32;
-    tp::LockedSPSCQueue<tp::Task> q(kCapacity);
+    Q q(kCapacity);
+    std::size_t owner_total = 0;
 
     for (auto _ : state) {
         std::atomic<std::size_t> consumed{0};
@@ -134,14 +145,20 @@ void BM_LockedSPSC_OwnerWithThieves(benchmark::State& state) {
             }
             if (const std::size_t k = q.try_pop_batch(out.data(), kBatch)) {
                 consumed.fetch_add(k, std::memory_order_relaxed);
+                owner_total += k;
             }
         }
         done.store(true);
         for (auto& t : threads) t.join();
     }
     state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(kItems));
+    state.counters["owner_share"] =
+        static_cast<double>(owner_total) / static_cast<double>(state.iterations() * kItems);
 }
-BENCHMARK(BM_LockedSPSC_OwnerWithThieves)
+BENCHMARK_TEMPLATE(BM_MainBox_OwnerWithThieves, LockedSPSC)
+    ->ArgName("thieves")->Arg(0)->Arg(1)->Arg(3)
+    ->UseRealTime()->Unit(benchmark::kMillisecond);
+BENCHMARK_TEMPLATE(BM_MainBox_OwnerWithThieves, LockFreeSPMC)
     ->ArgName("thieves")->Arg(0)->Arg(1)->Arg(3)
     ->UseRealTime()->Unit(benchmark::kMillisecond);
 
