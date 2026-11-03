@@ -273,10 +273,12 @@ TYPED_TEST(ThreadPoolTest, CustomSyncPolicyIsUsed) {
 TYPED_TEST(ThreadPoolTest, TasksOfBlockedWorkerAreStolen) {
     using Pool = PoolOf<TypeParam>;
     constexpr std::size_t kTasks = 200'000;
-    Pool pool(ThreadPoolOptions{.num_workers = 4});
     std::atomic<std::size_t> counter{0};
     std::atomic<std::size_t> ran_on_spammer{0};
     std::atomic<std::thread::id> spammer{};
+    // Declared last, so destroyed (joined) first: the spammer task may still
+    // be reading `counter` when wait_for() below returns.
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
 
     pool.submit(heap_task([&] {
         spammer.store(std::this_thread::get_id());
