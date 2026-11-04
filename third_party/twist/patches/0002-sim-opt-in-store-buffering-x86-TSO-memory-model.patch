@@ -1,0 +1,900 @@
+From 080b81bbb2b3068a8715e820807c4fbfdfa23819 Mon Sep 17 00:00:00 2001
+From: Sergey Dushenkov <ss.dushenkov@gmail.com>
+Date: Wed, 4 Nov 2026 23:08:26 +0300
+Subject: [PATCH 2/5] sim: opt-in store buffering (x86-TSO) memory model
+
+Atomic loads in the simulator always read the latest value, so
+store -> load reordering is never observed: a missing seq_cst fence in
+a Dekker-style protocol ("announce sleeping; fence; re-check" vs
+"publish; fence; check sleeping") is a lost wake-up on real hardware,
+but passes in simulation.
+
+With SimulatorParams::store_buffering (default: CMake option
+TWIST_SIM_STORE_BUFFERING, OFF) every thread gets a FIFO store buffer:
+
+- relaxed / release stores are buffered, seq_cst stores drain it,
+- loads forward from the own buffer, otherwise the scheduler decides
+  (RandomChoice) whether pending stores of other threads to the
+  location are flushed (with the older stores of the same buffer)
+  before the load; a store missed by store_buffer_max_skips loads is
+  flushed (eventual visibility, terminates spin loops under DFS),
+- RMW operations (including failed CAS), seq_cst fences and system
+  calls (futex, yield, sleep, spawn, exit) drain the buffer; before a
+  system call the drain is a separate preemptible step,
+- mutex::unlock is a seq_cst store (it reads contention_ afterwards),
+- a pending store is flushed when its atomic is destroyed.
+
+Flush decisions are ordinary scheduler decisions: explored by DFS,
+recorded by Recorder and reproduced by Replay.
+
+With store buffering off the only cost is a predictable branch in
+the store / load / RMW paths and in the draining system calls.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0174gihuXWLUfMwAE3xin9ru
+---
+ cmake/PrintDiagnostics.cmake                  |   4 +
+ cmake/TwistOptions.cmake                      |   1 +
+ library/config/CMakeLists.txt                 |   5 +
+ .../sim/source/twist/rt/sim/system/params.hpp |  15 +
+ .../source/twist/rt/sim/system/simulator.cpp  |  46 ++-
+ .../source/twist/rt/sim/system/simulator.hpp  |   4 +
+ .../twist/rt/sim/system/sync/action_type.hpp  |   2 +
+ .../source/twist/rt/sim/system/sync/model.hpp | 285 +++++++++++++++++-
+ .../twist/rt/sim/system/sync/store_buffer.hpp | 101 +++++++
+ .../twist/rt/sim/system/sync/thread.hpp       |   5 +
+ .../twist/rt/sim/system/thread/entry.cpp      |   3 +
+ .../rt/sim/user/library/std_like/mutex.hpp    |   4 +-
+ .../twist/rt/sim/user/scheduler/scheduler.cpp |   7 +-
+ 13 files changed, 476 insertions(+), 6 deletions(-)
+ create mode 100644 library/sim/source/twist/rt/sim/system/sync/store_buffer.hpp
+
+diff --git a/cmake/PrintDiagnostics.cmake b/cmake/PrintDiagnostics.cmake
+index d5477c01..c21f7346 100644
+--- a/cmake/PrintDiagnostics.cmake
++++ b/cmake/PrintDiagnostics.cmake
+@@ -24,6 +24,10 @@ if(TWIST_SIM)
+             ProjectLog("Runtime: Fixed user memory mapping")
+         endif()
+     endif()
++
++    if(TWIST_SIM_STORE_BUFFERING)
++        ProjectLog("Runtime: Store buffering (x86-TSO)")
++    endif()
+ else()
+     ProjectLog("Runtime: Threads")
+ endif()
+diff --git a/cmake/TwistOptions.cmake b/cmake/TwistOptions.cmake
+index eb96bb7f..3b9729c2 100644
+--- a/cmake/TwistOptions.cmake
++++ b/cmake/TwistOptions.cmake
+@@ -8,6 +8,7 @@ option(TWIST_SIM_ISOLATION "User memory isolation in simulation" OFF)
+ option(TWIST_SIM_FIXED_USER_MEMORY, "Fixed user memory mapping" OFF)
+ option(TWIST_SIM_DEBUG "Debug libraries for backward-cpp" OFF)
+ option(TWIST_SIM_VECTORIZE "Vectorize vector clocks" OFF)
++option(TWIST_SIM_STORE_BUFFERING "Store buffering (x86-TSO) in simulation by default" OFF)
+ 
+ option(TWIST_FAULTY "Enable fault injection" OFF)
+ set(TWIST_FAULT_PLACEMENT "BEFORE" CACHE STRING "Where to inject faults: BEFORE (default) sync operation / AFTER / BOTH sides")
+diff --git a/library/config/CMakeLists.txt b/library/config/CMakeLists.txt
+index 613c9274..225ca645 100644
+--- a/library/config/CMakeLists.txt
++++ b/library/config/CMakeLists.txt
+@@ -48,6 +48,11 @@ if(TWIST_SIM)
+         target_compile_definitions(${TWIST_CONFIG_TARGET} PUBLIC __TWIST_CONFIG_ISOLATED_SIM__=1)
+     endif()
+ 
++    if (TWIST_SIM_STORE_BUFFERING)
++        target_compile_definitions(${TWIST_CONFIG_TARGET} PUBLIC __TWIST_SIM_STORE_BUFFERING__=1)
++        target_compile_definitions(${TWIST_CONFIG_TARGET} PUBLIC __TWIST_CONFIG_SIM_STORE_BUFFERING__=1)
++    endif()
++
+     target_compile_definitions(${TWIST_CONFIG_TARGET} PUBLIC __TWISTED__=1)
+     target_compile_definitions(${TWIST_CONFIG_TARGET} PUBLIC __TWIST_CONFIG_TWISTED__=1)
+ 
+diff --git a/library/sim/source/twist/rt/sim/system/params.hpp b/library/sim/source/twist/rt/sim/system/params.hpp
+index ca9657f9..1c583366 100644
+--- a/library/sim/source/twist/rt/sim/system/params.hpp
++++ b/library/sim/source/twist/rt/sim/system/params.hpp
+@@ -9,6 +9,12 @@ namespace twist::rt::sim {
+ 
+ namespace system {
+ 
++#if defined(__TWIST_SIM_STORE_BUFFERING__)
++inline constexpr bool kStoreBufferingDefault = true;
++#else
++inline constexpr bool kStoreBufferingDefault = false;
++#endif
++
+ struct Params {
+   std::chrono::nanoseconds tick = std::chrono::microseconds(10);
+   bool allow_detached_threads = true;  // User memory isolation mode only
+@@ -30,6 +36,15 @@ struct Params {
+   bool digest_atomic_loads = false;
+   // Digest atomic loads if possible
+   bool allow_digest_atomic_loads = true;
++
++  // Store buffering (x86-TSO): store -> load reordering
++  // Default: CMake option TWIST_SIM_STORE_BUFFERING
++  bool store_buffering = kStoreBufferingDefault;
++  // Pending stores per thread, the oldest one is flushed on overflow
++  size_t store_buffer_capacity = 16;
++  // A pending store is flushed after being missed
++  // by that many loads from other threads
++  size_t store_buffer_max_skips = 4;
+ };
+ 
+ }  // namespace system
+diff --git a/library/sim/source/twist/rt/sim/system/simulator.cpp b/library/sim/source/twist/rt/sim/system/simulator.cpp
+index 45af034f..b2778a18 100644
+--- a/library/sim/source/twist/rt/sim/system/simulator.cpp
++++ b/library/sim/source/twist/rt/sim/system/simulator.cpp
+@@ -41,7 +41,7 @@ Simulator::Simulator(IScheduler* scheduler, Params params)
+       scheduler_(scheduler),
+       time_(ticker_, params),
+       memory_(params),
+-      memory_model_() {
++      memory_model_(scheduler, params) {
+   ValidateParams();
+ }
+ 
+@@ -74,6 +74,22 @@ call::Status Simulator::SystemCall(call::Handler handler) {
+ 
+ // ~ System calls
+ 
++void Simulator::UserDrainStoreBuffer() {
++  if (!memory_model_.StoreBuffering()) {
++    return;
++  }
++
++  TWIST_INTERNAL_ASSERT(AmIUser(), "Not in user-space");
++
++  if (running_->sync.store_buffer.IsEmpty()) {
++    return;  // Nothing to drain
++  }
++
++  sync::Action drain{nullptr, 0, sync::ActionType::StoreBufferDrain, 0, std::memory_order::seq_cst,
++                     "store buffer drain", trace::SourceLocation::Current()};
++  SysSync(&drain);
++}
++
+ void Simulator::SysNoop() {
+   auto noop = [](Thread*) {
+     return true;  // Resume;
+@@ -83,6 +99,8 @@ void Simulator::SysNoop() {
+ }
+ 
+ ThreadId Simulator::SysSpawn(IThreadUserState* user, const UserContext* /*ctx*/) {
++  UserDrainStoreBuffer();
++
+   ThreadId id;
+ 
+   auto spawn = [this, user, &id](Thread* me) {
+@@ -111,6 +129,8 @@ void Simulator::SysDetach(ThreadId id) {
+ }
+ 
+ void Simulator::SysYield(const UserContext* /*ctx*/) {
++  UserDrainStoreBuffer();
++
+   auto yield = [this](Thread* me) {
+     return _SysYield(me);
+   };
+@@ -119,6 +139,8 @@ void Simulator::SysYield(const UserContext* /*ctx*/) {
+ }
+ 
+ void Simulator::SysSwitchTo(ThreadId target) {
++  UserDrainStoreBuffer();
++
+   auto switch_to = [this, target](Thread* me) {
+     return _SysSwitchTo(me, target);
+   };
+@@ -139,6 +161,8 @@ struct SleepTimer final : Timer {
+ };
+ 
+ call::Status Simulator::SysSleepUntil(Time::Instant deadline) {
++  UserDrainStoreBuffer();
++
+   SleepTimer timer;
+   timer.when = deadline;
+   timer.sleeper = running_;
+@@ -184,6 +208,8 @@ trace::SourceLocation Simulator::SysGetAtomicSourceLoc(void* loc) {
+ }
+ 
+ call::Status Simulator::SysFutexWait(FutexLoc loc, uint64_t old, const WaiterContext* ctx) {
++  UserDrainStoreBuffer();
++
+   auto wait = [this, loc, old, ctx](Thread* me) {
+     _SysFutexWait(me, loc, old, /*timer=*/nullptr, ctx);
+     return false;  // Suspend
+@@ -203,6 +229,8 @@ struct FutexTimer : Timer {
+ };
+ 
+ call::Status Simulator::SysFutexWaitTimed(FutexLoc loc, uint64_t old, Time::Instant d, const WaiterContext* ctx) {
++  UserDrainStoreBuffer();
++
+   FutexTimer timer;
+   timer.when = d;
+   timer.waiter = running_;
+@@ -218,6 +246,8 @@ call::Status Simulator::SysFutexWaitTimed(FutexLoc loc, uint64_t old, Time::Inst
+ }
+ 
+ void Simulator::SysFutexWake(FutexLoc loc, size_t count, const WakerContext* /*ctx*/) {
++  UserDrainStoreBuffer();
++
+   auto wake = [this, loc, count](Thread* me) {
+     _SysFutexWake(/*waker=*/me, loc, count);
+     return true;  // Continue
+@@ -938,6 +968,8 @@ bool Simulator::HandleSystemCall(Thread* caller) {
+ }
+ 
+ ThreadId Simulator::_SysSpawn(Thread* parent, IThreadUserState* user) {
++  memory_model_.Drain(parent);
++
+   Thread* child = CreateThread(user);
+   child->parent_id = parent->id;
+   memory_model_.Spawn(parent, child);
+@@ -957,6 +989,7 @@ bool Simulator::_SysYield(Thread* thread) {
+   // TWIST_INTERNAL_VERIFY(thread->preemptive, "Yield is not supported in non-preemptive mode");
+ 
+   ++yield_count_;  // Statistics
++  memory_model_.Drain(thread);
+   thread->state = ThreadState::Runnable;
+   scheduler_->Yield(thread);
+   return false;  // Always reschedule
+@@ -965,12 +998,15 @@ bool Simulator::_SysYield(Thread* thread) {
+ bool Simulator::_SysSwitchTo(Thread* active, ThreadId next) {
+   TWIST_INTERNAL_VERIFY(active->attrs.preemptive, "SwitchTo is not supported in non-preemptive mode");
+   // TODO: active->id == next?
++  memory_model_.Drain(active);
+   active->state = ThreadState::Runnable;
+   scheduler_->SwitchTo(active, next);
+   return false;  // Always reschedule
+ }
+ 
+ void Simulator::_SysSleep(Thread* sleeper, Timer* timer) {
++  memory_model_.Drain(sleeper);
++
+   AddTimer(timer);
+ 
+   {
+@@ -1034,6 +1070,8 @@ void Simulator::_SysFutexWait(Thread* waiter, FutexLoc loc, uint64_t old, Timer*
+   // Statistics
+   ++futex_wait_count_;
+ 
++  memory_model_.Drain(waiter);
++
+   if (VulnerableToSpuriousWakeup(ctx)) {
+     if (scheduler_->SpuriousWakeup()) {
+       ScheduleWaiter(waiter, call::Status::Interrupted);
+@@ -1072,6 +1110,8 @@ void Simulator::_SysFutexWait(Thread* waiter, FutexLoc loc, uint64_t old, Timer*
+ }
+ 
+ void Simulator::_SysFutexWake(Thread* waker, FutexLoc loc, size_t count) {
++  memory_model_.Drain(waker);
++
+   Futex* futex = GetFutex(loc);
+ 
+   if (count >= kMaxThreads) {  // Optimization
+@@ -1155,6 +1195,8 @@ void Simulator::_SysThreadEnter(Thread* thread, user::fiber::Fiber* fiber) {
+ }
+ 
+ void Simulator::_SysThreadExit(Thread* thread) {
++  memory_model_.Drain(thread);
++
+   scheduler_->Exit(thread);
+ 
+   bool main = thread->main;
+@@ -1362,6 +1404,8 @@ Thread* Simulator::CreateThread(IThreadUserState* state) {
+ }
+ 
+ void Simulator::DestroyThread(Thread* thread) {
++  memory_model_.Forget(thread);
++
+   threads_.Unlink(thread);
+ 
+   memory_.FreeStack(std::move(*(thread->stack)));
+diff --git a/library/sim/source/twist/rt/sim/system/simulator.hpp b/library/sim/source/twist/rt/sim/system/simulator.hpp
+index a4bca929..79b4dbbc 100644
+--- a/library/sim/source/twist/rt/sim/system/simulator.hpp
++++ b/library/sim/source/twist/rt/sim/system/simulator.hpp
+@@ -156,6 +156,10 @@ class Simulator
+ 
+   void SysLog(log::Event*);
+ 
++  // Store buffering: drain as a separate (preemptible) step
++  // before system calls that act as full barriers
++  void UserDrainStoreBuffer();
++
+   bool SysIsTracingEnabled();
+   uint64_t SysNewScopeId();
+   void SysTrace(trace::Event*);
+diff --git a/library/sim/source/twist/rt/sim/system/sync/action_type.hpp b/library/sim/source/twist/rt/sim/system/sync/action_type.hpp
+index 79f87dda..8afcd725 100644
+--- a/library/sim/source/twist/rt/sim/system/sync/action_type.hpp
++++ b/library/sim/source/twist/rt/sim/system/sync/action_type.hpp
+@@ -14,6 +14,8 @@ enum class ActionType {
+   AtomicDestroy,
+   AtomicCasAcquireFence,
+   AtomicThreadFence,
++  // Store buffering: drain before system call
++  StoreBufferDrain,
+ };
+ 
+ inline bool IsLoad(ActionType action) {
+diff --git a/library/sim/source/twist/rt/sim/system/sync/model.hpp b/library/sim/source/twist/rt/sim/system/sync/model.hpp
+index 78109336..3bf6fdd7 100644
+--- a/library/sim/source/twist/rt/sim/system/sync/model.hpp
++++ b/library/sim/source/twist/rt/sim/system/sync/model.hpp
+@@ -3,13 +3,20 @@
+ #include "atomic.hpp"
+ #include "non_atomic.hpp"
+ #include "alloc.hpp"
++#include "store_buffer.hpp"
+ 
++#include "../params.hpp"
++#include "../limits.hpp"
++#include "../scheduler/scheduler.hpp"
+ #include "../thread/struct.hpp"
+ #include "../thread/count.hpp"
+ 
+ #include "invalid.hpp"
+ 
++#include <array>
+ #include <map>
++#include <utility>
++#include <vector>
+ 
+ namespace twist::rt::sim {
+ 
+@@ -21,15 +28,29 @@ namespace system::sync {
+ // Weaken Release Sequences
+ // https://wg21.link/p0982
+ 
++// Atomic loads read the latest value from memory,
++// happens-before is tracked for data race detection.
++
++// With Params::store_buffering (opt-in): x86-TSO,
++// plain stores are delayed in per-thread FIFO store buffers.
++
+ class SeqCstMemoryModel {
+  public:
+-  SeqCstMemoryModel() {
++  SeqCstMemoryModel(IScheduler* scheduler, const Params& params)
++      : scheduler_(scheduler),
++        store_buffering_(params.store_buffering &&
++                         (params.store_buffer_capacity > 0)),
++        store_buffer_capacity_(params.store_buffer_capacity),
++        store_buffer_max_skips_(params.store_buffer_max_skips) {
+   }
+ 
+   void Reset() {
+     atomics_.clear();
+     non_atomics_.clear();
+     allocs_.clear();
++
++    store_buffers_.fill(nullptr);
++    pending_store_buffers_ = 0;
+   }
+ 
+   // Stat
+@@ -89,14 +110,42 @@ class SeqCstMemoryModel {
+       case ActionType::AtomicThreadFence:
+         AtomicThreadFence(thread, action);
+         return 0;
++      case ActionType::StoreBufferDrain:
++        Drain(thread);
++        return 0;
+       default:
+         TWIST_INTERNAL_PANIC("Unhandled synchronization action");
+     }
+   }
+ 
++  // Store buffering (x86-TSO)
++
++  bool StoreBuffering() const {
++    return store_buffering_;
++  }
++
++  // Full barrier: make all pending stores of the thread visible
++  // System calls, seq_cst stores and fences, RMW operations
++  void Drain(Thread* thread) {
++    if (store_buffering_) {
++      FlushStoreBuffer(thread, thread->sync.store_buffer.Size());
++    }
++  }
++
++  // Thread is destroyed without exit (wipe)
++  void Forget(Thread* thread) {
++    if (store_buffering_) {
++      thread->sync.store_buffer.Init();
++      UnregisterStoreBuffer(thread);
++    }
++  }
++
+   // Futex
+ 
+-  uint64_t FutexLoad(Thread* /*thread*/, AtomicVar* atomic) {
++  uint64_t FutexLoad(Thread* thread, AtomicVar* atomic) {
++    if (store_buffering_) {
++      FlushBeforeLoad(thread, atomic);
++    }
+     return atomic->last_write.value;
+   }
+ 
+@@ -207,6 +256,16 @@ class SeqCstMemoryModel {
+ 
+     AtomicVar* atomic = GetShadowAtomicVar(load);
+ 
++    if (store_buffering_) {
++      if (auto own = reader->sync.store_buffer.FindLatest(atomic)) {
++        if (!FlushOwnBeforeLoad(reader, atomic, *own)) {
++          // Store-to-load forwarding
++          return reader->sync.store_buffer[*own].value;
++        }
++      }
++      FlushBeforeLoad(reader, atomic);
++    }
++
+     uint64_t value;
+     if (IsAcquireOrder(load->mo)) {
+       value = AtomicLoadAcquire(reader, atomic);
+@@ -217,8 +276,16 @@ class SeqCstMemoryModel {
+     return value;
+   }
+ 
+-  uint64_t AtomicDebugLoad(Thread* /*reader*/, Action* load) {
++  uint64_t AtomicDebugLoad(Thread* reader, Action* load) {
+     AtomicVar* atomic = GetShadowAtomicVar(load);
++
++    if (store_buffering_) {
++      // Do not flush: debug loads should not affect the execution
++      if (auto own = reader->sync.store_buffer.FindLatest(atomic)) {
++        return reader->sync.store_buffer[*own].value;
++      }
++    }
++
+     return atomic->last_write.value;
+   }
+ 
+@@ -233,6 +300,16 @@ class SeqCstMemoryModel {
+ 
+     AtomicVar* atomic = GetShadowAtomicVar(store);
+ 
++    if (store_buffering_) {
++      if (store->mo == std::memory_order::seq_cst) {
++        // x86: mov + mfence (or xchg)
++        Drain(writer);
++      } else {
++        BufferStore(writer, atomic, store);
++        return;
++      }
++    }
++
+     if (IsReleaseOrder(store->mo)) {
+       AtomicStoreRelease(writer, atomic, store->value);
+     } else {
+@@ -243,6 +320,13 @@ class SeqCstMemoryModel {
+   uint64_t AtomicRmwLoad(Thread* writer, Action* rmw) {
+     AtomicVar* atomic = GetShadowAtomicVar(rmw);
+ 
++    if (store_buffering_) {
++      // x86: locked instructions drain the store buffer
++      // (even if compare-exchange fails)
++      Drain(writer);
++      FlushBeforeLoad(writer, atomic);
++    }
++
+     uint64_t value;
+     if (IsAcquireOrder(rmw->mo)) {
+       value = AtomicLoadAcquire(writer, atomic);
+@@ -269,6 +353,10 @@ class SeqCstMemoryModel {
+     // Fix missing call site
+     destroy->source_loc = atomic->source_loc;
+ 
++    if (store_buffering_) {
++      FlushStoresTo(atomic);
++    }
++
+     atomic->dtor.emplace();
+ 
+     // atomics_.erase(destroy->loc);
+@@ -320,6 +408,8 @@ class SeqCstMemoryModel {
+   }
+ 
+   void AtomicThreadFenceSeqCst(Thread* thread) {
++    // x86: mfence
++    Drain(thread);
+     // Happens-before: total order of seq_cst fences
+     // is not tracked, values are sequentially consistent anyway
+     AtomicThreadFenceAcqRel(thread);
+@@ -344,6 +434,183 @@ class SeqCstMemoryModel {
+     }
+   }
+ 
++ private:
++  // Store buffers
++
++  void BufferStore(Thread* writer, AtomicVar* atomic, Action* store) {
++    StoreBuffer& buffer = writer->sync.store_buffer;
++
++    if (buffer.Size() == store_buffer_capacity_) {
++      // Overflow
++      FlushStoreBuffer(writer, 1);
++    }
++
++    if (buffer.IsEmpty()) {
++      RegisterStoreBuffer(writer);
++    }
++
++    BufferedStore& pending = buffer.Push(store_buffer_capacity_);
++
++    pending.atomic = atomic;
++    pending.value = store->value;
++    // See AtomicStore{Release,Relaxed}
++    if (IsReleaseOrder(store->mo)) {
++      pending.clock.Assign(writer->sync.clock.current);
++    } else {
++      pending.clock.Assign(writer->sync.clock.release_fence);
++    }
++  }
++
++  // Flush `count` oldest pending stores of the writer to memory
++  void FlushStoreBuffer(Thread* writer, size_t count) {
++    if (count == 0) {
++      return;
++    }
++
++    StoreBuffer& buffer = writer->sync.store_buffer;
++
++    for (size_t i = 0; i < count; ++i) {
++      BufferedStore& pending = buffer.Front();
++      pending.atomic->last_write.value = pending.value;
++      pending.atomic->last_write.clock.Assign(pending.clock);
++      buffer.PopFront();
++    }
++
++    if (buffer.IsEmpty()) {
++      UnregisterStoreBuffer(writer);
++    }
++  }
++
++  // Before `reader` loads `atomic` from memory, pending stores to `atomic`
++  // from other threads may be flushed (with all older stores from the same
++  // buffers). Choice 0 – keep them pending, choice i – flush buffer up to i-th
++  // candidate
++  void FlushBeforeLoad(Thread* reader, AtomicVar* atomic) {
++    if (pending_store_buffers_ == 0) {
++      return;  // Fast path
++    }
++
++    while (true) {
++      CollectPendingStores(reader, atomic);
++
++      if (candidates_.empty()) {
++        return;
++      }
++
++      size_t choice = scheduler_->RandomChoice(candidates_.size() + 1);
++
++      if (choice == 0) {
++        // Load misses all pending stores
++        for (auto [writer, index] : candidates_) {
++          ++writer->sync.store_buffer[index].skips;
++        }
++        return;
++      }
++
++      auto [writer, index] = candidates_[choice - 1];
++      FlushStoreBuffer(writer, index + 1);
++    }
++  }
++
++  // Reader has pending store to `atomic` at index `own` in its buffer.
++  // Pending stores to `atomic` from other threads may still be ordered after
++  // it: choice 0 – forward own store, choice i – flush own buffer up to `own`
++  // and then other buffer up to i-th candidate
++  bool FlushOwnBeforeLoad(Thread* reader, AtomicVar* atomic, size_t own) {
++    if (pending_store_buffers_ < 2) {
++      return false;  // Fast path
++    }
++
++    CollectPendingStores(reader, atomic);
++
++    if (candidates_.empty()) {
++      return false;
++    }
++
++    size_t choice = scheduler_->RandomChoice(candidates_.size() + 1);
++
++    if (choice == 0) {
++      for (auto [writer, index] : candidates_) {
++        ++writer->sync.store_buffer[index].skips;
++      }
++      return false;
++    }
++
++    auto [writer, index] = candidates_[choice - 1];
++
++    FlushStoreBuffer(reader, own + 1);
++    FlushStoreBuffer(writer, index + 1);
++
++    return true;
++  }
++
++  // Candidates for FlushBeforeLoad in deterministic order
++  void CollectPendingStores(Thread* reader, AtomicVar* atomic) {
++    candidates_.clear();
++
++    for (Thread* writer : store_buffers_) {
++      if ((writer == nullptr) || (writer == reader)) {
++        continue;
++      }
++
++      StoreBuffer& buffer = writer->sync.store_buffer;
++
++      {
++        // Eventual visibility: do not let a store be missed forever
++        // (e.g. by a spinning reader under DFS)
++
++        size_t starved = 0;
++        for (size_t i = 0; i < buffer.Size(); ++i) {
++          if ((buffer[i].atomic == atomic) &&
++              (buffer[i].skips >= store_buffer_max_skips_)) {
++            starved = i + 1;
++          }
++        }
++        FlushStoreBuffer(writer, starved);
++      }
++
++      for (size_t i = 0; i < buffer.Size(); ++i) {
++        if (buffer[i].atomic == atomic) {
++          candidates_.emplace_back(writer, i);
++        }
++      }
++    }
++  }
++
++  void FlushStoresTo(AtomicVar* atomic) {
++    for (Thread* writer : store_buffers_) {
++      if (writer == nullptr) {
++        continue;
++      }
++
++      StoreBuffer& buffer = writer->sync.store_buffer;
++
++      size_t last = 0;
++      for (size_t i = 0; i < buffer.Size(); ++i) {
++        if (buffer[i].atomic == atomic) {
++          last = i + 1;
++        }
++      }
++      FlushStoreBuffer(writer, last);
++    }
++  }
++
++  void RegisterStoreBuffer(Thread* thread) {
++    Thread*& slot = store_buffers_[thread->id - 1];
++    if (slot == nullptr) {
++      slot = thread;
++      ++pending_store_buffers_;
++    }
++  }
++
++  void UnregisterStoreBuffer(Thread* thread) {
++    Thread*& slot = store_buffers_[thread->id - 1];
++    if (slot != nullptr) {
++      slot = nullptr;
++      --pending_store_buffers_;
++    }
++  }
++
+  private:
+   // Non-atomics
+ 
+@@ -498,9 +765,21 @@ class SeqCstMemoryModel {
+   }
+ 
+  private:
++  IScheduler* scheduler_;
++
+   std::map<void*, AtomicVar> atomics_;
+   std::map<void*, NonAtomicVar> non_atomics_;
+   std::map<void*, Alloc> allocs_;
++
++  // Store buffering
++  const bool store_buffering_;
++  const size_t store_buffer_capacity_;
++  const size_t store_buffer_max_skips_;
++  // Threads with non-empty store buffers, indexed by thread id
++  std::array<Thread*, kMaxThreads> store_buffers_{};
++  size_t pending_store_buffers_ = 0;
++  // FlushBeforeLoad: (thread, index in store buffer)
++  std::vector<std::pair<Thread*, size_t>> candidates_;
+ };
+ 
+ }  // namespace system::sync
+diff --git a/library/sim/source/twist/rt/sim/system/sync/store_buffer.hpp b/library/sim/source/twist/rt/sim/system/sync/store_buffer.hpp
+new file mode 100644
+index 00000000..c5451472
+--- /dev/null
++++ b/library/sim/source/twist/rt/sim/system/sync/store_buffer.hpp
+@@ -0,0 +1,101 @@
++#pragma once
++
++#include "atomic.hpp"
++#include "clock.hpp"
++
++#include <twist/detail/assert.hpp>
++
++#include <cstdint>
++#include <cstdlib>
++#include <optional>
++#include <vector>
++
++namespace twist::rt::sim {
++
++namespace system::sync {
++
++// x86-TSO store buffer
++// https://www.cl.cam.ac.uk/~pes20/weakmemory/cacm.pdf
++
++struct BufferedStore {
++  AtomicVar* atomic;
++  uint64_t value;
++  // Release clock of the writer captured at the store
++  VectorClock clock;
++  // Number of loads from other threads that have not observed this store
++  size_t skips;
++};
++
++// Per-thread FIFO of pending stores (bounded ring)
++
++class StoreBuffer {
++ public:
++  void Init() {
++    head_ = 0;
++    size_ = 0;
++  }
++
++  bool IsEmpty() const {
++    return size_ == 0;
++  }
++
++  size_t Size() const {
++    return size_;
++  }
++
++  size_t Capacity() const {
++    return slots_.size();
++  }
++
++  // 0 - oldest
++  BufferedStore& operator[](size_t index) {
++    return slots_[(head_ + index) % slots_.size()];
++  }
++
++  const BufferedStore& operator[](size_t index) const {
++    return slots_[(head_ + index) % slots_.size()];
++  }
++
++  // Precondition: Size() < capacity
++  BufferedStore& Push(size_t capacity) {
++    if (slots_.size() != capacity) {
++      TWIST_INTERNAL_ASSERT(size_ == 0, "Non-empty store buffer resized");
++      slots_.resize(capacity);
++      head_ = 0;
++    }
++
++    TWIST_INTERNAL_ASSERT(size_ < slots_.size(), "Store buffer overflow");
++
++    BufferedStore& slot = (*this)[size_++];
++    slot.skips = 0;
++    return slot;
++  }
++
++  BufferedStore& Front() {
++    return (*this)[0];
++  }
++
++  void PopFront() {
++    head_ = (head_ + 1) % slots_.size();
++    --size_;
++  }
++
++  // Store-to-load forwarding: index of the youngest store to `atomic`
++  std::optional<size_t> FindLatest(const AtomicVar* atomic) const {
++    for (size_t i = size_; i > 0; --i) {
++      if ((*this)[i - 1].atomic == atomic) {
++        return i - 1;
++      }
++    }
++    return std::nullopt;
++  }
++
++ private:
++  std::vector<BufferedStore> slots_;
++  size_t head_ = 0;
++  size_t size_ = 0;
++};
++
++}  // namespace system::sync
++
++}  // namespace twist::rt::sim
+diff --git a/library/sim/source/twist/rt/sim/system/sync/thread.hpp b/library/sim/source/twist/rt/sim/system/sync/thread.hpp
+index 39246255..44b6dd26 100644
+--- a/library/sim/source/twist/rt/sim/system/sync/thread.hpp
++++ b/library/sim/source/twist/rt/sim/system/sync/thread.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "clock.hpp"
++#include "store_buffer.hpp"
+ 
+ namespace twist::rt::sim {
+ 
+@@ -15,11 +16,15 @@ struct ThreadContext {
+     VectorClock release_fence;
+   } clock;
+ 
++  // Store buffering mode only
++  StoreBuffer store_buffer;
++
+   void Init() {
+     epoch = 0;
+     clock.current.Init();
+     clock.acquire_fence.Init();
+     clock.release_fence.Init();
++    store_buffer.Init();
+   }
+ };
+ 
+diff --git a/library/sim/source/twist/rt/sim/system/thread/entry.cpp b/library/sim/source/twist/rt/sim/system/thread/entry.cpp
+index 302104a0..656dcecf 100644
+--- a/library/sim/source/twist/rt/sim/system/thread/entry.cpp
++++ b/library/sim/source/twist/rt/sim/system/thread/entry.cpp
+@@ -78,6 +78,9 @@ void Entry(Thread* me) {
+         .Log();
+   }
+ 
++  // Thread exit is a full barrier
++  simulator->UserDrainStoreBuffer();
++
+   {
+     user::scheduler::PreemptionGuard guard{};
+     me->user->AtThreadExit();
+diff --git a/library/sim/source/twist/rt/sim/user/library/std_like/mutex.hpp b/library/sim/source/twist/rt/sim/user/library/std_like/mutex.hpp
+index afc123d1..2a55ccbe 100644
+--- a/library/sim/source/twist/rt/sim/user/library/std_like/mutex.hpp
++++ b/library/sim/source/twist/rt/sim/user/library/std_like/mutex.hpp
+@@ -76,7 +76,9 @@ class MutexImpl {
+ 
+     auto loc = locked_.FutexLoc();
+ 
+-    locked_.Store(State::Unlocked, std::memory_order::release, call_site);
++    // seq_cst: full barrier with store buffering (like xchg in glibc),
++    // contention_ is checked after the store becomes visible
++    locked_.Store(State::Unlocked, std::memory_order::seq_cst, call_site);
+ 
+     if (contention_ > 0) {
+       system::WakerContext waker{"mutex::unlock", call_site};
+diff --git a/library/sim/source/twist/rt/sim/user/scheduler/scheduler.cpp b/library/sim/source/twist/rt/sim/user/scheduler/scheduler.cpp
+index 845e3acb..936b6a38 100644
+--- a/library/sim/source/twist/rt/sim/user/scheduler/scheduler.cpp
++++ b/library/sim/source/twist/rt/sim/user/scheduler/scheduler.cpp
+@@ -29,7 +29,12 @@ void Interrupt(trace::SourceLocation call_site) {
+ 
+   // TODO: better impl
+   TWISTED_STATIC_PRIVATE_VAR(Contention, interrupt);
+-  interrupt->atom.store(1, std::memory_order::relaxed, call_site);
++  if (system::Simulator::Current()->SharedMemory().StoreBuffering()) {
++    // Do not occupy store buffer
++    interrupt->atom.load(std::memory_order::relaxed, call_site);
++  } else {
++    interrupt->atom.store(1, std::memory_order::relaxed, call_site);
++  }
+ }
+ 
+ bool SetThreadAttrPreemptive(bool target_status) {
+-- 
+2.56.0
+

@@ -72,9 +72,10 @@ struct SpmcSlot<thread_pool::Task, Sync> {
 //                 cell that the checker tracks for happens-before races;
 //   NoPreemption  RAII guard: the current thread is not preempted inside.
 //
-// Slot contents are atomics (racy by design), and a checker that gives every
-// atomic load the latest value (the Twist simulator does) cannot see a missing
-// release / acquire on them. So each slot also has a probe: the producer
+// Slot contents are atomics (racy by design), and a checker whose atomics are
+// sequentially consistent or x86-TSO (the Twist simulator, with or without
+// store buffering) never lets a missing release / acquire on them change a
+// value read. So each slot also has a probe: the producer
 // write()s it before publishing, the consumer read()s it right before a CAS
 // that will succeed. A missing edge in either direction (publication or slot
 // reuse) then shows up as a data race on the probe.

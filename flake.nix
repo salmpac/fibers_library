@@ -12,6 +12,9 @@
     # behind them: sure renamed its target (sure -> sure-context) and sure-stack
     # moved headers afterwards. So Lipovsky's libs are pinned to revisions
     # contemporary with the Twist commit. Bump them together.
+    #
+    # Twist itself gets our local patches on top (twistPatched below), so the
+    # store path in FIBERS_DEP_TWIST is the patched source.
     twist = { url = "gitlab:Lipovsky/twist/407b44e51a9d53c9fd5cbada08ada7a4a1cf029d"; flake = false; };
     twist-futex-like = { url = "gitlab:Lipovsky/futex_like/d617dcb44f820476d73d1ea3ca4f987d8971a0e3"; flake = false; };
     twist-spin-wait = { url = "gitlab:Lipovsky/spin_wait"; flake = false; };
@@ -35,9 +38,21 @@
         clang = pkgs.llvmPackages_21.stdenv;
       };
 
+      # Upstream Twist plus our local patches (third_party/twist/patches, see the
+      # README there): seq_cst fences and x86-TSO store buffering in the
+      # simulator. Drop once upstream has an equivalent.
+      twistPatched = pkgs: pkgs.applyPatches {
+        name = "twist-patched";
+        src = inputs.twist;
+        patches =
+          let dir = ./third_party/twist/patches;
+          in map (name: dir + "/${name}")
+            (builtins.filter (pkgs.lib.hasSuffix ".patch") (builtins.attrNames (builtins.readDir dir)));
+      };
+
       # FIBERS_DEP_<NAME> = /nix/store/... for cmake/Twist.cmake
-      twistDepsEnv = {
-        FIBERS_DEP_TWIST = "${inputs.twist}";
+      twistDepsEnv = pkgs: {
+        FIBERS_DEP_TWIST = "${twistPatched pkgs}";
         FIBERS_DEP_FUTEX_LIKE = "${inputs.twist-futex-like}";
         FIBERS_DEP_SPIN_WAIT = "${inputs.twist-spin-wait}";
         FIBERS_DEP_SURE = "${inputs.twist-sure}";
@@ -57,7 +72,7 @@
             + lib.optionalString (twist != null) "-twist-${twist}"
             + lib.optionalString (sanitize != "") "-${builtins.replaceStrings [ "," ] [ "-" ] sanitize}";
           twistFlags = {
-            sim = [ "-DTWIST_FAULTY=ON" "-DTWIST_SIM=ON" "-DTWIST_SIM_ISOLATION=ON" ];
+            sim = [ "-DTWIST_FAULTY=ON" "-DTWIST_SIM=ON" "-DTWIST_SIM_ISOLATION=ON" "-DTWIST_SIM_STORE_BUFFERING=ON" ];
             faulty = [ "-DTWIST_FAULTY=ON" ];
           };
         in
@@ -90,7 +105,7 @@
           hardeningDisable = lib.optional (sanitize != "") "fortify";
 
           doCheck = true;
-        } // lib.optionalAttrs (twist != null) twistDepsEnv);
+        } // lib.optionalAttrs (twist != null) (twistDepsEnv pkgs));
 
       variants = pkgs: {
         default = mkFibers pkgs { };
@@ -127,7 +142,7 @@
               pkgs.gdb
             ];
             hardeningDisable = [ "fortify" ];
-          } // twistDepsEnv);
+          } // twistDepsEnv pkgs);
         });
     };
 }

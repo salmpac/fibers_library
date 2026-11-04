@@ -1,0 +1,1146 @@
+From dcee22d6a95662ae7c02502c5b70066befdd467e Mon Sep 17 00:00:00 2001
+From: Sergey Dushenkov <ss.dushenkov@gmail.com>
+Date: Wed, 4 Nov 2026 23:08:26 +0300
+Subject: [PATCH 3/5] tests/sim/tso: litmus and protocol tests for store
+ buffering
+
+- litmus: SB (with relaxed / acquire / seq_cst loads, seq_cst fences,
+  seq_cst stores, RMW), MP, LB, IRIW, CoRR, CoWR / CoWW, 2+2W,
+- Dekker-style wake-up protocol with and without seq_cst fences under
+  Random, PCT and DFS schedulers,
+- RMW drains the store buffer, store-to-load forwarding,
+- termination of busy-wait loops under DFS,
+- Twist mutex under store buffering,
+- replay of flush decisions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0174gihuXWLUfMwAE3xin9ru
+---
+ tests/sim/CMakeLists.txt     |   1 +
+ tests/sim/tso/CMakeLists.txt |  13 +
+ tests/sim/tso/drain.cpp      | 192 ++++++++++++
+ tests/sim/tso/explore.hpp    |  93 ++++++
+ tests/sim/tso/litmus.cpp     | 547 +++++++++++++++++++++++++++++++++++
+ tests/sim/tso/main.cpp       |   3 +
+ tests/sim/tso/replay.cpp     |  82 ++++++
+ tests/sim/tso/wake.cpp       | 126 ++++++++
+ 8 files changed, 1057 insertions(+)
+ create mode 100644 tests/sim/tso/CMakeLists.txt
+ create mode 100644 tests/sim/tso/drain.cpp
+ create mode 100644 tests/sim/tso/explore.hpp
+ create mode 100644 tests/sim/tso/litmus.cpp
+ create mode 100644 tests/sim/tso/main.cpp
+ create mode 100644 tests/sim/tso/replay.cpp
+ create mode 100644 tests/sim/tso/wake.cpp
+
+diff --git a/tests/sim/CMakeLists.txt b/tests/sim/CMakeLists.txt
+index 65c6e524..b6e61381 100644
+--- a/tests/sim/CMakeLists.txt
++++ b/tests/sim/CMakeLists.txt
+@@ -18,4 +18,5 @@ if(TWIST_SIM_ISOLATION)
+     add_subdirectory(rmw)
+     add_subdirectory(happens_before)
+     add_subdirectory(params)
++    add_subdirectory(tso)
+ endif()
+diff --git a/tests/sim/tso/CMakeLists.txt b/tests/sim/tso/CMakeLists.txt
+new file mode 100644
+index 00000000..f6635309
+--- /dev/null
++++ b/tests/sim/tso/CMakeLists.txt
+@@ -0,0 +1,13 @@
++add_executable(twist_tests_sim_tso
++        litmus.cpp
++        wake.cpp
++        drain.cpp
++        replay.cpp
++        main.cpp)
++
++target_link_libraries(twist_tests_sim_tso PRIVATE twist Catch2::Catch2WithMain)
++
++add_test(NAME twist_tests_sim_tso
++        COMMAND twist_tests_sim_tso)
++
++set_tests_properties(twist_tests_sim_tso PROPERTIES LABELS "sim;tso;store-buffering")
+diff --git a/tests/sim/tso/drain.cpp b/tests/sim/tso/drain.cpp
+new file mode 100644
+index 00000000..5f759917
+--- /dev/null
++++ b/tests/sim/tso/drain.cpp
+@@ -0,0 +1,192 @@
++#include "explore.hpp"
++
++#include <twist/ed/std/atomic.hpp>
++#include <twist/ed/std/mutex.hpp>
++#include <twist/ed/std/thread.hpp>
++
++#include <twist/assist/assert.hpp>
++#include <twist/assist/shared.hpp>
++
++#include <twist/test/body/wg.hpp>
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <fmt/core.h>
++
++#include <limits>
++
++TEST_CASE("RMW drains store buffer") {
++  // RMW bypasses the store buffer, so older pending stores
++  // must be flushed first, otherwise z = 1 could be visible before x = 1
++
++  auto rmw = [](auto op) {
++    return [op] {
++      twist::ed::std::atomic<int> x{0};
++      twist::ed::std::atomic<int> z{0};
++
++      twist::ed::std::thread t1([&] {
++        x.store(1, std::memory_order::relaxed);
++        op(z);
++      });
++
++      twist::ed::std::thread t2([&] {
++        if (z.load(std::memory_order::relaxed) == 1) {
++          TWIST_ASSERT_M(x.load(std::memory_order::relaxed) == 1, "Pending store reordered with RMW");
++        }
++      });
++
++      t1.join();
++      t2.join();
++    };
++  };
++
++  SECTION("exchange") {
++    auto stat = tso::Dfs(tso::SimParams(true), rmw([](auto& z) {
++      z.exchange(1, std::memory_order::relaxed);
++    }));
++    REQUIRE(stat.Ok());
++  }
++
++  SECTION("fetch_add") {
++    auto stat = tso::Dfs(tso::SimParams(true), rmw([](auto& z) {
++      z.fetch_add(1, std::memory_order::relaxed);
++    }));
++    REQUIRE(stat.Ok());
++  }
++
++  SECTION("compare_exchange") {
++    auto stat = tso::Dfs(tso::SimParams(true), rmw([](auto& z) {
++      int expected = 0;
++      z.compare_exchange_strong(expected, 1, std::memory_order::relaxed);
++    }));
++    REQUIRE(stat.Ok());
++  }
++
++  SECTION("Plain store does not drain") {
++    auto stat = tso::Dfs(tso::SimParams(true), rmw([](auto& z) {
++      z.store(1, std::memory_order::relaxed);
++    }));
++    // FIFO: x = 1 is visible before z = 1
++    REQUIRE(stat.Ok());
++  }
++}
++
++TEST_CASE("Store-to-load forwarding") {
++  auto stat = tso::Dfs(tso::SimParams(true), [] {
++    twist::ed::std::atomic<int> x{0};
++
++    twist::ed::std::thread t([&] {
++      x.store(1, std::memory_order::relaxed);
++      TWIST_ASSERT_M(x.load(std::memory_order::relaxed) == 1, "Own store is not visible");
++      x.store(2, std::memory_order::relaxed);
++      TWIST_ASSERT_M(x.load(std::memory_order::relaxed) == 2, "Own store is not visible");
++    });
++
++    t.join();
++
++    TWIST_ASSERT_M(x.load() == 2, "Pending store lost");
++  });
++
++  REQUIRE(stat.Ok());
++}
++
++// Busy-wait loops without yields / fences:
++// pending store must eventually become visible to a spinning reader
++
++static void Handshake() {
++  twist::ed::std::atomic<int> flag{0};
++  twist::ed::std::atomic<int> ack{0};
++
++  twist::ed::std::thread writer([&] {
++    flag.store(1, std::memory_order::relaxed);
++    while (ack.load(std::memory_order::relaxed) == 0) {
++      // Busy wait
++    }
++  });
++
++  twist::ed::std::thread reader([&] {
++    while (flag.load(std::memory_order::relaxed) == 0) {
++      // Busy wait
++    }
++    ack.store(1, std::memory_order::relaxed);
++  });
++
++  writer.join();
++  reader.join();
++}
++
++static twist::sim::sched::DfsScheduler::Params SpinDfsParams() {
++  auto params = twist::sim::sched::DfsScheduler::Params{};
++  // Busy waiting requires forced preemptions
++  params.force_preempt_after_steps = 2;
++  // Non-terminating simulation
++  params.max_steps = 100;
++  return params;
++}
++
++TEST_CASE("Spin loop termination under DFS") {
++  SECTION("Store buffering off") {
++    auto stat = tso::Dfs(tso::SimParams(false), Handshake, SpinDfsParams());
++    fmt::println("Handshake / SC: simulations = {}, pruned = {}, max_steps = {}", stat.sims, stat.pruned, stat.max_steps);
++    REQUIRE(stat.Ok());
++    REQUIRE(stat.pruned == 0);
++  }
++
++  SECTION("Store buffering") {
++    auto sim_params = tso::SimParams(true);
++    // Reduce state space
++    sim_params.store_buffer_max_skips = 2;
++
++    auto stat = tso::Dfs(sim_params, Handshake, SpinDfsParams());
++    fmt::println("Handshake / TSO: simulations = {}, pruned = {}, max_steps = {}", stat.sims, stat.pruned, stat.max_steps);
++    REQUIRE(stat.Ok());
++    REQUIRE(stat.pruned == 0);
++  }
++
++  SECTION("Unbounded skips") {
++    // Left-most DFS branch: reader misses pending flag = 1 forever
++
++    auto sim_params = tso::SimParams(true);
++    sim_params.store_buffer_max_skips = std::numeric_limits<size_t>::max();
++
++    twist::sim::sched::DfsScheduler scheduler{SpinDfsParams()};
++    twist::sim::Simulator sim{&scheduler, sim_params};
++    auto result = sim.Run(Handshake);
++
++    REQUIRE(!result.Complete());
++    REQUIRE(result.std_err.find("max_steps") != std::string::npos);
++  }
++}
++
++TEST_CASE("Twist mutex under store buffering") {
++  auto test = [] {
++    twist::ed::std::mutex mutex;
++    twist::assist::Shared<int> counter{0};
++
++    twist::test::body::WaitGroup{}
++        .Add(3, [&] {
++          for (size_t i = 0; i < 2; ++i) {
++            mutex.lock();
++            *counter += 1;
++            mutex.unlock();
++          }
++        })
++        .Join();
++
++    TWIST_ASSERT_M(*counter == 6, "Lost increments");
++  };
++
++  SECTION("Random") {
++    auto stat = tso::Random(tso::SimParams(true), test, 1000);
++    REQUIRE(stat.Ok());
++  }
++
++  SECTION("DFS") {
++    auto dfs_params = twist::sim::sched::DfsScheduler::Params{};
++    dfs_params.max_preempts = 3;
++
++    auto stat = tso::Dfs(tso::SimParams(true), test, dfs_params);
++    fmt::println("Mutex / TSO: simulations = {}", stat.sims);
++    REQUIRE(stat.Ok());
++  }
++}
+diff --git a/tests/sim/tso/explore.hpp b/tests/sim/tso/explore.hpp
+new file mode 100644
+index 00000000..5a09117f
+--- /dev/null
++++ b/tests/sim/tso/explore.hpp
+@@ -0,0 +1,93 @@
++#pragma once
++
++#include <twist/sim.hpp>
++
++#include <cstdlib>
++#include <functional>
++#include <optional>
++#include <string>
++
++// Helpers for store buffering (x86-TSO) tests
++
++namespace tso {
++
++inline twist::sim::SimulatorParams SimParams(bool store_buffering) {
++  auto params = twist::sim::SimulatorParams{};
++  params.store_buffering = store_buffering;
++  params.malloc_randomize = false;
++  return params;
++}
++
++struct Stat {
++  size_t sims = 0;
++  size_t failures = 0;
++  size_t pruned = 0;
++  // Subset of pruned: non-terminating simulations
++  size_t max_steps = 0;
++  std::optional<twist::sim::Result> failure;
++
++  void Add(twist::sim::Result result) {
++    ++sims;
++    if (!result.Complete()) {
++      ++pruned;
++      if (result.std_err.find("max_steps") != std::string::npos) {
++        ++max_steps;
++      }
++    } else if (!result.Ok()) {
++      ++failures;
++      if (!failure) {
++        failure = std::move(result);
++      }
++    }
++  }
++
++  bool Ok() const {
++    return failures == 0;
++  }
++};
++
++using Main = std::function<void()>;
++
++// Exhaustive search
++inline Stat Dfs(twist::sim::SimulatorParams sim_params, Main main,
++                twist::sim::sched::DfsScheduler::Params dfs_params = {}) {
++  Stat stat;
++
++  twist::sim::sched::DfsScheduler scheduler{dfs_params};
++  do {
++    twist::sim::Simulator sim{&scheduler, sim_params};
++    stat.Add(sim.Run([main] { main(); }));
++  } while (scheduler.NextSchedule());
++
++  return stat;
++}
++
++inline Stat Random(twist::sim::SimulatorParams sim_params, Main main, size_t sims,
++                   uint64_t seed = 42) {
++  Stat stat;
++
++  twist::sim::sched::RandomScheduler scheduler{{.seed = seed}};
++  for (size_t i = 0; i < sims; ++i) {
++    twist::sim::Simulator sim{&scheduler, sim_params};
++    stat.Add(sim.Run([main] { main(); }));
++    scheduler.NextSchedule();
++  }
++
++  return stat;
++}
++
++inline Stat Pct(twist::sim::SimulatorParams sim_params, Main main, size_t sims,
++                size_t depth = 3, uint64_t seed = 42) {
++  Stat stat;
++
++  twist::sim::sched::PctScheduler scheduler{{.depth = depth, .seed = seed}};
++  for (size_t i = 0; i < sims; ++i) {
++    twist::sim::Simulator sim{&scheduler, sim_params};
++    stat.Add(sim.Run([main] { main(); }));
++    scheduler.NextSchedule();
++  }
++
++  return stat;
++}
++
++}  // namespace tso
+diff --git a/tests/sim/tso/litmus.cpp b/tests/sim/tso/litmus.cpp
+new file mode 100644
+index 00000000..a664f20a
+--- /dev/null
++++ b/tests/sim/tso/litmus.cpp
+@@ -0,0 +1,547 @@
++#include "explore.hpp"
++
++#include <twist/ed/std/atomic.hpp>
++#include <twist/ed/std/thread.hpp>
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <fmt/core.h>
++
++#include <array>
++
++// Litmus tests for store buffering (x86-TSO)
++// https://www.cl.cam.ac.uk/~pes20/weakmemory/x86tso-paper.tphols.pdf
++
++// Outcomes are counted by DFS over all schedules (including flush choices)
++
++using Outcomes = std::array<size_t, 4>;
++
++static size_t Index(int r0, int r1) {
++  return r0 * 2 + r1;
++}
++
++static Outcomes Explore(bool store_buffering, std::function<void(Outcomes&)> litmus) {
++  Outcomes outcomes{};
++
++  auto stat = tso::Dfs(tso::SimParams(store_buffering), [&outcomes, litmus] {
++    litmus(outcomes);
++  });
++
++  REQUIRE(stat.Ok());
++  REQUIRE(stat.pruned == 0);
++
++  fmt::println("Simulations: {}, outcomes: {}", stat.sims,
++               fmt::format("[00: {}, 01: {}, 10: {}, 11: {}]",
++                           outcomes[0], outcomes[1], outcomes[2], outcomes[3]));
++
++  return outcomes;
++}
++
++//////////////////////////////////////////////////////////////////////
++
++// SB: Store buffering
++//
++// T1: x = 1; r0 = y
++// T2: y = 1; r1 = x
++//
++// r0 = r1 = 0: allowed on x86-TSO, forbidden under SC
++
++enum class Barrier {
++  None,
++  SeqCstFence,
++  SeqCstStore,
++  Exchange,
++  FetchAdd,
++  FailedCas,
++};
++
++static void StoreBuffering(Outcomes& outcomes, Barrier barrier, std::memory_order load_mo) {
++  twist::ed::std::atomic<int> x{0};
++  twist::ed::std::atomic<int> y{0};
++  twist::ed::std::atomic<int> z{0};
++
++  int r0 = -1;
++  int r1 = -1;
++
++  auto store = [&](twist::ed::std::atomic<int>& a) {
++    switch (barrier) {
++      case Barrier::None:
++        a.store(1, std::memory_order::relaxed);
++        break;
++      case Barrier::SeqCstFence:
++        a.store(1, std::memory_order::relaxed);
++        twist::ed::std::atomic_thread_fence(std::memory_order::seq_cst);
++        break;
++      case Barrier::SeqCstStore:
++        a.store(1, std::memory_order::seq_cst);
++        break;
++      case Barrier::Exchange:
++        a.store(1, std::memory_order::release);
++        z.exchange(1, std::memory_order::relaxed);
++        break;
++      case Barrier::FetchAdd:
++        a.store(1, std::memory_order::release);
++        z.fetch_add(1, std::memory_order::relaxed);
++        break;
++      case Barrier::FailedCas: {
++        a.store(1, std::memory_order::release);
++        int expected = 42;
++        z.compare_exchange_strong(expected, 0, std::memory_order::relaxed);
++        break;
++      }
++    }
++  };
++
++  twist::ed::std::thread t1([&] {
++    store(x);
++    r0 = y.load(load_mo);
++  });
++
++  twist::ed::std::thread t2([&] {
++    store(y);
++    r1 = x.load(load_mo);
++  });
++
++  t1.join();
++  t2.join();
++
++  ++outcomes[Index(r0, r1)];
++}
++
++TEST_CASE("Litmus: SB") {
++  SECTION("Relaxed / store buffering off") {
++    auto outcomes = Explore(false, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::None, std::memory_order::relaxed);
++    });
++    REQUIRE(outcomes[Index(0, 0)] == 0);
++  }
++
++  SECTION("Relaxed") {
++    auto outcomes = Explore(true, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::None, std::memory_order::relaxed);
++    });
++    REQUIRE(outcomes[Index(0, 0)] > 0);
++    REQUIRE(outcomes[Index(0, 1)] > 0);
++    REQUIRE(outcomes[Index(1, 0)] > 0);
++    REQUIRE(outcomes[Index(1, 1)] > 0);
++  }
++
++  SECTION("Release / acquire") {
++    // x86: plain mov
++    auto outcomes = Explore(true, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::None, std::memory_order::acquire);
++    });
++    REQUIRE(outcomes[Index(0, 0)] > 0);
++  }
++
++  SECTION("seq_cst loads") {
++    // x86 mapping: seq_cst load = plain mov
++    auto outcomes = Explore(true, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::None, std::memory_order::seq_cst);
++    });
++    REQUIRE(outcomes[Index(0, 0)] > 0);
++  }
++
++  SECTION("seq_cst fences") {
++    auto outcomes = Explore(true, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::SeqCstFence, std::memory_order::relaxed);
++    });
++    REQUIRE(outcomes[Index(0, 0)] == 0);
++  }
++
++  SECTION("seq_cst fences / store buffering off") {
++    // atomic_thread_fence(seq_cst) is supported without store buffering
++    auto outcomes = Explore(false, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::SeqCstFence, std::memory_order::relaxed);
++    });
++    REQUIRE(outcomes[Index(0, 0)] == 0);
++  }
++
++  SECTION("seq_cst stores") {
++    auto outcomes = Explore(true, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::SeqCstStore, std::memory_order::seq_cst);
++    });
++    REQUIRE(outcomes[Index(0, 0)] == 0);
++  }
++}
++
++TEST_CASE("Litmus: SB + RMW") {
++  // Locked instructions drain the store buffer
++
++  SECTION("exchange") {
++    auto outcomes = Explore(true, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::Exchange, std::memory_order::acquire);
++    });
++    REQUIRE(outcomes[Index(0, 0)] == 0);
++  }
++
++  SECTION("fetch_add") {
++    auto outcomes = Explore(true, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::FetchAdd, std::memory_order::acquire);
++    });
++    REQUIRE(outcomes[Index(0, 0)] == 0);
++  }
++
++  SECTION("Failed compare_exchange") {
++    auto outcomes = Explore(true, [](Outcomes& o) {
++      StoreBuffering(o, Barrier::FailedCas, std::memory_order::acquire);
++    });
++    REQUIRE(outcomes[Index(0, 0)] == 0);
++  }
++}
++
++//////////////////////////////////////////////////////////////////////
++
++// MP: Message passing
++//
++// T1: data = 1; flag = 1
++// T2: r0 = flag; r1 = data
++//
++// r0 = 1, r1 = 0: forbidden on x86-TSO (FIFO store buffer)
++
++TEST_CASE("Litmus: MP") {
++  auto outcomes = Explore(true, [](Outcomes& o) {
++    twist::ed::std::atomic<int> data{0};
++    twist::ed::std::atomic<int> flag{0};
++
++    int r0 = -1;
++    int r1 = -1;
++
++    twist::ed::std::thread t1([&] {
++      data.store(1, std::memory_order::relaxed);
++      flag.store(1, std::memory_order::relaxed);
++    });
++
++    twist::ed::std::thread t2([&] {
++      r0 = flag.load(std::memory_order::relaxed);
++      r1 = data.load(std::memory_order::relaxed);
++    });
++
++    t1.join();
++    t2.join();
++
++    ++o[Index(r0, r1)];
++  });
++
++  REQUIRE(outcomes[Index(1, 0)] == 0);
++  REQUIRE(outcomes[Index(1, 1)] > 0);
++  REQUIRE(outcomes[Index(0, 0)] > 0);
++}
++
++//////////////////////////////////////////////////////////////////////
++
++// LB: Load buffering
++//
++// T1: r0 = x; y = 1
++// T2: r1 = y; x = 1
++//
++// r0 = r1 = 1: forbidden on x86-TSO
++
++TEST_CASE("Litmus: LB") {
++  auto outcomes = Explore(true, [](Outcomes& o) {
++    twist::ed::std::atomic<int> x{0};
++    twist::ed::std::atomic<int> y{0};
++
++    int r0 = -1;
++    int r1 = -1;
++
++    twist::ed::std::thread t1([&] {
++      r0 = x.load(std::memory_order::relaxed);
++      y.store(1, std::memory_order::relaxed);
++    });
++
++    twist::ed::std::thread t2([&] {
++      r1 = y.load(std::memory_order::relaxed);
++      x.store(1, std::memory_order::relaxed);
++    });
++
++    t1.join();
++    t2.join();
++
++    ++o[Index(r0, r1)];
++  });
++
++  REQUIRE(outcomes[Index(1, 1)] == 0);
++  REQUIRE(outcomes[Index(0, 0)] > 0);
++}
++
++//////////////////////////////////////////////////////////////////////
++
++// IRIW: Independent reads of independent writes
++//
++// T1: x = 1
++// T2: y = 1
++// T3: r0 = x; r1 = y
++// T4: r2 = y; r3 = x
++//
++// r0 = 1, r1 = 0, r2 = 1, r3 = 0: forbidden on x86-TSO (multi-copy atomic)
++
++struct IriwOutcomes {
++  size_t t3_saw_x_only = 0;
++  size_t t4_saw_y_only = 0;
++  size_t forbidden = 0;
++};
++
++static void Iriw(IriwOutcomes& o) {
++  twist::ed::std::atomic<int> x{0};
++  twist::ed::std::atomic<int> y{0};
++
++  int r0 = -1;
++  int r1 = -1;
++  int r2 = -1;
++  int r3 = -1;
++
++  twist::ed::std::thread t1([&] {
++    x.store(1, std::memory_order::relaxed);
++  });
++
++  twist::ed::std::thread t2([&] {
++    y.store(1, std::memory_order::relaxed);
++  });
++
++  twist::ed::std::thread t3([&] {
++    r0 = x.load(std::memory_order::acquire);
++    r1 = y.load(std::memory_order::acquire);
++  });
++
++  twist::ed::std::thread t4([&] {
++    r2 = y.load(std::memory_order::acquire);
++    r3 = x.load(std::memory_order::acquire);
++  });
++
++  t1.join();
++  t2.join();
++  t3.join();
++  t4.join();
++
++  if (r0 == 1 && r1 == 0) {
++    ++o.t3_saw_x_only;
++  }
++  if (r2 == 1 && r3 == 0) {
++    ++o.t4_saw_y_only;
++  }
++  if (r0 == 1 && r1 == 0 && r2 == 1 && r3 == 0) {
++    ++o.forbidden;
++  }
++}
++
++TEST_CASE("Litmus: IRIW") {
++  SECTION("DFS") {
++    // 5 threads: exhaustive search is too expensive, bound preemptions
++    auto dfs_params = twist::sim::sched::DfsScheduler::Params{};
++    dfs_params.max_preempts = 3;
++
++    IriwOutcomes o;
++    auto stat = tso::Dfs(tso::SimParams(true), [&o] { Iriw(o); }, dfs_params);
++
++    fmt::println("IRIW / DFS: simulations = {}", stat.sims);
++
++    REQUIRE(stat.Ok());
++    REQUIRE(o.t3_saw_x_only > 0);
++    REQUIRE(o.t4_saw_y_only > 0);
++    REQUIRE(o.forbidden == 0);
++  }
++
++  SECTION("Random") {
++    IriwOutcomes o;
++    auto stat = tso::Random(tso::SimParams(true), [&o] { Iriw(o); }, 20'000);
++
++    REQUIRE(stat.Ok());
++    REQUIRE(o.t3_saw_x_only > 0);
++    REQUIRE(o.t4_saw_y_only > 0);
++    REQUIRE(o.forbidden == 0);
++  }
++}
++
++//////////////////////////////////////////////////////////////////////
++
++// Coherence
++
++TEST_CASE("Litmus: CoRR") {
++  // T1: x = 1
++  // T2: r0 = x; r1 = x
++  //
++  // r0 = 1, r1 = 0: forbidden
++
++  auto outcomes = Explore(true, [](Outcomes& o) {
++    twist::ed::std::atomic<int> x{0};
++
++    int r0 = -1;
++    int r1 = -1;
++
++    twist::ed::std::thread t1([&] {
++      x.store(1, std::memory_order::relaxed);
++    });
++
++    twist::ed::std::thread t2([&] {
++      r0 = x.load(std::memory_order::relaxed);
++      r1 = x.load(std::memory_order::relaxed);
++    });
++
++    t1.join();
++    t2.join();
++
++    ++o[Index(r0, r1)];
++  });
++
++  REQUIRE(outcomes[Index(1, 0)] == 0);
++  REQUIRE(outcomes[Index(0, 1)] > 0);
++}
++
++TEST_CASE("Litmus: CoRR (2 writers)") {
++  // T1: x = 1
++  // T2: x = 2
++  // T3: r0 = x; r1 = x
++  // T4: r2 = x; r3 = x
++  //
++  // Readers must agree on the order of writes to x:
++  // r0 = 1, r1 = 2, r2 = 2, r3 = 1: forbidden
++
++  size_t one_then_two = 0;
++  size_t two_then_one = 0;
++  size_t forbidden = 0;
++
++  // 5 threads: exhaustive search is too expensive, bound preemptions
++  auto dfs_params = twist::sim::sched::DfsScheduler::Params{};
++  dfs_params.max_preempts = 3;
++
++  auto stat = tso::Dfs(tso::SimParams(true), [&] {
++    twist::ed::std::atomic<int> x{0};
++
++    int r0 = -1;
++    int r1 = -1;
++    int r2 = -1;
++    int r3 = -1;
++
++    twist::ed::std::thread t1([&] {
++      x.store(1, std::memory_order::relaxed);
++    });
++
++    twist::ed::std::thread t2([&] {
++      x.store(2, std::memory_order::relaxed);
++    });
++
++    twist::ed::std::thread t3([&] {
++      r0 = x.load(std::memory_order::relaxed);
++      r1 = x.load(std::memory_order::relaxed);
++    });
++
++    twist::ed::std::thread t4([&] {
++      r2 = x.load(std::memory_order::relaxed);
++      r3 = x.load(std::memory_order::relaxed);
++    });
++
++    t1.join();
++    t2.join();
++    t3.join();
++    t4.join();
++
++    bool t3_12 = (r0 == 1 && r1 == 2);
++    bool t3_21 = (r0 == 2 && r1 == 1);
++    bool t4_12 = (r2 == 1 && r3 == 2);
++    bool t4_21 = (r2 == 2 && r3 == 1);
++
++    if (t3_12 || t4_12) {
++      ++one_then_two;
++    }
++    if (t3_21 || t4_21) {
++      ++two_then_one;
++    }
++    if ((t3_12 && t4_21) || (t3_21 && t4_12)) {
++      ++forbidden;
++    }
++  }, dfs_params);
++
++  fmt::println("CoRR (2 writers) simulations: {}", stat.sims);
++
++  REQUIRE(stat.Ok());
++  REQUIRE(stat.pruned == 0);
++
++  REQUIRE(one_then_two > 0);
++  REQUIRE(two_then_one > 0);
++  REQUIRE(forbidden == 0);
++}
++
++TEST_CASE("Litmus: CoWR / CoWW") {
++  // T1: x = 1; r0 = x
++  // T2: x = 2
++  //
++  // r0 = 0: forbidden (CoWR, store-to-load forwarding)
++  // r0 = 2 && final x = 1: forbidden (CoWR + CoWW)
++  // r0 = 2: allowed (x = 1 flushed before x = 2)
++
++  std::array<size_t, 3> r0_values{};
++  std::array<size_t, 3> final_values{};
++  size_t forbidden = 0;
++
++  auto stat = tso::Dfs(tso::SimParams(true), [&] {
++    twist::ed::std::atomic<int> x{0};
++
++    int r0 = -1;
++
++    twist::ed::std::thread t1([&] {
++      x.store(1, std::memory_order::relaxed);
++      r0 = x.load(std::memory_order::relaxed);
++    });
++
++    twist::ed::std::thread t2([&] {
++      x.store(2, std::memory_order::relaxed);
++    });
++
++    t1.join();
++    t2.join();
++
++    int final = x.load(std::memory_order::relaxed);
++
++    ++r0_values[r0];
++    ++final_values[final];
++
++    if (r0 == 2 && final == 1) {
++      ++forbidden;
++    }
++  });
++
++  REQUIRE(stat.Ok());
++  REQUIRE(stat.pruned == 0);
++
++  REQUIRE(r0_values[0] == 0);
++  REQUIRE(r0_values[1] > 0);
++  REQUIRE(r0_values[2] > 0);
++  REQUIRE(final_values[1] > 0);
++  REQUIRE(final_values[2] > 0);
++  REQUIRE(forbidden == 0);
++}
++
++TEST_CASE("Litmus: 2+2W") {
++  // T1: x = 1; y = 2
++  // T2: y = 1; x = 2
++  //
++  // Final x = 1, y = 1: forbidden on x86-TSO
++
++  size_t forbidden = 0;
++
++  auto stat = tso::Dfs(tso::SimParams(true), [&] {
++    twist::ed::std::atomic<int> x{0};
++    twist::ed::std::atomic<int> y{0};
++
++    twist::ed::std::thread t1([&] {
++      x.store(1, std::memory_order::relaxed);
++      y.store(2, std::memory_order::relaxed);
++    });
++
++    twist::ed::std::thread t2([&] {
++      y.store(1, std::memory_order::relaxed);
++      x.store(2, std::memory_order::relaxed);
++    });
++
++    t1.join();
++    t2.join();
++
++    if (x.load() == 1 && y.load() == 1) {
++      ++forbidden;
++    }
++  });
++
++  REQUIRE(stat.Ok());
++  REQUIRE(forbidden == 0);
++}
+diff --git a/tests/sim/tso/main.cpp b/tests/sim/tso/main.cpp
+new file mode 100644
+index 00000000..9a3c4cfb
+--- /dev/null
++++ b/tests/sim/tso/main.cpp
+@@ -0,0 +1,3 @@
++#include <twist/config.hpp>
++
++static_assert(twist::config::kIsolatedSim);
+diff --git a/tests/sim/tso/replay.cpp b/tests/sim/tso/replay.cpp
+new file mode 100644
+index 00000000..4ea4829f
+--- /dev/null
++++ b/tests/sim/tso/replay.cpp
+@@ -0,0 +1,82 @@
++#include "explore.hpp"
++
++#include <twist/ed/std/atomic.hpp>
++#include <twist/ed/std/thread.hpp>
++
++#include <twist/assist/assert.hpp>
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <fmt/core.h>
++
++#include <utility>
++
++// Flush choices are scheduler decisions:
++// recorded by Recorder and reproduced by ReplayScheduler
++
++// SB litmus: TWIST_ASSERT fails on r0 = r1 = 0
++static void StoreBufferingAssert() {
++  twist::ed::std::atomic<int> x{0};
++  twist::ed::std::atomic<int> y{0};
++
++  int r0 = -1;
++  int r1 = -1;
++
++  twist::ed::std::thread t1([&] {
++    x.store(1, std::memory_order::relaxed);
++    r0 = y.load(std::memory_order::relaxed);
++  });
++
++  twist::ed::std::thread t2([&] {
++    y.store(1, std::memory_order::relaxed);
++    r1 = x.load(std::memory_order::relaxed);
++  });
++
++  t1.join();
++  t2.join();
++
++  TWIST_ASSERT_M(!(r0 == 0 && r1 == 0), "Store -> load reordering");
++}
++
++TEST_CASE("Replay flush choices") {
++  auto sim_params = tso::SimParams(true);
++  // Make digest sensitive to loaded values
++  sim_params.digest_atomic_loads = true;
++
++  twist::sim::sched::RandomScheduler random{{.seed = 17}};
++
++  size_t failures = 0;
++  size_t passes = 0;
++
++  for (size_t i = 0; i < 256; ++i) {
++    auto [schedule, recorded] = [&] {
++      twist::sim::sched::Recorder recorder{&random};
++      twist::sim::Simulator sim{&recorder, sim_params};
++      auto result = sim.Run(StoreBufferingAssert);
++      return std::pair{recorder.GetSchedule(), result};
++    }();
++
++    if (recorded.Ok()) {
++      ++passes;
++    } else {
++      ++failures;
++    }
++
++    {
++      twist::sim::sched::ReplayScheduler replay{schedule};
++      twist::sim::Simulator sim{&replay, sim_params};
++      auto replayed = sim.Run(StoreBufferingAssert);
++
++      REQUIRE(replayed.status == recorded.status);
++      REQUIRE(replayed.digest == recorded.digest);
++      REQUIRE(replayed.std_err == recorded.std_err);
++    }
++
++    random.NextSchedule();
++  }
++
++  fmt::println("Replay: {} passed / {} failed simulations reproduced", passes, failures);
++
++  REQUIRE(failures > 0);
++  REQUIRE(passes > 0);
++}
+diff --git a/tests/sim/tso/wake.cpp b/tests/sim/tso/wake.cpp
+new file mode 100644
+index 00000000..b6c5394b
+--- /dev/null
++++ b/tests/sim/tso/wake.cpp
+@@ -0,0 +1,126 @@
++#include "explore.hpp"
++
++#include <twist/ed/std/atomic.hpp>
++#include <twist/ed/std/thread.hpp>
++#include <twist/ed/wait/futex.hpp>
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <fmt/core.h>
++
++// Dekker-style wake-up protocol:
++//
++// Consumer: sleeping = true; [fence]; if (!ready) { wait }
++// Producer: ready = true; [fence]; if (sleeping) { wake }
++//
++// Without seq_cst fences both loads may miss the stores
++// (still in store buffers) => lost wake-up => deadlock
++
++static void WakeProtocol(bool fences) {
++  twist::ed::std::atomic<uint32_t> epoch{0};
++  twist::ed::std::atomic<bool> sleeping{false};
++  twist::ed::std::atomic<bool> ready{false};
++
++  auto fence = [fences] {
++    if (fences) {
++      twist::ed::std::atomic_thread_fence(std::memory_order::seq_cst);
++    }
++  };
++
++  twist::ed::std::thread consumer([&] {
++    uint32_t e = epoch.load(std::memory_order::relaxed);
++
++    sleeping.store(true, std::memory_order::relaxed);
++    fence();
++    if (!ready.load(std::memory_order::relaxed)) {
++      // Until epoch != e
++      twist::ed::futex::Wait(epoch, e, std::memory_order::relaxed);
++    }
++  });
++
++  twist::ed::std::thread producer([&] {
++    ready.store(true, std::memory_order::relaxed);
++    fence();
++    if (sleeping.load(std::memory_order::relaxed)) {
++      auto wake_key = twist::ed::futex::PrepareWake(epoch);
++      epoch.fetch_add(1, std::memory_order::relaxed);
++      twist::ed::futex::WakeOne(wake_key);
++    }
++  });
++
++  consumer.join();
++  producer.join();
++}
++
++static void Report(const char* name, const tso::Stat& stat) {
++  fmt::println("{}: simulations = {}, failures = {}", name, stat.sims, stat.failures);
++  if (stat.failure) {
++    REQUIRE(stat.failure->status == twist::sim::Status::Deadlock);
++  }
++}
++
++TEST_CASE("Wake protocol: Random") {
++  static const size_t kSims = 1000;
++
++  SECTION("No fences / store buffering off") {
++    auto stat = tso::Random(tso::SimParams(false), [] { WakeProtocol(false); }, kSims);
++    Report("Random, no fences, SC", stat);
++    REQUIRE(stat.Ok());
++  }
++
++  SECTION("No fences") {
++    auto stat = tso::Random(tso::SimParams(true), [] { WakeProtocol(false); }, kSims);
++    Report("Random, no fences, TSO", stat);
++    REQUIRE(!stat.Ok());
++  }
++
++  SECTION("Fences") {
++    auto stat = tso::Random(tso::SimParams(true), [] { WakeProtocol(true); }, kSims);
++    Report("Random, fences, TSO", stat);
++    REQUIRE(stat.Ok());
++  }
++}
++
++TEST_CASE("Wake protocol: PCT") {
++  static const size_t kSims = 1000;
++
++  SECTION("No fences / store buffering off") {
++    auto stat = tso::Pct(tso::SimParams(false), [] { WakeProtocol(false); }, kSims);
++    Report("PCT, no fences, SC", stat);
++    REQUIRE(stat.Ok());
++  }
++
++  SECTION("No fences") {
++    auto stat = tso::Pct(tso::SimParams(true), [] { WakeProtocol(false); }, kSims);
++    Report("PCT, no fences, TSO", stat);
++    REQUIRE(!stat.Ok());
++  }
++
++  SECTION("Fences") {
++    auto stat = tso::Pct(tso::SimParams(true), [] { WakeProtocol(true); }, kSims);
++    Report("PCT, fences, TSO", stat);
++    REQUIRE(stat.Ok());
++  }
++}
++
++TEST_CASE("Wake protocol: DFS") {
++  SECTION("No fences / store buffering off") {
++    auto stat = tso::Dfs(tso::SimParams(false), [] { WakeProtocol(false); });
++    Report("DFS, no fences, SC", stat);
++    REQUIRE(stat.Ok());
++    REQUIRE(stat.pruned == 0);
++  }
++
++  SECTION("No fences") {
++    auto stat = tso::Dfs(tso::SimParams(true), [] { WakeProtocol(false); });
++    Report("DFS, no fences, TSO", stat);
++    REQUIRE(!stat.Ok());
++  }
++
++  SECTION("Fences") {
++    auto stat = tso::Dfs(tso::SimParams(true), [] { WakeProtocol(true); });
++    Report("DFS, fences, TSO", stat);
++    REQUIRE(stat.Ok());
++    REQUIRE(stat.pruned == 0);
++  }
++}
+-- 
+2.56.0
+

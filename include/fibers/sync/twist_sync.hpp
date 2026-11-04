@@ -10,6 +10,11 @@
 // Requires linking against the `twist` CMake target (FIBERS_TWIST=ON), built
 // with TWIST_ED_STD_ATOMIC_WAIT=ON (cmake/Twist.cmake sets it): parked workers
 // sleep in Atomic<std::uint32_t>::wait, which the simulator models as a futex.
+//
+// Needs Twist with our local patches (third_party/twist/patches): seq_cst
+// fences in the simulator, and the opt-in x86-TSO store buffers
+// (TWIST_SIM_STORE_BUFFERING, on in the clang-twist-sim preset and the nix
+// twist-sim package) under which a missing seq_cst fence is observable.
 
 #include <twist/ed/static/thread_local/var.hpp>
 #include <twist/ed/std/atomic.hpp>
@@ -42,18 +47,11 @@ struct TwistSync {
     // In the simulator this is a scheduling point (yield).
     static void spin_hint() noexcept { twist::ed::CpuRelax(); }
 
+    // seq_cst included: the simulator supports it (local Twist patch 0001)
+    // and, in store-buffering mode, it drains the thread's store buffer like
+    // MFENCE. Weakening it to acq_rel would hide exactly the store -> load
+    // reorderings that mode exists to expose.
     static void atomic_thread_fence(std::memory_order order) noexcept {
-#if defined(__TWIST_SIM__)
-        // The simulator panics on seq_cst fences. It runs atomics sequentially
-        // consistently (every load reads the latest store in its single
-        // timeline), so the store-load ordering a seq_cst fence adds holds by
-        // construction; what is left is its happens-before part: acq_rel.
-        // Consequence: store->load reordering, i.e. a MISSING seq_cst fence,
-        // cannot be observed in simulation (see the real-thread tests).
-        if (order == std::memory_order_seq_cst) {
-            order = std::memory_order_acq_rel;
-        }
-#endif
         twist::ed::std::atomic_thread_fence(order);
     }
 
@@ -73,9 +71,11 @@ struct TwistSync {
 #if defined(__TWIST_SIM__)
     // Checker hooks for lock-free containers (see queue::detail::HasHbProbe in
     // lock_free_spmc_queue.hpp and ipc::detail::HasHbProbe in spsc_ring.hpp).
-    // The simulator gives every atomic load the latest value, so ordering bugs
-    // between racy-by-design atomics are only visible through happens-before
-    // checks of plain memory: this probe.
+    // Even with store buffering the simulator is x86-TSO: loads are never
+    // reordered with loads nor stores with stores, so a missing release /
+    // acquire between racy-by-design atomics does not change any value they
+    // read. It is only visible through happens-before checks of plain
+    // memory: this probe.
     class HbProbe {
     public:
         void write() noexcept { cell_.Write(0); }

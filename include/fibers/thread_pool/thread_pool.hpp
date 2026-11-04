@@ -200,8 +200,8 @@ template <class Sync>
 //   worker already sleeps, stay with B; (b) the overload check is a relaxed
 //   load without a fence, so on real hardware a worker that parks or stops
 //   searching at that very moment may miss B's last submit (a store-load race
-//   of nanoseconds; the Twist simulator, being sequentially consistent, does
-//   not explore it). Fibers never block a worker, so this is a non-goal.
+//   of nanoseconds, which no test targets). Fibers never block a worker, so
+//   this is a non-goal.
 
 // main_box defaults to the lock-free SPMC ring (owner push without RMW, one
 // CAS per popped/stolen batch); LockedSPSCQueue remains available as Q.

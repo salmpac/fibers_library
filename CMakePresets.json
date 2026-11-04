@@ -86,7 +86,8 @@
       "cacheVariables": {
         "TWIST_FAULTY": "ON",
         "TWIST_SIM": "ON",
-        "TWIST_SIM_ISOLATION": "ON"
+        "TWIST_SIM_ISOLATION": "ON",
+        "TWIST_SIM_STORE_BUFFERING": "ON"
       }
     },
     {

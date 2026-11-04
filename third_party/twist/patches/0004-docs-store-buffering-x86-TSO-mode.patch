@@ -1,0 +1,148 @@
+From 280d133dcb27945e87a594eb990d92a423b36d60 Mon Sep 17 00:00:00 2001
+From: Sergey Dushenkov <ss.dushenkov@gmail.com>
+Date: Wed, 4 Nov 2026 23:08:26 +0300
+Subject: [PATCH 4/5] docs: store buffering (x86-TSO) mode
+
+Describe the opt-in mode and its parameters, and its limits in
+"Non-goals / C++ MM": TSO only, not the C++ memory model.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0174gihuXWLUfMwAE3xin9ru
+---
+ README.md                           |  1 +
+ docs/ru/twist/non-goals.md          |  6 +++
+ docs/ru/twist/sim.md                |  3 +-
+ docs/ru/twist/sim/runtime-checks.md |  1 +
+ docs/ru/twist/sim/tso.md            | 69 +++++++++++++++++++++++++++++
+ 5 files changed, 79 insertions(+), 1 deletion(-)
+ create mode 100644 docs/ru/twist/sim/tso.md
+
+diff --git a/README.md b/README.md
+index a02a2a9f..63db7796 100644
+--- a/README.md
++++ b/README.md
+@@ -52,6 +52,7 @@ Keywords: [_fault injection_](https://en.wikipedia.org/wiki/Fault_injection), [_
+       - [Happens-before](https://eel.is/c++draft/intro.races#11) tracking, precise data race detection (with `twist::assist::Shared<T>` annotations)
+         - `std::atomic_thread_fence` support
+         - [`malloc`](https://eel.is/c++draft/new.delete.dataraces) support
++      - Store → load reordering ([x86-TSO](https://www.cl.cam.ac.uk/~pes20/weakmemory/cacm.pdf) store buffers, opt-in: `TWIST_SIM_STORE_BUFFERING` / `SimulatorParams::store_buffering`)
+   - Memory
+     - Leaks (automatic),
+     - Double-free (automatic),
+diff --git a/docs/ru/twist/non-goals.md b/docs/ru/twist/non-goals.md
+index 9b06d27f..a3ac11dc 100644
+--- a/docs/ru/twist/non-goals.md
++++ b/docs/ru/twist/non-goals.md
+@@ -14,3 +14,9 @@
+ Задача верификации для С++ MM (на данный момент?) решается только в маленьком масштабе (отдельных примитивов синхронизации), так что для нее лучше применять специализированные инструменты.
+ 
+ Рекомендация: [GenMC](https://plv.mpi-sws.org/genmc/)
++
++Симулятор по умолчанию исполняет атомарные операции последовательно согласованно и проверяет только happens-before (гонки).
++
++Опционально (выключено по умолчанию) симулятор моделирует [буферизацию записей x86-TSO](sim/tso.md): переупорядочивание store → load,
++например, пропущенный `atomic_thread_fence(seq_cst)` в протоколе засыпания / пробуждения. Это не верификация относительно С++ MM:
++остальные переупорядочивания, допустимые в С++ (и на ARM / POWER), не воспроизводятся.
+diff --git a/docs/ru/twist/sim.md b/docs/ru/twist/sim.md
+index 3ff56823..f67c6d0a 100644
+--- a/docs/ru/twist/sim.md
++++ b/docs/ru/twist/sim.md
+@@ -2,4 +2,5 @@
+ 
+ - [Дизайн](sim/design.md)
+ - [Реестр планировщиков](sim/sched.md)
+-- [Проверки](sim/runtime-checks.md)
+\ No newline at end of file
++- [Проверки](sim/runtime-checks.md)
++- [Буферизация записей (x86-TSO)](sim/tso.md)
+\ No newline at end of file
+diff --git a/docs/ru/twist/sim/runtime-checks.md b/docs/ru/twist/sim/runtime-checks.md
+index f3eeb696..e9c25a06 100644
+--- a/docs/ru/twist/sim/runtime-checks.md
++++ b/docs/ru/twist/sim/runtime-checks.md
+@@ -6,6 +6,7 @@
+   * 🤖 Дэдлоки – автоматически (при использовании блокирующих примитивов синхронзации)
+   * 🖐️ Гонки (data races) – на объектах, помеченных как `twist::assist::Shared<T>`
+     * поддерживается `atomic_thread_fence`
++  * 🤖 Переупорядочивание store → load (x86-TSO) – в [режиме буферизации записей](tso.md), выключен по умолчанию
+ * Память
+     * 🤖 Утечки (memory leaks) – автоматически
+       * с помощью аннотации `twist::assist::New<T>` можно сохранить контекст аллокации для отчета,
+diff --git a/docs/ru/twist/sim/tso.md b/docs/ru/twist/sim/tso.md
+new file mode 100644
+index 00000000..6ae45282
+--- /dev/null
++++ b/docs/ru/twist/sim/tso.md
+@@ -0,0 +1,69 @@
++# Симуляция
++
++## Буферизация записей (x86-TSO)
++
++По умолчанию симулятор исполняет атомарные операции _последовательно согласованно_: каждое чтение видит последнюю запись в память,
++а модель памяти C++ используется только для отслеживания отношения happens-before (для поиска гонок на `twist::assist::Shared<T>`).
++
++В таком режиме не воспроизводится переупорядочивание store → load, поэтому ошибки вида «забыли `atomic_thread_fence(seq_cst)`» не видны.
++Типичный пример – потерянное пробуждение в протоколе в стиле Деккера:
++
++```cpp
++// Consumer                          // Producer
++sleeping.store(true, relaxed);       ready.store(true, relaxed);
++// atomic_thread_fence(seq_cst);     // atomic_thread_fence(seq_cst);
++if (!ready.load(relaxed)) {          if (sleeping.load(relaxed)) {
++  Park();                              Wake();
++}                                    }
++```
++
++Без барьеров оба чтения могут не увидеть записи, которые еще находятся в буферах записи процессоров, и консьюмер заснет навсегда.
++
++Режим _буферизации записей_ моделирует [x86-TSO](https://www.cl.cam.ac.uk/~pes20/weakmemory/cacm.pdf):
++
++- у каждого потока есть FIFO-буфер записей,
++- `store` с `memory_order::relaxed` / `release` попадает в буфер потока,
++- поток читает собственные записи из буфера (store-to-load forwarding),
++- перед чтением из памяти планировщик (через `RandomChoice`) решает, сбросить ли в память ожидающие записи других потоков в эту ячейку (вместе с более старыми записями из того же буфера) или прочитать старое значение,
++- буфер потока сбрасывается полностью
++  - в `store` с `memory_order::seq_cst` (`mov` + `mfence`),
++  - в `atomic_thread_fence(memory_order::seq_cst)` (`mfence`),
++  - в RMW-операциях (`exchange`, `fetch_add`, `compare_exchange_*`, в том числе неудачных),
++  - в системных вызовах: `futex::Wait` / `Wake`, `std::atomic<T>::wait` / `notify_*`, `yield` / `SpinWait` / `CpuRelax`, `sleep_for`, создание и завершение потока,
++  - в примитивах синхронизации Twist (`std::mutex::unlock` и т.п.).
++
++Сброс буфера перед системным вызовом – отдельный шаг, перед которым поток может быть вытеснен.
++
++Решения о сбросе буферов – обычные решения планировщика: `Dfs` перебирает их, `Recorder` записывает, `Replay` воспроизводит.
++
++### Включение
++
++Режим выключен по умолчанию.
++
++| Параметр                                          | По умолчанию | Описание                                                                                          |
++|---------------------------------------------------|--------------|---------------------------------------------------------------------------------------------------|
++| CMake опция `TWIST_SIM_STORE_BUFFERING`           | `OFF`        | Значение по умолчанию для `SimulatorParams::store_buffering` (compile definition `__TWIST_SIM_STORE_BUFFERING__`) |
++| `SimulatorParams::store_buffering`                | `false`      | Включить буферизацию записей для конкретной симуляции                                              |
++| `SimulatorParams::store_buffer_capacity`          | 16           | Емкость буфера потока; при переполнении в память уходит самая старая запись                       |
++| `SimulatorParams::store_buffer_max_skips`         | 4            | Сколько чтений других потоков может «не заметить» ожидающую запись, после чего она сбрасывается   |
++
++```cpp
++auto params = twist::sim::SimulatorParams{};
++params.store_buffering = true;
++
++twist::sim::Simulator sim{&scheduler, params};
++```
++
++Параметр `store_buffer_max_skips` гарантирует, что запись рано или поздно станет видна (как на реальном процессоре):
++без него `Dfs` мог бы бесконечно выбирать «не сбрасывать» в цикле активного ожидания.
++
++### Ограничения
++
++- Моделируется только x86-TSO, а не модель памяти C++ целиком: не воспроизводятся переупорядочивания load → load, store → store, load → store,
++  чтения «из будущего» и не-multi-copy-atomic поведение (ARM, POWER). Например, `relaxed` вместо `release` / `acquire` в message passing по-прежнему не обнаруживается
++  (для этого есть проверка happens-before с `twist::assist::Shared<T>`).
++- `seq_cst`-чтения не сбрасывают буфер (как `mov` на x86): барьер нужен на стороне записи.
++- Для happens-before `atomic_thread_fence(seq_cst)` эквивалентен `acq_rel`.
++- Режим увеличивает пространство перебора для `Dfs` и требует больше итераций для рандомизированных планировщиков.
++
++Для полной верификации кода относительно модели памяти C++ по-прежнему рекомендуется [GenMC](https://plv.mpi-sws.org/genmc/), см. [Non-goals](../non-goals.md).
+-- 
+2.56.0
+
