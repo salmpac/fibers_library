@@ -4,7 +4,7 @@
 // sharded_object_pool.hpp with intrusive nodes and a pluggable per-shard free
 // list (see shard_stacks.hpp).
 //
-// Same contract and options as MutexVectorPool: objects are default
+// Contract (see sharded_object_pool.hpp): objects are default
 // constructed, owned by the pool for its whole lifetime (type-stable), shard
 // selection per operation is ShardSelect::kRoundRobin or kHome, an empty start
 // shard makes acquire() probe the others, and when all are empty the pool
@@ -145,21 +145,13 @@ private:
 };
 
 // The variants, ready to use.
-template <class T, SyncPolicy Sync = StdSync, class Lock = thread_pool::SpinLock<Sync>>
-using LockedListPool = ShardedPool<T, LockedStack<Sync, Lock>, Sync>;
-
 template <class T, SyncPolicy Sync = StdSync>
 using TaggedPool = ShardedPool<T, TaggedStack<Sync>, Sync>;
 
+// Default object pool: shards are tagged Treiber stacks, the fastest
+// lock-free variant in object_pool_bench. Keep PoolOptions::select at
+// kRoundRobin when objects are released on other threads (fibers, tasks).
 template <class T, SyncPolicy Sync = StdSync>
-using AtomicPointerPool = ShardedPool<T, AtomicPointerStack<Sync>, Sync>;
-
-// AtomicPointer without the per-pop refcount pin (validated read instead).
-template <class T, SyncPolicy Sync = StdSync>
-using AtomicPointerValidatedPool =
-    ShardedPool<T, AtomicPointerStack<Sync, ReadMode::kValidated>, Sync>;
-
-template <class T, SyncPolicy Sync = StdSync>
-using HazardPool = ShardedPool<T, HazardStack<Sync>, Sync>;
+using DefaultPool = TaggedPool<T, Sync>;
 
 }  // namespace object_pool

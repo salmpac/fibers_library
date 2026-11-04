@@ -1,6 +1,8 @@
 #pragma once
 
-// Sharded object pools.
+// Sharded object pools: common definitions (options, shard selection,
+// per-thread state, the ObjectPool concept). The pool itself is
+// ShardedPool / DefaultPool in sharded_pool.hpp.
 //
 // A pool owns objects of type T for its whole lifetime: acquire() hands out a
 // pointer to an existing (default-constructed, possibly reused) object,
@@ -17,9 +19,6 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <mutex>
-#include <vector>
 
 #include "thread_pool/sync.hpp"
 
@@ -44,33 +43,14 @@ struct PoolOptions {
     std::size_t initial_objects = 1024;  // preallocated, spread over shards
     std::size_t grow_chunk = 256;        // objects allocated when all shards are empty
     ShardSelect select = ShardSelect::kRoundRobin;
-    // Upper bound on threads inside acquire()/release() at the same time.
-    // Sizes per-thread tables of the lock-free variants: AtomicPointer slot
-    // tables (4 * max_threads slots per shard) and hazard slots (min(max_threads,
-    // 16) per shard); the other pools ignore it. Exceeding it is safe (never a
-    // deadlock) but makes extra threads spin until a slot frees.
-    std::size_t max_threads = 64;
 };
 
 namespace detail {
 
 struct PoolThreadState {
     std::uint64_t cursor = 0;
-    std::uint64_t rng = 0;  // xorshift64 state, never 0 once seeded
-    std::size_t hazard_hint = 0;    // hazard-pointer slot that worked last time
-    std::size_t ticket_cursor = 0;  // AtomicPointer slot-bag scan position
     bool seeded = false;
 };
-
-// Cheap per-thread randomness (start positions of table scans).
-inline std::uint64_t next_random(PoolThreadState& state) noexcept {
-    std::uint64_t x = state.rng;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    state.rng = x;
-    return x;
-}
 
 // Same rules as thread_pool::detail::thread_state(): fibers may migrate
 // between threads, so the thread-local is reached only through a call that is
@@ -81,9 +61,6 @@ template <class Sync>
     PoolThreadState& state = Sync::template thread_local_instance<PoolThreadState>();
     if (!state.seeded) [[unlikely]] {
         state.cursor = static_cast<std::uint64_t>(Sync::random_seed());
-        state.rng = static_cast<std::uint64_t>(Sync::random_seed()) | 1;
-        state.ticket_cursor = static_cast<std::size_t>(next_random(state));
-        state.hazard_hint = static_cast<std::size_t>(next_random(state));
         state.seeded = true;
     }
     return state;
@@ -92,98 +69,9 @@ template <class Sync>
 inline PoolOptions normalize(PoolOptions options) {
     options.shards = std::max<std::size_t>(options.shards, 1);
     options.grow_chunk = std::max<std::size_t>(options.grow_chunk, 1);
-    options.max_threads = std::max<std::size_t>(options.max_threads, 1);
     return options;
 }
 
 }  // namespace detail
-
-// Baseline: every shard is a lock + std::vector<T*> free list.
-// Lock defaults to Sync::Mutex; thread_pool::SpinLock<Sync> also fits.
-template <class T, SyncPolicy Sync = StdSync, class Lock = typename Sync::Mutex>
-    requires std::default_initializable<T>
-class MutexVectorPool {
-public:
-    using value_type = T;
-
-    explicit MutexVectorPool(PoolOptions options = {})
-        : options_(detail::normalize(options)),
-          shards_(std::make_unique<Shard[]>(options_.shards)) {
-        if (options_.initial_objects != 0) {
-            T* objects = allocate_chunk(options_.initial_objects);
-            for (std::size_t i = 0; i < options_.initial_objects; ++i) {
-                shards_[i % options_.shards].free.push_back(objects + i);
-            }
-        }
-    }
-
-    MutexVectorPool(const MutexVectorPool&) = delete;
-    MutexVectorPool& operator=(const MutexVectorPool&) = delete;
-
-    T* acquire() {
-        const std::size_t n = options_.shards;
-        const std::size_t start = next_shard();
-        for (std::size_t i = 0; i < n; ++i) {
-            Shard& shard = shards_[(start + i) % n];
-            std::lock_guard guard(shard.lock);
-            if (!shard.free.empty()) {
-                T* object = shard.free.back();
-                shard.free.pop_back();
-                return object;
-            }
-        }
-        return grow_and_take(start);
-    }
-
-    void release(T* object) {
-        Shard& shard = shards_[next_shard() % options_.shards];
-        std::lock_guard guard(shard.lock);
-        shard.free.push_back(object);
-    }
-
-    // Total number of objects owned by the pool (in use + free).
-    std::size_t capacity() const {
-        std::lock_guard guard(grow_lock_);
-        return capacity_;
-    }
-
-private:
-    struct alignas(kCacheLineSize) Shard {
-        Lock lock;
-        std::vector<T*> free;
-    };
-
-    std::size_t next_shard() noexcept {
-        detail::PoolThreadState& state = detail::pool_thread_state<Sync>();
-        return static_cast<std::size_t>(
-            options_.select == ShardSelect::kRoundRobin ? state.cursor++ : state.cursor);
-    }
-
-    T* allocate_chunk(std::size_t count) {
-        std::lock_guard guard(grow_lock_);
-        chunks_.push_back(std::make_unique<T[]>(count));
-        capacity_ += count;
-        return chunks_.back().get();
-    }
-
-    T* grow_and_take(std::size_t shard_index) {
-        T* objects = allocate_chunk(options_.grow_chunk);
-        if (options_.grow_chunk > 1) {
-            Shard& shard = shards_[shard_index % options_.shards];
-            std::lock_guard guard(shard.lock);
-            for (std::size_t i = 1; i < options_.grow_chunk; ++i) {
-                shard.free.push_back(objects + i);
-            }
-        }
-        return objects;
-    }
-
-    const PoolOptions options_;
-    std::unique_ptr<Shard[]> shards_;
-
-    mutable typename Sync::Mutex grow_lock_;
-    std::vector<std::unique_ptr<T[]>> chunks_;
-    std::size_t capacity_ = 0;
-};
 
 }  // namespace object_pool

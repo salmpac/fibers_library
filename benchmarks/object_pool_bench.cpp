@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-#include "object_pool/sharded_object_pool.hpp"
+#include "baseline_pools.hpp"
 #include "object_pool/sharded_pool.hpp"
 #include "thread_pool/spin_lock.hpp"
 #include "thread_pool/spsc_queue.hpp"
@@ -57,26 +57,19 @@ struct NewDelete {
     std::size_t capacity() const { return 0; }
 };
 
-using MutexRR = Configured<op::MutexVectorPool<Obj>, op::ShardSelect::kRoundRobin>;
-using MutexHome = Configured<op::MutexVectorPool<Obj>, op::ShardSelect::kHome>;
-using SpinRR = Configured<op::MutexVectorPool<Obj, op::StdSync, thread_pool::SpinLock<>>,
+using MutexRR = Configured<op::baseline::MutexVectorPool<Obj>, op::ShardSelect::kRoundRobin>;
+using MutexHome = Configured<op::baseline::MutexVectorPool<Obj>, op::ShardSelect::kHome>;
+using SpinRR = Configured<op::baseline::MutexVectorPool<Obj, op::StdSync, thread_pool::SpinLock<>>,
                           op::ShardSelect::kRoundRobin>;
-using SpinHome = Configured<op::MutexVectorPool<Obj, op::StdSync, thread_pool::SpinLock<>>,
+using SpinHome = Configured<op::baseline::MutexVectorPool<Obj, op::StdSync, thread_pool::SpinLock<>>,
                             op::ShardSelect::kHome>;
 
 // Intrusive-node pools (sharded_pool.hpp): shard free list = spin-locked list,
-// tagged Treiber stack, AtomicPointer stack, hazard-pointer stack.
-using LockedRR = Configured<op::LockedListPool<Obj>, op::ShardSelect::kRoundRobin>;
-using LockedHome = Configured<op::LockedListPool<Obj>, op::ShardSelect::kHome>;
+// tagged Treiber stack (DefaultPool).
+using LockedRR = Configured<op::baseline::LockedListPool<Obj>, op::ShardSelect::kRoundRobin>;
+using LockedHome = Configured<op::baseline::LockedListPool<Obj>, op::ShardSelect::kHome>;
 using TaggedRR = Configured<op::TaggedPool<Obj>, op::ShardSelect::kRoundRobin>;
 using TaggedHome = Configured<op::TaggedPool<Obj>, op::ShardSelect::kHome>;
-using AtomicPtrRR = Configured<op::AtomicPointerPool<Obj>, op::ShardSelect::kRoundRobin>;
-using AtomicPtrHome = Configured<op::AtomicPointerPool<Obj>, op::ShardSelect::kHome>;
-using AtomicPtrValRR =
-    Configured<op::AtomicPointerValidatedPool<Obj>, op::ShardSelect::kRoundRobin>;
-using AtomicPtrValHome = Configured<op::AtomicPointerValidatedPool<Obj>, op::ShardSelect::kHome>;
-using HazardRR = Configured<op::HazardPool<Obj>, op::ShardSelect::kRoundRobin>;
-using HazardHome = Configured<op::HazardPool<Obj>, op::ShardSelect::kHome>;
 
 static_assert(op::ObjectPool<NewDelete>);
 static_assert(op::ObjectPool<MutexRR>);
@@ -191,11 +184,5 @@ REGISTER_POOL(LockedRR);
 REGISTER_POOL(LockedHome);
 REGISTER_POOL(TaggedRR);
 REGISTER_POOL(TaggedHome);
-REGISTER_POOL(AtomicPtrRR);
-REGISTER_POOL(AtomicPtrHome);
-REGISTER_POOL(AtomicPtrValRR);
-REGISTER_POOL(AtomicPtrValHome);
-REGISTER_POOL(HazardRR);
-REGISTER_POOL(HazardHome);
 
 }  // namespace

@@ -244,18 +244,13 @@ op::PoolOptions tiny(std::size_t shards, std::size_t objects, op::ShardSelect se
     return op::PoolOptions{.shards = shards,
                            .initial_objects = objects,
                            .grow_chunk = 1,
-                           .select = select,
-                           .max_threads = 4};
+                           .select = select};
 }
 
 template <class Pool>
 class PoolTwist : public ::testing::Test {};
 
-using Pools = ::testing::Types<op::TaggedPool<Object, TwistSync>,
-                               op::AtomicPointerPool<Object, TwistSync>,
-                               op::AtomicPointerValidatedPool<Object, TwistSync>,
-                               op::HazardPool<Object, TwistSync>,
-                               op::LockedListPool<Object, TwistSync>>;
+using Pools = ::testing::Types<op::DefaultPool<Object, TwistSync>>;
 TYPED_TEST_SUITE(PoolTwist, Pools);
 
 }  // namespace
@@ -274,14 +269,6 @@ TYPED_TEST(PoolTwist, OneShardScarce) {
 // shards and growth are hit.
 TYPED_TEST(PoolTwist, TwoShardsRoundRobin) {
     churn<TypeParam>(tiny(2, 2, op::ShardSelect::kRoundRobin), 3, kRounds);
-}
-
-// Fewer max_threads than threads: AtomicPointer tables and hazard slots run
-// out and threads have to wait for them.
-TYPED_TEST(PoolTwist, MoreThreadsThanMaxThreads) {
-    auto options = tiny(1, 3, op::ShardSelect::kHome);
-    options.max_threads = 1;
-    churn<TypeParam>(options, 3, kRounds / 2);
 }
 
 TYPED_TEST(PoolTwist, CrossThreadHandOff) {

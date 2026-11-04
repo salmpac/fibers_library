@@ -8,10 +8,7 @@
 #include <thread>
 #include <vector>
 
-#include "object_pool/atomic_pointer.hpp"
-#include "object_pool/sharded_object_pool.hpp"
 #include "object_pool/sharded_pool.hpp"
-#include "thread_pool/spin_lock.hpp"
 
 namespace op = object_pool;
 
@@ -23,17 +20,8 @@ struct Object {
     Object* next = nullptr;
 };
 
-// Every pool implementation goes into `Pools`; tests run for all of them.
-// An entry provides `Pool` and `options(PoolOptions)`.
-template <op::ShardSelect kSelect, class Lock>
-struct MutexVector {
-    using Pool = op::MutexVectorPool<Object, op::StdSync, Lock>;
-    static op::PoolOptions options(op::PoolOptions o) {
-        o.select = kSelect;
-        return o;
-    }
-};
-
+// Pool configurations under test: `Pool` and `options(PoolOptions)`.
+// (Lock-based baselines live in benchmarks/ only.)
 template <class P, op::ShardSelect kSelect>
 struct Sharded {
     using Pool = P;
@@ -46,31 +34,14 @@ struct Sharded {
 constexpr auto kRR = op::ShardSelect::kRoundRobin;
 constexpr auto kHome = op::ShardSelect::kHome;
 
-using Pools = ::testing::Types<
-    MutexVector<kRR, std::mutex>,
-    MutexVector<kHome, std::mutex>,
-    MutexVector<kRR, thread_pool::SpinLock<>>,
-    MutexVector<kHome, thread_pool::SpinLock<>>,
-    Sharded<op::LockedListPool<Object>, kRR>,
-    Sharded<op::LockedListPool<Object>, kHome>,
-    Sharded<op::TaggedPool<Object>, kRR>,
-    Sharded<op::TaggedPool<Object>, kHome>,
-    Sharded<op::AtomicPointerPool<Object>, kRR>,
-    Sharded<op::AtomicPointerPool<Object>, kHome>,
-    Sharded<op::AtomicPointerValidatedPool<Object>, kRR>,
-    Sharded<op::AtomicPointerValidatedPool<Object>, kHome>,
-    Sharded<op::HazardPool<Object>, kRR>,
-    Sharded<op::HazardPool<Object>, kHome>>;
+using Pools = ::testing::Types<Sharded<op::DefaultPool<Object>, kRR>,
+                               Sharded<op::DefaultPool<Object>, kHome>>;
 
 template <class Impl>
 class PoolTest : public ::testing::Test {};
 TYPED_TEST_SUITE(PoolTest, Pools);
 
-static_assert(op::ObjectPool<op::MutexVectorPool<Object>>);
-static_assert(op::ObjectPool<op::LockedListPool<Object>>);
-static_assert(op::ObjectPool<op::TaggedPool<Object>>);
-static_assert(op::ObjectPool<op::AtomicPointerPool<Object>>);
-static_assert(op::ObjectPool<op::HazardPool<Object>>);
+static_assert(op::ObjectPool<op::DefaultPool<Object>>);
 
 }  // namespace
 
@@ -159,30 +130,6 @@ TYPED_TEST(PoolTest, CrossThreadRelease) {
     EXPECT_GE(pool.capacity(), 64u);
 }
 
-// Fewer max_threads than threads: the lock-free variants must only spin for a
-// free slot (AtomicPointer tables, hazard slots), never deadlock or break.
-TYPED_TEST(PoolTest, MoreThreadsThanMaxThreads) {
-    constexpr int kThreads = 6;
-    constexpr int kIterations = 20'000;
-    auto options = TypeParam::options({.shards = 2, .initial_objects = 4, .grow_chunk = 2});
-    options.max_threads = 1;
-    typename TypeParam::Pool pool(options);
-    std::atomic<int> violations{0};
-    std::vector<std::thread> threads;
-    for (int t = 1; t <= kThreads; ++t) {
-        threads.emplace_back([&, t] {
-            for (int it = 0; it < kIterations; ++it) {
-                Object* o = pool.acquire();
-                if (o->owner.exchange(t) != 0) violations.fetch_add(1);
-                if (o->owner.exchange(0) != t) violations.fetch_add(1);
-                pool.release(o);
-            }
-        });
-    }
-    for (auto& th : threads) th.join();
-    EXPECT_EQ(violations.load(), 0);
-}
-
 // ------------------------------------------------------------ shard stacks
 
 namespace {
@@ -224,15 +171,9 @@ struct StackHarness {
 template <class Stack>
 class StackTest : public ::testing::Test {};
 
-using Stacks = ::testing::Types<op::LockedStack<op::StdSync>, op::TaggedStack<op::StdSync>,
-                                op::AtomicPointerStack<op::StdSync>,
-                                op::AtomicPointerStack<op::StdSync, op::ReadMode::kValidated>,
-                                op::HazardStack<op::StdSync>>;
+using Stacks = ::testing::Types<op::TaggedStack<op::StdSync>>;
 TYPED_TEST_SUITE(StackTest, Stacks);
 
-std::uint64_t lcg(std::uint64_t& seed) {
-    return seed = seed * 6364136223846793005ull + 1442695040888963407ull;
-}
 
 }  // namespace
 
@@ -287,15 +228,13 @@ TYPED_TEST(StackTest, ValueHookRoundTrip) {
 }
 
 // Every node is owned by at most one thread; at the end all nodes are back
-// exactly once (nothing lost, nothing duplicated). Also with fewer
-// max_threads than threads.
+// exactly once (nothing lost, nothing duplicated).
 TYPED_TEST(StackTest, StressExclusiveOwnership) {
-    for (std::size_t max_threads : {std::size_t{8}, std::size_t{2}}) {
+    {
         constexpr int kThreads = 8;
         constexpr int kIterations = 40'000;
         constexpr std::size_t kNodes = 12;
         op::PoolOptions options;
-        options.max_threads = max_threads;
         StackHarness<TypeParam> h(options);
         auto nodes = h.push_fresh(kNodes);
         std::atomic<int> violations{0};
@@ -353,51 +292,4 @@ TYPED_TEST(StackTest, CrossThreadRelease) {
     std::set<Hook*> back;
     while (Hook* n = h.pop()) back.insert(n);
     EXPECT_EQ(back.size(), kNodes);
-}
-
-TEST(AtomicPointer, TransactionsCommitAndAbort) {
-    op::AtomicPointer<std::uint32_t, op::StdSync> ap(1, 5u);
-    std::size_t cursor = 0;
-    auto add = [](std::uint32_t d) {
-        return [d](std::uint32_t cur, std::uint32_t& next) {
-            next = cur + d;
-            return true;
-        };
-    };
-    EXPECT_EQ(ap.transact<op::ReadMode::kPinned>(add(1), cursor), 5u);
-    EXPECT_EQ(ap.transact<op::ReadMode::kValidated>(add(2), cursor), 6u);
-    EXPECT_EQ(ap.load(), 8u);
-    EXPECT_EQ(ap.transact<op::ReadMode::kPinned>([](std::uint32_t, std::uint32_t&) { return false; }, cursor),
-              std::nullopt);
-    EXPECT_EQ(ap.load(), 8u);
-    // Many transactions on a 4-slot table: slots must be recycled.
-    for (int i = 0; i < 1000; ++i) ap.transact<op::ReadMode::kPinned>(add(1), cursor);
-    EXPECT_EQ(ap.load(), 1008u);
-}
-
-// Pinned and unpinned transactions mixed; no update may be lost.
-TEST(AtomicPointer, ConcurrentIncrements) {
-    constexpr int kThreads = 8;
-    constexpr int kPerThread = 50'000;
-    op::AtomicPointer<std::uint64_t, op::StdSync> ap(kThreads, 0);
-    std::vector<std::thread> threads;
-    for (int t = 0; t < kThreads; ++t) {
-        threads.emplace_back([&, t] {
-            std::uint64_t seed = static_cast<std::uint64_t>(t) + 1;
-            std::size_t cursor = static_cast<std::size_t>(lcg(seed));
-            auto inc = [](std::uint64_t cur, std::uint64_t& next) {
-                next = cur + 1;
-                return true;
-            };
-            for (int i = 0; i < kPerThread; ++i) {
-                switch (t % 3) {
-                    case 0: ap.transact<op::ReadMode::kPinned>(inc, cursor); break;
-                    case 1: ap.transact<op::ReadMode::kValidated>(inc, cursor); break;
-                    default: ap.transact<op::ReadMode::kRaw>(inc, cursor); break;
-                }
-            }
-        });
-    }
-    for (auto& th : threads) th.join();
-    EXPECT_EQ(ap.load(), std::uint64_t{kThreads} * kPerThread);
 }
