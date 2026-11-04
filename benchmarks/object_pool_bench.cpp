@@ -10,7 +10,7 @@
 // items_per_second counts objects (one acquire + one release each).
 //
 // To add a pool implementation: define a default-constructible type
-// satisfying object_pool::ObjectPool for `Obj` and call REGISTER_POOL below.
+// satisfying fibers::object_pool::ObjectPool for `Obj` and call REGISTER_POOL below.
 
 #include <benchmark/benchmark.h>
 
@@ -21,11 +21,11 @@
 #include <vector>
 
 #include "baseline_pools.hpp"
-#include "object_pool/sharded_pool.hpp"
-#include "thread_pool/spin_lock.hpp"
-#include "thread_pool/spsc_queue.hpp"
+#include "fibers/object_pool/sharded_pool.hpp"
+#include "fibers/sync/spin_lock.hpp"
+#include "fibers/queue/spsc_queue.hpp"
 
-namespace op = object_pool;
+namespace op = fibers::object_pool;
 
 namespace {
 
@@ -59,9 +59,9 @@ struct NewDelete {
 
 using MutexRR = Configured<op::baseline::MutexVectorPool<Obj>, op::ShardSelect::kRoundRobin>;
 using MutexHome = Configured<op::baseline::MutexVectorPool<Obj>, op::ShardSelect::kHome>;
-using SpinRR = Configured<op::baseline::MutexVectorPool<Obj, op::StdSync, thread_pool::SpinLock<>>,
+using SpinRR = Configured<op::baseline::MutexVectorPool<Obj, fibers::sync::StdSync, fibers::sync::SpinLock<>>,
                           op::ShardSelect::kRoundRobin>;
-using SpinHome = Configured<op::baseline::MutexVectorPool<Obj, op::StdSync, thread_pool::SpinLock<>>,
+using SpinHome = Configured<op::baseline::MutexVectorPool<Obj, fibers::sync::StdSync, fibers::sync::SpinLock<>>,
                             op::ShardSelect::kHome>;
 
 // Intrusive-node pools (sharded_pool.hpp): shard free list = spin-locked list,
@@ -132,9 +132,9 @@ void BM_Cross(benchmark::State& state) {
     const auto pairs = static_cast<std::size_t>(state.range(0));
     Pool pool;
     for (auto _ : state) {
-        std::vector<std::unique_ptr<thread_pool::SPSCQueue<Obj*>>> channels;
+        std::vector<std::unique_ptr<fibers::queue::SPSCQueue<Obj*>>> channels;
         for (std::size_t p = 0; p < pairs; ++p) {
-            channels.push_back(std::make_unique<thread_pool::SPSCQueue<Obj*>>(1024));
+            channels.push_back(std::make_unique<fibers::queue::SPSCQueue<Obj*>>(1024));
         }
         std::vector<std::thread> threads;
         for (std::size_t p = 0; p < pairs; ++p) {
@@ -142,7 +142,7 @@ void BM_Cross(benchmark::State& state) {
             threads.emplace_back([&pool, &channel] {  // producer
                 for (std::size_t i = 0; i < kOpsPerThread;) {
                     Obj* o = pool.acquire();
-                    while (!channel.try_push(std::move(o))) thread_pool::cpu_relax();
+                    while (!channel.try_push(std::move(o))) fibers::sync::cpu_relax();
                     ++i;
                 }
             });
@@ -151,7 +151,7 @@ void BM_Cross(benchmark::State& state) {
                 for (std::size_t i = 0; i < kOpsPerThread;) {
                     const std::size_t n = channel.try_pop_batch(buf, 32);
                     if (n == 0) {
-                        thread_pool::cpu_relax();
+                        fibers::sync::cpu_relax();
                         continue;
                     }
                     for (std::size_t j = 0; j < n; ++j) pool.release(buf[j]);

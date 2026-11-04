@@ -8,14 +8,14 @@
 #include <thread>
 #include <vector>
 
-#include "thread_pool/lock_free_spmc_queue.hpp"
-#include "thread_pool/locked_spsc_queue.hpp"
-#include "thread_pool/sharded_queue.hpp"
-#include "thread_pool/slow_queue.hpp"
-#include "thread_pool/spsc_queue.hpp"
-#include "thread_pool/task.hpp"
+#include "fibers/queue/lock_free_spmc_queue.hpp"
+#include "fibers/queue/locked_spsc_queue.hpp"
+#include "fibers/queue/sharded_queue.hpp"
+#include "fibers/queue/slow_queue.hpp"
+#include "fibers/queue/spsc_queue.hpp"
+#include "fibers/thread_pool/task.hpp"
 
-namespace tp = thread_pool;
+namespace tp = fibers::thread_pool;
 
 namespace {
 
@@ -23,8 +23,8 @@ constexpr std::size_t kItems = std::size_t{1} << 20;
 constexpr std::size_t kCapacity = 256;
 
 // The two main_box implementations, compared side by side.
-using LockedSPSC = tp::LockedSPSCQueue<tp::Task>;
-using LockFreeSPMC = tp::LockFreeSPMCQueue<tp::Task>;
+using LockedSPSC = fibers::queue::LockedSPSCQueue<tp::Task>;
+using LockFreeSPMC = fibers::queue::LockFreeSPMCQueue<tp::Task>;
 
 void noop(void*) noexcept {}
 tp::Task make_task() noexcept { return tp::Task(nullptr, &noop, nullptr); }
@@ -36,7 +36,7 @@ void fill(std::vector<tp::Task>& buf, std::size_t n) {
 // ---------------------------------------------------------------- 1 thread
 
 void BM_SPSC_PushPop(benchmark::State& state) {
-    tp::SPSCQueue<tp::Task> q(kCapacity);
+    fibers::queue::SPSCQueue<tp::Task> q(kCapacity);
     tp::Task out;
     for (auto _ : state) {
         q.try_push(make_task());
@@ -49,7 +49,7 @@ BENCHMARK(BM_SPSC_PushPop);
 
 void BM_SPSC_PushPopBatch(benchmark::State& state) {
     const auto batch = static_cast<std::size_t>(state.range(0));
-    tp::SPSCQueue<tp::Task> q(kCapacity);
+    fibers::queue::SPSCQueue<tp::Task> q(kCapacity);
     std::vector<tp::Task> in(batch), out(batch);
     for (auto _ : state) {
         fill(in, batch);
@@ -82,7 +82,7 @@ BENCHMARK_TEMPLATE(BM_MainBox_OwnerPushPopBatch, LockFreeSPMC)->ArgName("batch")
 // One producer thread, the benchmark thread consumes.
 void BM_SPSC_ProducerConsumer(benchmark::State& state) {
     const auto batch = static_cast<std::size_t>(state.range(0));
-    tp::SPSCQueue<tp::Task> q(kCapacity);
+    fibers::queue::SPSCQueue<tp::Task> q(kCapacity);
     std::vector<tp::Task> out(batch);
 
     for (auto _ : state) {
@@ -93,13 +93,13 @@ void BM_SPSC_ProducerConsumer(benchmark::State& state) {
                 fill(buf, n);
                 const std::size_t k = q.try_push_batch(buf.data(), n);
                 sent += k;
-                if (k == 0) tp::cpu_relax();
+                if (k == 0) fibers::sync::cpu_relax();
             }
         });
         for (std::size_t received = 0; received < kItems;) {
             const std::size_t k = q.try_pop_batch(out.data(), batch);
             received += k;
-            if (k == 0) tp::cpu_relax();
+            if (k == 0) fibers::sync::cpu_relax();
         }
         producer.join();
     }
@@ -129,7 +129,7 @@ void BM_MainBox_OwnerWithThieves(benchmark::State& state) {
                     if (const std::size_t k = q.try_steal_batch(buf.data(), kBatch)) {
                         consumed.fetch_add(k, std::memory_order_relaxed);
                     } else {
-                        tp::cpu_relax();
+                        fibers::sync::cpu_relax();
                     }
                 }
             });
@@ -168,7 +168,7 @@ void BM_ShardedQueue_MPSC(benchmark::State& state) {
     const auto producers = static_cast<std::size_t>(state.range(0));
     const auto shards = static_cast<std::size_t>(state.range(1));
     constexpr std::size_t kBatch = 32;
-    tp::ShardedQueue<tp::Task> q(shards, kCapacity);
+    fibers::queue::ShardedQueue<tp::Task> q(shards, kCapacity);
     std::vector<tp::Task> out(kBatch);
     const std::size_t per_producer = kItems / producers;
     const std::size_t total = per_producer * producers;
@@ -181,7 +181,7 @@ void BM_ShardedQueue_MPSC(benchmark::State& state) {
                     if (q.try_push(make_task(), p)) {
                         ++i;
                     } else {
-                        tp::cpu_relax();
+                        fibers::sync::cpu_relax();
                     }
                 }
             });
@@ -190,7 +190,7 @@ void BM_ShardedQueue_MPSC(benchmark::State& state) {
         for (std::size_t received = 0; received < total;) {
             const std::size_t k = q.try_pop_batch(out.data(), kBatch, cursor++);
             received += k;
-            if (k == 0) tp::cpu_relax();
+            if (k == 0) fibers::sync::cpu_relax();
         }
         for (auto& t : threads) t.join();
     }
@@ -205,7 +205,7 @@ BENCHMARK(BM_ShardedQueue_MPSC)
 void BM_SlowQueue_MPSC(benchmark::State& state) {
     const auto producers = static_cast<std::size_t>(state.range(0));
     constexpr std::size_t kBatch = 32;
-    tp::SlowQueue<tp::Task> q;
+    fibers::queue::SlowQueue<tp::Task> q;
     std::vector<tp::Task> out(kBatch);
     const std::size_t per_producer = kItems / producers;
     const std::size_t total = per_producer * producers;
@@ -220,7 +220,7 @@ void BM_SlowQueue_MPSC(benchmark::State& state) {
         for (std::size_t received = 0; received < total;) {
             const std::size_t k = q.try_pop_batch(out.data(), kBatch);
             received += k;
-            if (k == 0) tp::cpu_relax();
+            if (k == 0) fibers::sync::cpu_relax();
         }
         for (auto& t : threads) t.join();
     }

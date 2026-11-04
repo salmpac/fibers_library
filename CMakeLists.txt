@@ -50,37 +50,39 @@ if(FIBERS_TWIST)
     include(cmake/Twist.cmake)
 endif()
 
-# Header-only work-stealing thread pool: include/thread_pool, namespace thread_pool.
-add_library(fibers_thread_pool INTERFACE)
-add_library(fibers::thread_pool ALIAS fibers_thread_pool)
-set_target_properties(fibers_thread_pool PROPERTIES EXPORT_NAME thread_pool)
-target_include_directories(fibers_thread_pool INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_compile_features(fibers_thread_pool INTERFACE cxx_std_20)
-target_link_libraries(fibers_thread_pool INTERFACE Threads::Threads)
+# Header-only components: include/fibers/<component>/*.hpp, namespace
+# fibers::<component>, one INTERFACE target fibers::<component> each. All of
+# them share the include dir include/ (#include "fibers/<component>/x.hpp");
+# a component links the components it uses.
+function(fibers_add_component name)
+    add_library(fibers_${name} INTERFACE)
+    add_library(fibers::${name} ALIAS fibers_${name})
+    set_target_properties(fibers_${name} PROPERTIES EXPORT_NAME ${name})
+    target_include_directories(fibers_${name} INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(fibers_${name} INTERFACE cxx_std_20)
+    target_link_libraries(fibers_${name} INTERFACE ${ARGN})
+    install(TARGETS fibers_${name} EXPORT fibersTargets)
+endfunction()
 
-# Header-only sharded object pools: include/object_pool, namespace object_pool.
-add_library(fibers_object_pool INTERFACE)
-add_library(fibers::object_pool ALIAS fibers_object_pool)
-set_target_properties(fibers_object_pool PROPERTIES EXPORT_NAME object_pool)
-target_link_libraries(fibers_object_pool INTERFACE fibers_thread_pool)  # Sync policy
-
-# Header-only reactor thread (epoll, timers, polling sources): include/poller.
-add_library(fibers_poller INTERFACE)
-add_library(fibers::poller ALIAS fibers_poller)
-set_target_properties(fibers_poller PROPERTIES EXPORT_NAME poller)
-target_link_libraries(fibers_poller INTERFACE fibers_thread_pool)  # Sync policy, Task
-
-# Header-only shared-memory SPSC rings for other processes: include/ipc.
-add_library(fibers_ipc INTERFACE)
-add_library(fibers::ipc ALIAS fibers_ipc)
-set_target_properties(fibers_ipc PROPERTIES EXPORT_NAME ipc)
-target_link_libraries(fibers_ipc INTERFACE fibers_poller)
+# Sync policy (StdSync / TwistSync, policy concepts), cpu_relax, SpinLock.
+fibers_add_component(sync Threads::Threads)
+# fail_fast(): the library never throws.
+fibers_add_component(fail)
+# SPSC / SPMC / sharded / slow queues. (LockFreeSPMCQueue's Task slot uses
+# fibers/thread_pool/task.hpp, a dependency-free header.)
+fibers_add_component(queue fibers::sync)
+# Work-stealing thread pool and Task.
+fibers_add_component(thread_pool fibers::sync fibers::queue)
+# Sharded object pools.
+fibers_add_component(object_pool fibers::sync fibers::fail)
+# Reactor thread (epoll, timers, polling sources); hands out Tasks.
+fibers_add_component(poller fibers::sync fibers::fail fibers::thread_pool)
+# Shared-memory SPSC rings for other processes, polled by the poller.
+fibers_add_component(ipc fibers::sync fibers::poller)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(TARGETS fibers_thread_pool fibers_object_pool EXPORT fibersTargets)
-install(TARGETS fibers_poller fibers_ipc EXPORT fibersTargets)
 install(EXPORT fibersTargets
     NAMESPACE fibers::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fibers)

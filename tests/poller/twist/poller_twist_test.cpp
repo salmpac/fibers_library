@@ -36,16 +36,19 @@
 #include <twist/sim.hpp>
 #endif
 
-#include "ipc/doorbell.hpp"
-#include "ipc/ring_checkable.hpp"
-#include "ipc/spsc_ring.hpp"
-#include "poller/fake_backend.hpp"
-#include "poller/poller.hpp"
-#include "poller/twist_sync.hpp"
+#include "fibers/ipc/doorbell.hpp"
+#include "fibers/ipc/ring_checkable.hpp"
+#include "fibers/ipc/spsc_ring.hpp"
+#include "fibers/poller/fake_backend.hpp"
+#include "fibers/poller/poller.hpp"
+#include "fibers/sync/twist_sync.hpp"
+
+namespace ipc = fibers::ipc;
+namespace poller = fibers::poller;
 
 namespace {
 
-using Sync = poller::TwistSync;
+using Sync = fibers::sync::TwistSync;
 using Backend = poller::FakeBackend<Sync>;
 using Poller = poller::Poller<Backend, Sync>;
 using Timer = Poller::Timer;

@@ -14,22 +14,22 @@
 #include <mutex>
 #include <vector>
 
-#include "object_pool/sharded_pool.hpp"
-#include "thread_pool/spin_lock.hpp"
+#include "fibers/object_pool/sharded_pool.hpp"
+#include "fibers/sync/spin_lock.hpp"
 
-namespace object_pool::baseline {
+namespace fibers::object_pool::baseline {
 
-using object_pool::detail::PoolThreadState;
-using object_pool::kCacheLineSize;
-using object_pool::NoShared;
-using object_pool::PoolOptions;
-using object_pool::ShardSelect;
-using object_pool::StdSync;
-using object_pool::SyncPolicy;
-namespace detail = object_pool::detail;
+using fibers::object_pool::detail::PoolThreadState;
+using fibers::sync::kCacheLineSize;
+using fibers::object_pool::NoShared;
+using fibers::object_pool::PoolOptions;
+using fibers::object_pool::ShardSelect;
+using fibers::sync::StdSync;
+using fibers::sync::SyncPolicy;
+namespace detail = fibers::object_pool::detail;
 
 // Baseline: every shard is a lock + std::vector<T*> free list.
-// Lock defaults to Sync::Mutex; thread_pool::SpinLock<Sync> also fits.
+// Lock defaults to Sync::Mutex; fibers::sync::SpinLock<Sync> also fits.
 template <class T, SyncPolicy Sync = StdSync, class Lock = typename Sync::Mutex>
     requires std::default_initializable<T>
 class MutexVectorPool {
@@ -118,7 +118,7 @@ private:
 
 // ------------------------------------------------------------ LockedStack
 
-template <SyncPolicy Sync, class Lock = thread_pool::SpinLock<Sync>>
+template <SyncPolicy Sync, class Lock = fibers::sync::SpinLock<Sync>>
 class LockedStack {
 public:
     using Shared = NoShared;
@@ -149,7 +149,7 @@ private:
     detail::NodeIndex head_ = detail::kNullNode;
 };
 
-template <class T, SyncPolicy Sync = StdSync, class Lock = thread_pool::SpinLock<Sync>>
+template <class T, SyncPolicy Sync = StdSync, class Lock = fibers::sync::SpinLock<Sync>>
 using LockedListPool = ShardedPool<T, LockedStack<Sync, Lock>, Sync>;
 
-}  // namespace object_pool::baseline
+}  // namespace fibers::object_pool::baseline

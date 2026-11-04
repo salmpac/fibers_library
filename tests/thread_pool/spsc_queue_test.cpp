@@ -5,13 +5,13 @@
 #include <thread>
 #include <vector>
 
-#include "thread_pool/locked_spsc_queue.hpp"
-#include "thread_pool/spsc_queue.hpp"
-#include "thread_pool/task.hpp"
+#include "fibers/queue/locked_spsc_queue.hpp"
+#include "fibers/queue/spsc_queue.hpp"
+#include "fibers/thread_pool/task.hpp"
 
-using thread_pool::LockedSPSCQueue;
-using thread_pool::SPSCQueue;
-using thread_pool::Task;
+using fibers::queue::LockedSPSCQueue;
+using fibers::queue::SPSCQueue;
+using fibers::thread_pool::Task;
 
 TEST(SPSCQueue, CapacityRoundsUpToPowerOfTwo) {
     EXPECT_EQ(SPSCQueue<int>(0).capacity(), 1u);

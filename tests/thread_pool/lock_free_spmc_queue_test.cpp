@@ -8,17 +8,17 @@
 #include <thread>
 #include <vector>
 
-#include "thread_pool/lock_free_spmc_queue.hpp"
-#include "thread_pool/locked_spsc_queue.hpp"
-#include "thread_pool/task.hpp"
-#include "thread_pool/thread_pool.hpp"
+#include "fibers/queue/lock_free_spmc_queue.hpp"
+#include "fibers/queue/locked_spsc_queue.hpp"
+#include "fibers/thread_pool/task.hpp"
+#include "fibers/thread_pool/thread_pool.hpp"
 
-using thread_pool::LockedSPSCQueue;
-using thread_pool::LockFreeSPMCQueue;
-using thread_pool::Task;
+using fibers::queue::LockedSPSCQueue;
+using fibers::queue::LockFreeSPMCQueue;
+using fibers::thread_pool::Task;
 
-static_assert(thread_pool::MainQueue<LockFreeSPMCQueue<Task>>);
-static_assert(thread_pool::MainQueue<LockFreeSPMCQueue<>>);
+static_assert(fibers::thread_pool::MainQueue<LockFreeSPMCQueue<Task>>);
+static_assert(fibers::thread_pool::MainQueue<LockFreeSPMCQueue<>>);
 
 namespace {
 

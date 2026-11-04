@@ -8,9 +8,9 @@
 #include <thread>
 #include <vector>
 
-#include "object_pool/sharded_pool.hpp"
+#include "fibers/object_pool/sharded_pool.hpp"
 
-namespace op = object_pool;
+namespace op = fibers::object_pool;
 
 namespace {
 
@@ -156,11 +156,11 @@ TEST(PoolThreadState, RoundRobinPoolDoesNotMoveHomeShard) {
 
 namespace {
 
-using Arena = op::detail::NodeArena<Object, op::StdSync>;
+using Arena = op::detail::NodeArena<Object, fibers::sync::StdSync>;
 using Hook = Arena::Hook;
 
 op::detail::PoolThreadState& thread_state() {
-    return op::detail::pool_thread_state<op::StdSync>();
+    return op::detail::pool_thread_state<fibers::sync::StdSync>();
 }
 
 template <class Stack>
@@ -193,7 +193,7 @@ struct StackHarness {
 template <class Stack>
 class StackTest : public ::testing::Test {};
 
-using Stacks = ::testing::Types<op::TaggedStack<op::StdSync>>;
+using Stacks = ::testing::Types<op::TaggedStack<fibers::sync::StdSync>>;
 TYPED_TEST_SUITE(StackTest, Stacks);
 
 

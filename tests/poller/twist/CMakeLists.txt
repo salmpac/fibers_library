@@ -1,4 +1,4 @@
-# Poller and in-process ipc ring with poller::TwistSync + FakeBackend under
+# Poller and in-process ipc ring with sync::TwistSync + FakeBackend under
 # Twist: deterministic simulation (TWIST_SIM) or real threads with fault
 # injection (TWIST_FAULTY).
 add_executable(poller_twist_tests poller_twist_test.cpp)

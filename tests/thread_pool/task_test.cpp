@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "thread_pool/task.hpp"
+#include "fibers/thread_pool/task.hpp"
 
-using thread_pool::Task;
+using fibers::thread_pool::Task;
 
 namespace {
 

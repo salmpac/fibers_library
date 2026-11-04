@@ -21,10 +21,10 @@
 #include <thread>
 #include <vector>
 
-#include "object_pool/pool_allocator.hpp"
-#include "object_pool/sharded_pool.hpp"
+#include "fibers/object_pool/pool_allocator.hpp"
+#include "fibers/object_pool/sharded_pool.hpp"
 
-namespace op = object_pool;
+namespace op = fibers::object_pool;
 
 // ------------------------------------------------------------ global new
 
@@ -243,11 +243,11 @@ class RefusingResource : public std::pmr::memory_resource {
     }
 };
 
-using CountingPool = op::DefaultPool<Object, op::StdSync, CountingAllocator>;
+using CountingPool = op::DefaultPool<Object, fibers::sync::StdSync, CountingAllocator>;
 
 // The per-thread pool state is seeded on first use; do it outside the
 // measured windows.
-void warm_up() { static_cast<void>(op::detail::pool_thread_state<op::StdSync>()); }
+void warm_up() { static_cast<void>(op::detail::pool_thread_state<fibers::sync::StdSync>()); }
 
 template <class T>
 bool aligned_to(const T* p, std::size_t align) {
@@ -260,9 +260,9 @@ bool aligned_to(const T* p, std::size_t align) {
 
 static_assert(std::is_empty_v<op::NewDeleteAllocator>);
 static_assert(std::is_same_v<op::DefaultPool<Object>,
-                             op::DefaultPool<Object, op::StdSync, op::DefaultAllocator>>);
+                             op::DefaultPool<Object, fibers::sync::StdSync, op::DefaultAllocator>>);
 // An empty allocator takes no space; a stateful one is stored once.
-static_assert(sizeof(op::DefaultPool<Object, op::StdSync, op::PmrAllocator>) ==
+static_assert(sizeof(op::DefaultPool<Object, fibers::sync::StdSync, op::PmrAllocator>) ==
               sizeof(op::DefaultPool<Object>) + sizeof(void*));
 
 // ------------------------------------------------------------ default allocator
@@ -436,7 +436,7 @@ static_assert(!Poolable<ThrowingCtor>, "throwing T() must be rejected");
 
 void build_pool_on_refusing_resource() {
     RefusingResource resource;
-    op::DefaultPool<Object, op::StdSync, op::PmrAllocator> pool({.shards = 2}, &resource);
+    op::DefaultPool<Object, fibers::sync::StdSync, op::PmrAllocator> pool({.shards = 2}, &resource);
 }
 
 struct Tiny {
@@ -466,7 +466,7 @@ TEST(PoolAllocatorDeathTest, IndexSpaceExhaustionTerminates) {
 TEST(PoolAllocator, OverAlignedObjects) {
     AllocStats stats;
     {
-        op::DefaultPool<Wide, op::StdSync, CountingAllocator> pool(
+        op::DefaultPool<Wide, fibers::sync::StdSync, CountingAllocator> pool(
             {.shards = 3, .initial_objects = 7, .grow_chunk = 5}, CountingAllocator(stats, 1));
         std::vector<Wide*> held;
         for (int i = 0; i < 40; ++i) {
@@ -492,7 +492,7 @@ TEST(PoolAllocator, PmrCountingResource) {
     held.reserve(12);
     const std::size_t global_before = g_global_news.load();
     {
-        op::DefaultPool<Wide, op::StdSync, op::PmrAllocator> pool(
+        op::DefaultPool<Wide, fibers::sync::StdSync, op::PmrAllocator> pool(
             {.shards = 2, .initial_objects = 3, .grow_chunk = 2}, &resource);
         EXPECT_EQ(pool.get_allocator().resource(), &resource);
         for (int i = 0; i < 12; ++i) {
@@ -522,7 +522,7 @@ TEST(PoolAllocator, PmrMonotonicBuffer) {
     held.reserve(100);
     const std::size_t global_before = g_global_news.load();
     {
-        op::DefaultPool<Object, op::StdSync, op::PmrAllocator> pool(
+        op::DefaultPool<Object, fibers::sync::StdSync, op::PmrAllocator> pool(
             {.shards = 4, .initial_objects = 32, .grow_chunk = 16}, &arena);
         for (int i = 0; i < 100; ++i) held.push_back(pool.acquire());
         for (Object* o : held) {
@@ -538,7 +538,7 @@ TEST(PoolAllocator, PmrDefaultResource) {
     CountingResource resource;
     std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
     {
-        op::DefaultPool<Object, op::StdSync, op::PmrAllocator> pool({.initial_objects = 4});
+        op::DefaultPool<Object, fibers::sync::StdSync, op::PmrAllocator> pool({.initial_objects = 4});
         EXPECT_EQ(pool.get_allocator().resource(), &resource);
         pool.release(pool.acquire());
     }

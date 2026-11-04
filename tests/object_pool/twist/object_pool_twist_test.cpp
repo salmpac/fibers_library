@@ -36,11 +36,11 @@
 #include <twist/sim.hpp>
 #endif
 
-#include "object_pool/sharded_pool.hpp"
-#include "thread_pool/twist_sync.hpp"
+#include "fibers/object_pool/sharded_pool.hpp"
+#include "fibers/sync/twist_sync.hpp"
 
-namespace op = object_pool;
-using thread_pool::TwistSync;
+namespace op = fibers::object_pool;
+using fibers::sync::TwistSync;
 
 namespace {
 

@@ -32,11 +32,13 @@
 #include <twist/sim.hpp>
 #endif
 
-#include "thread_pool/lock_free_spmc_queue.hpp"
-#include "thread_pool/thread_pool.hpp"
-#include "thread_pool/twist_sync.hpp"
+#include "fibers/queue/lock_free_spmc_queue.hpp"
+#include "fibers/thread_pool/thread_pool.hpp"
+#include "fibers/sync/twist_sync.hpp"
 
-namespace tp = thread_pool;
+namespace tp = fibers::thread_pool;
+namespace q = fibers::queue;
+using fibers::sync::TwistSync;
 
 namespace {
 
@@ -125,8 +127,8 @@ void count_task(void* memo) noexcept { static_cast<Counter*>(memo)->fetch_add(1)
 
 tp::Task count(Counter& counter) { return tp::Task(&counter, &count_task, nullptr); }
 
-using LockedPool = tp::ThreadPool<tp::TwistSync, tp::LockedSPSCQueue<tp::Task, tp::TwistSync>>;
-using LockFreePool = tp::ThreadPool<tp::TwistSync, tp::LockFreeSPMCQueue<tp::Task, tp::TwistSync>>;
+using LockedPool = tp::ThreadPool<TwistSync, q::LockedSPSCQueue<tp::Task, TwistSync>>;
+using LockFreePool = tp::ThreadPool<TwistSync, q::LockFreeSPMCQueue<tp::Task, TwistSync>>;
 
 struct PoolName {
     template <class Pool>
@@ -409,7 +411,7 @@ TYPED_TEST(ThreadPoolTwist, ExternalProducersRaceWithParking) {
 TEST(LockFreeSPMCQueueTwist, OwnerAndThieves) {
     check([] {
         static constexpr std::size_t kTasks = 6;
-        using Queue = tp::LockFreeSPMCQueue<tp::Task, tp::TwistSync>;
+        using Queue = q::LockFreeSPMCQueue<tp::Task, TwistSync>;
 
         struct Memo {
             twist::assist::Shared<std::size_t> payload{std::size_t{0}};

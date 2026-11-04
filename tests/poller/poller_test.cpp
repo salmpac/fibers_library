@@ -19,11 +19,13 @@
 #include <thread>
 #include <vector>
 
-#include "object_pool/sharded_pool.hpp"
-#include "poller/eventfd.hpp"
-#include "poller/fake_backend.hpp"
-#include "poller/poller.hpp"
-#include "thread_pool/thread_pool.hpp"
+#include "fibers/object_pool/sharded_pool.hpp"
+#include "fibers/poller/eventfd.hpp"
+#include "fibers/poller/fake_backend.hpp"
+#include "fibers/poller/poller.hpp"
+#include "fibers/thread_pool/thread_pool.hpp"
+
+namespace poller = fibers::poller;
 
 namespace {
 
@@ -165,7 +167,7 @@ TEST(Poller, PipeReadiness) {
 // Echo server on one end of a socketpair: readiness -> Task on a ThreadPool,
 // which reads until EAGAIN and writes back (the fiber pattern, minus fibers).
 TEST(Poller, SocketpairEchoThroughThreadPool) {
-    thread_pool::ThreadPool<> pool(thread_pool::ThreadPoolOptions{.num_workers = 1});
+    fibers::thread_pool::ThreadPool<> pool(fibers::thread_pool::ThreadPoolOptions{.num_workers = 1});
     Poller p(TaskSink::of(pool));
     int sv[2];
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv), 0);
@@ -379,7 +381,7 @@ struct PooledTimer {
     static void callback(void* memo, TimerEvent event, TaskBatch&) noexcept;
 };
 
-using TimerPool = object_pool::DefaultPool<PooledTimer>;
+using TimerPool = fibers::object_pool::DefaultPool<PooledTimer>;
 
 void PooledTimer::callback(void* memo, TimerEvent event, TaskBatch&) noexcept {
     auto* self = static_cast<PooledTimer*>(memo);

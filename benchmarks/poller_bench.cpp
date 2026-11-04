@@ -30,10 +30,13 @@
 #include <thread>
 #include <vector>
 
-#include "ipc/ring_checkable.hpp"
-#include "ipc/spsc_ring.hpp"
-#include "poller/eventfd.hpp"
-#include "poller/poller.hpp"
+#include "fibers/ipc/ring_checkable.hpp"
+#include "fibers/ipc/spsc_ring.hpp"
+#include "fibers/poller/eventfd.hpp"
+#include "fibers/poller/poller.hpp"
+
+namespace ipc = fibers::ipc;
+namespace poller = fibers::poller;
 
 namespace {
 
@@ -94,7 +97,7 @@ void BM_TimerScheduleFire(benchmark::State& state) {
         }
         target += batch;
         while (fired.load(std::memory_order_acquire) < target) {
-            thread_pool::cpu_relax();
+            fibers::sync::cpu_relax();
         }
     }
     p.stop();
@@ -132,7 +135,7 @@ void BM_EventfdWakeLatency(benchmark::State& state) {
             poller::eventfd_signal(probe.fd);
             std::int64_t seen;
             while ((seen = probe.seen_at.load(std::memory_order_acquire)) == 0) {
-                thread_pool::cpu_relax();
+                fibers::sync::cpu_relax();
             }
             samples.push_back(seen - sent);
         }
@@ -232,7 +235,7 @@ void BM_RingThroughput(benchmark::State& state) {
         poller::PollerOptions options;
         if (spin) options.spin_budget = poller::kSpinForever;
         poller::Poller<> p(TaskSink::of(sink), options);
-        ipc::RingCheckable<Item, poller::StdSync, ipc::EventFdDoorbell, 64> consumer(
+        ipc::RingCheckable<Item, fibers::sync::StdSync, ipc::EventFdDoorbell, 64> consumer(
             ex.ring, ipc::EventFdDoorbell{ex.bell_fd}, &on_items, &received);
         p.add(consumer.checkable());
         p.start();

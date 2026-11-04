@@ -18,12 +18,15 @@
 #include <thread>
 #include <vector>
 
-#include "ipc/doorbell.hpp"
-#include "ipc/fd_passing.hpp"
-#include "ipc/ring_checkable.hpp"
-#include "ipc/spsc_ring.hpp"
-#include "poller/eventfd.hpp"
-#include "poller/poller.hpp"
+#include "fibers/ipc/doorbell.hpp"
+#include "fibers/ipc/fd_passing.hpp"
+#include "fibers/ipc/ring_checkable.hpp"
+#include "fibers/ipc/spsc_ring.hpp"
+#include "fibers/poller/eventfd.hpp"
+#include "fibers/poller/poller.hpp"
+
+namespace ipc = fibers::ipc;
+namespace poller = fibers::poller;
 
 namespace {
 

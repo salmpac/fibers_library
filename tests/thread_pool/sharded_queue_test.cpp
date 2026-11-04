@@ -5,11 +5,11 @@
 #include <thread>
 #include <vector>
 
-#include "thread_pool/sharded_queue.hpp"
-#include "thread_pool/slow_queue.hpp"
+#include "fibers/queue/sharded_queue.hpp"
+#include "fibers/queue/slow_queue.hpp"
 
-using thread_pool::ShardedQueue;
-using thread_pool::SlowQueue;
+using fibers::queue::ShardedQueue;
+using fibers::queue::SlowQueue;
 
 TEST(ShardedQueue, PushPopSingleThread) {
     ShardedQueue<int> q(3, 2);

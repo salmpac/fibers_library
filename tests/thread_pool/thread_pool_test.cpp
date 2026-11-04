@@ -15,21 +15,21 @@
 #include <utility>
 #include <vector>
 
-#include "thread_pool/lock_free_spmc_queue.hpp"
-#include "thread_pool/thread_pool.hpp"
+#include "fibers/queue/lock_free_spmc_queue.hpp"
+#include "fibers/thread_pool/thread_pool.hpp"
 
 #include "heap_task.hpp"
 
 using namespace std::chrono_literals;
-using thread_pool::LockedSPSCQueue;
-using thread_pool::LockFreeSPMCQueue;
-using thread_pool::Task;
-using thread_pool::ThreadPool;
-using thread_pool::ThreadPoolOptions;
-using thread_pool::test::heap_task;
+using fibers::queue::LockedSPSCQueue;
+using fibers::queue::LockFreeSPMCQueue;
+using fibers::thread_pool::Task;
+using fibers::thread_pool::ThreadPool;
+using fibers::thread_pool::ThreadPoolOptions;
+using fibers::thread_pool::test::heap_task;
 
-static_assert(thread_pool::MainQueue<LockedSPSCQueue<Task>>);
-static_assert(thread_pool::MainQueue<LockFreeSPMCQueue<Task>>);
+static_assert(fibers::thread_pool::MainQueue<LockedSPSCQueue<Task>>);
+static_assert(fibers::thread_pool::MainQueue<LockFreeSPMCQueue<Task>>);
 
 namespace {
 
@@ -37,7 +37,7 @@ std::atomic<std::size_t> g_mutex_locks{0};
 std::atomic<std::size_t> g_spin_hints{0};
 
 // Policy that overrides Mutex and spin_hint to prove they are actually used.
-struct CountingSync : thread_pool::StdSync {
+struct CountingSync : fibers::sync::StdSync {
     struct Mutex {
         void lock() {
             g_mutex_locks.fetch_add(1, std::memory_order_relaxed);
@@ -53,11 +53,11 @@ struct CountingSync : thread_pool::StdSync {
 
     static void spin_hint() noexcept {
         g_spin_hints.fetch_add(1, std::memory_order_relaxed);
-        thread_pool::cpu_relax();
+        fibers::sync::cpu_relax();
     }
 };
 
-static_assert(thread_pool::SyncPolicy<CountingSync>);
+static_assert(fibers::sync::SyncPolicy<CountingSync>);
 
 // Spins until counter reaches `expected` or timeout expires.
 bool wait_for(const std::atomic<std::size_t>& counter, std::size_t expected,
@@ -81,7 +81,7 @@ struct LockFreeMainBox {
     using Queue = LockFreeSPMCQueue<Task, Sync>;
 };
 
-template <class Box, class Sync = thread_pool::StdSync>
+template <class Box, class Sync = fibers::sync::StdSync>
 using PoolOf = ThreadPool<Sync, typename Box::template Queue<Sync>>;
 
 struct MainBoxName {

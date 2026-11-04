@@ -46,10 +46,10 @@
 #include <thread>
 #include <vector>
 
-#include "thread_pool/lock_free_spmc_queue.hpp"
-#include "thread_pool/thread_pool.hpp"
+#include "fibers/queue/lock_free_spmc_queue.hpp"
+#include "fibers/thread_pool/thread_pool.hpp"
 
-namespace tp = thread_pool;
+namespace tp = fibers::thread_pool;
 
 namespace {
 
@@ -57,7 +57,7 @@ namespace {
 // overflow_box, so a non-zero count means the SlowQueue was used.
 std::atomic<std::size_t> g_overflow_locks{0};
 
-struct BenchSync : tp::StdSync {
+struct BenchSync : fibers::sync::StdSync {
     struct Mutex {
         void lock() {
             g_overflow_locks.fetch_add(1, std::memory_order_relaxed);
@@ -73,11 +73,11 @@ struct BenchSync : tp::StdSync {
 };
 
 // Every pool benchmark runs once per main_box implementation.
-using LockedPool = tp::ThreadPool<BenchSync, tp::LockedSPSCQueue<tp::Task, BenchSync>>;
-using LockFreePool = tp::ThreadPool<BenchSync, tp::LockFreeSPMCQueue<tp::Task, BenchSync>>;
+using LockedPool = tp::ThreadPool<BenchSync, fibers::queue::LockedSPSCQueue<tp::Task, BenchSync>>;
+using LockFreePool = tp::ThreadPool<BenchSync, fibers::queue::LockFreeSPMCQueue<tp::Task, BenchSync>>;
 
 template <class Pool>
-struct alignas(tp::kCacheLineSize) Chain {
+struct alignas(fibers::sync::kCacheLineSize) Chain {
     Pool* pool;
     std::atomic<std::size_t>* finished;
     std::size_t remaining;
@@ -195,7 +195,7 @@ public:
     }
 
 private:
-    struct alignas(tp::kCacheLineSize) Slot {
+    struct alignas(fibers::sync::kCacheLineSize) Slot {
         std::atomic<std::size_t> value{0};
     };
     static constexpr std::size_t kSlots = 64;

@@ -7,9 +7,9 @@
 #include <type_traits>
 #include <utility>
 
-#include "thread_pool/task.hpp"
+#include "fibers/thread_pool/task.hpp"
 
-namespace thread_pool::test {
+namespace fibers::thread_pool::test {
 
 template <class F>
 Task heap_task(F&& f) {
@@ -24,4 +24,4 @@ Task heap_task(F&& f) {
         [](void* memo) noexcept { delete static_cast<Fn*>(memo); });
 }
 
-}  // namespace thread_pool::test
+}  // namespace fibers::thread_pool::test
