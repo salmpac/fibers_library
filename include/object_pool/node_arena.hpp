@@ -11,16 +11,20 @@
 // Nodes are named by 32-bit indices: [entry:8][offset:24], entry 0 is never
 // used, so index 0 is the null link. Indices instead of pointers keep a link
 // small enough to pack with a 32-bit ABA tag into one 64-bit CAS word.
+//
+// All memory (the chunks and the fixed-size chunk directory) comes from the
+// arena's PoolAllocator (pool_allocator.hpp): one allocation at construction,
+// one per growth, all returned at destruction.
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <new>
 #include <stdexcept>
-#include <vector>
+#include <utility>
 
+#include "object_pool/pool_allocator.hpp"
 #include "thread_pool/sync.hpp"
 
 namespace object_pool::detail {
@@ -49,7 +53,7 @@ struct NodeHook {
     NodeIndex self = kNullNode;  // own index, immutable after construction
 };
 
-template <class T, SyncPolicy Sync>
+template <class T, SyncPolicy Sync, PoolAllocator Alloc = DefaultAllocator>
 class NodeArena {
 public:
     using Hook = NodeHook<Sync>;
@@ -69,26 +73,30 @@ public:
     // run out before the 32-bit index space does.
     static constexpr std::size_t kGrowDivisor = 16;
 
-    NodeArena() {
-        directory_ = std::make_unique<Entry[]>(kEntries);
+    explicit NodeArena(Alloc alloc = Alloc()) : alloc_(std::move(alloc)) {
+        void* memory = alloc_.allocate(sizeof(Directory), alignof(Directory));
+        directory_ = ::new (memory) Directory{};
     }
 
     NodeArena(const NodeArena&) = delete;
     NodeArena& operator=(const NodeArena&) = delete;
 
     ~NodeArena() {
-        for (const Block& block : blocks_) {
-            for (std::size_t i = 0; i < block.count; ++i) {
-                std::byte* node = block.memory + i * kStride;
-                value_of(node)->~T();
-                hook_at(node)->~Hook();
-            }
-            ::operator delete(block.memory, std::align_val_t{kAlign});
+        for (std::size_t b = 0; b < blocks_; ++b) {
+            const Block& block = directory_->blocks[b];
+            destroy_nodes(block.memory, block.count);
+            alloc_.deallocate(block.memory, block.count * kStride, kAlign);
         }
+        directory_->~Directory();
+        alloc_.deallocate(directory_, sizeof(Directory), alignof(Directory));
     }
 
+    Alloc& allocator() noexcept { return alloc_; }
+    const Alloc& allocator() const noexcept { return alloc_; }
+
     Hook* hook(NodeIndex index) const noexcept {
-        std::byte* base = directory_[index >> kOffsetBits].base.load(std::memory_order_acquire);
+        std::byte* base =
+            directory_->entries[index >> kOffsetBits].base.load(std::memory_order_acquire);
         return hook_at(base + (index & (kEntryNodes - 1)) * kStride);
     }
 
@@ -111,8 +119,7 @@ public:
             throw std::length_error("object_pool: node index space exhausted");
         }
 
-        auto* memory = static_cast<std::byte*>(
-            ::operator new(count * kStride, std::align_val_t{kAlign}));
+        auto* memory = static_cast<std::byte*>(alloc_.allocate(count * kStride, kAlign));
         std::size_t constructed = 0;
         try {
             for (; constructed < count; ++constructed) {
@@ -125,21 +132,20 @@ public:
                     throw;
                 }
             }
-            blocks_.push_back(Block{memory, count});
         } catch (...) {
-            for (std::size_t i = 0; i < constructed; ++i) {
-                value_of(memory + i * kStride)->~T();
-                hook_at(memory + i * kStride)->~Hook();
-            }
-            ::operator delete(memory, std::align_val_t{kAlign});
+            destroy_nodes(memory, constructed);
+            alloc_.deallocate(memory, count * kStride, kAlign);
             throw;
         }
+        // Cannot overflow: every block takes at least one of the
+        // kEntries - 1 usable entries, checked above.
+        directory_->blocks[blocks_++] = Block{memory, count};
 
         const std::size_t first_entry = next_entry_;
         next_entry_ += entries;
         for (std::size_t e = 0; e < entries; ++e) {
-            directory_[first_entry + e].base.store(memory + e * kEntryNodes * kStride,
-                                                   std::memory_order_release);
+            directory_->entries[first_entry + e].base.store(memory + e * kEntryNodes * kStride,
+                                                            std::memory_order_release);
         }
         auto index_of = [first_entry](std::size_t i) {
             return static_cast<NodeIndex>(((first_entry + i / kEntryNodes) << kOffsetBits) |
@@ -176,6 +182,13 @@ private:
     static T* value_of(std::byte* node) noexcept {
         return std::launder(reinterpret_cast<T*>(node + kValueOffset));
     }
+    static void destroy_nodes(std::byte* memory, std::size_t count) noexcept {
+        for (std::size_t i = 0; i < count; ++i) {
+            std::byte* node = memory + i * kStride;
+            value_of(node)->~T();
+            hook_at(node)->~Hook();
+        }
+    }
 
     // Written once (under lock_) before any node of the entry is published,
     // read by every index -> node translation. Atomic because a stale index
@@ -185,14 +198,25 @@ private:
         typename Sync::template Atomic<std::byte*> base{nullptr};
     };
 
+    // One allocated chunk of `count` nodes.
     struct Block {
-        std::byte* memory;
-        std::size_t count;
+        std::byte* memory = nullptr;
+        std::size_t count = 0;
     };
 
-    std::unique_ptr<Entry[]> directory_;
+    // Fixed size, allocated once with the arena: the 8-bit entry field bounds
+    // both arrays, so growth never reallocates the directory (and allocates
+    // nothing but the chunk itself). `entries` is the hot part (index
+    // translation); `blocks` is only touched by grow() and the destructor.
+    struct Directory {
+        Entry entries[kEntries];
+        Block blocks[kEntries - 1];
+    };
+
+    [[no_unique_address]] Alloc alloc_;
+    Directory* directory_ = nullptr;
     mutable typename Sync::Mutex lock_;
-    std::vector<Block> blocks_;
+    std::size_t blocks_ = 0;  // used prefix of directory_->blocks
     std::size_t next_entry_ = 1;
     std::size_t capacity_ = 0;
 };
