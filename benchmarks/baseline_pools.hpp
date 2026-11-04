@@ -86,7 +86,7 @@ private:
     std::size_t next_shard() noexcept {
         detail::PoolThreadState& state = detail::pool_thread_state<Sync>();
         return static_cast<std::size_t>(
-            options_.select == ShardSelect::kRoundRobin ? state.cursor++ : state.cursor);
+            options_.select == ShardSelect::kRoundRobin ? state.round_robin++ : state.home);
     }
 
     T* allocate_chunk(std::size_t count) {

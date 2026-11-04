@@ -117,7 +117,7 @@ private:
 
     std::size_t next_shard(detail::PoolThreadState& thread) noexcept {
         return static_cast<std::size_t>(
-            options_.select == ShardSelect::kRoundRobin ? thread.cursor++ : thread.cursor);
+            options_.select == ShardSelect::kRoundRobin ? thread.round_robin++ : thread.home);
     }
 
     T* grow_and_take(std::size_t shard, detail::PoolThreadState& thread) {

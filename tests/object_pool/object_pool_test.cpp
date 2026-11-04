@@ -130,6 +130,28 @@ TYPED_TEST(PoolTest, CrossThreadRelease) {
     EXPECT_GE(pool.capacity(), 64u);
 }
 
+// The per-thread state is shared by all pools: using a round-robin pool must
+// not move the thread's home shard in a kHome pool. In kHome a released object
+// is on top of the home shard, so the next acquire() returns it again.
+TEST(PoolThreadState, RoundRobinPoolDoesNotMoveHomeShard) {
+    op::DefaultPool<Object> home_pool({.shards = 8,
+                                       .initial_objects = 8,
+                                       .select = op::ShardSelect::kHome});
+    op::DefaultPool<Object> rr_pool({.shards = 8,
+                                     .initial_objects = 8,
+                                     .select = op::ShardSelect::kRoundRobin});
+    Object* mine = home_pool.acquire();
+    for (int round = 0; round < 50; ++round) {
+        home_pool.release(mine);
+        for (int i = 0; i <= round % 5; ++i) {  // advance the round-robin counter
+            rr_pool.release(rr_pool.acquire());
+        }
+        Object* again = home_pool.acquire();
+        ASSERT_EQ(again, mine) << "home shard moved in round " << round;
+    }
+    home_pool.release(mine);
+}
+
 // ------------------------------------------------------------ shard stacks
 
 namespace {

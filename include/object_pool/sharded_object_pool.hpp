@@ -10,9 +10,13 @@
 // memory is type-stable. When every shard is empty the pool grows by a chunk.
 //
 // Shard selection per operation:
-//   kRoundRobin - each acquire/release moves the thread's cursor to the next
-//                 shard (spreads load, objects migrate between shards);
+//   kRoundRobin - each acquire/release moves the thread's round-robin
+//                 counter to the next shard (spreads load, objects migrate
+//                 between shards);
 //   kHome       - a thread always starts at its own (random) home shard.
+// The per-thread state is shared by all pools: the round-robin counter and the
+// home seed are separate, so round-robin pools never move a thread's home
+// shard in kHome pools.
 // Either way, an empty shard makes acquire() scan the others before growing.
 
 #include <algorithm>
@@ -48,7 +52,8 @@ struct PoolOptions {
 namespace detail {
 
 struct PoolThreadState {
-    std::uint64_t cursor = 0;
+    std::uint64_t round_robin = 0;  // advanced by every op of a kRoundRobin pool
+    std::uint64_t home = 0;         // fixed per thread; home shard = home % shards
     bool seeded = false;
 };
 
@@ -60,7 +65,8 @@ template <class Sync>
     asm volatile("" ::: "memory");
     PoolThreadState& state = Sync::template thread_local_instance<PoolThreadState>();
     if (!state.seeded) [[unlikely]] {
-        state.cursor = static_cast<std::uint64_t>(Sync::random_seed());
+        state.round_robin = static_cast<std::uint64_t>(Sync::random_seed());
+        state.home = static_cast<std::uint64_t>(Sync::random_seed());
         state.seeded = true;
     }
     return state;
