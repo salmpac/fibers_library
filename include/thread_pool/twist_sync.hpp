@@ -6,7 +6,9 @@
 // through Twist, so both fault injection (TWIST_FAULTY) and the deterministic
 // simulator (TWIST_SIM) see all synchronisation in the library.
 //
-// Requires linking against the `twist` CMake target (FIBERS_TWIST=ON).
+// Requires linking against the `twist` CMake target (FIBERS_TWIST=ON), built
+// with TWIST_ED_STD_ATOMIC_WAIT=ON (cmake/Twist.cmake sets it): parked workers
+// sleep in Atomic<std::uint32_t>::wait, which the simulator models as a futex.
 
 #include <twist/ed/static/thread_local/var.hpp>
 #include <twist/ed/std/atomic.hpp>
@@ -34,6 +36,19 @@ struct TwistSync {
 
     // In the simulator this is a scheduling point (yield).
     static void spin_hint() noexcept { twist::ed::CpuRelax(); }
+
+    static void atomic_thread_fence(std::memory_order order) noexcept {
+#if defined(__TWIST_SIM__)
+        // The simulator panics on seq_cst fences. It runs atomics sequentially
+        // consistently (every load reads the latest store in its single
+        // timeline), so the store-load ordering a seq_cst fence adds holds by
+        // construction; what is left is its happens-before part: acq_rel.
+        if (order == std::memory_order_seq_cst) {
+            order = std::memory_order_acq_rel;
+        }
+#endif
+        twist::ed::std::atomic_thread_fence(order);
+    }
 
     template <class T>
     static T& thread_local_instance() noexcept {

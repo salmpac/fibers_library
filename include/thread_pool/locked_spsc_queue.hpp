@@ -56,6 +56,8 @@ public:
         return n;
     }
 
+    std::size_t size_approx() const noexcept { return queue_.size_approx(); }
+
     bool empty_approx() const noexcept { return queue_.empty_approx(); }
 
 private:

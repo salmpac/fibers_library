@@ -88,26 +88,37 @@ tp::ThreadPoolOptions tiny(std::size_t workers) {
         .batch_size = 2,
         .mail_box_check_interval = 2,
         .max_steal_backoff = 4,  // each spin_hint is a yield in the simulator
+        .idle_spins_before_park = 8,  // park early and often (~2-3 idle rounds)
     };
 }
 
-// Bounded wait: a lost task must fail the run (and print the schedule), not
-// hang the simulator. In simulation the bound is in scheduling steps, on real
-// threads in wall-clock time.
-void wait_until(Counter& counter, std::size_t target) {
+// Bounded waits: a lost task or wakeup must fail the run (and print the
+// schedule), not hang the simulator. In simulation the bound is in scheduling
+// steps, on real threads in wall-clock time.
 #if defined(__TWIST_SIM__)
-    for (std::size_t step = 0; counter.load() < target; ++step) {
-        TWIST_ASSERT_M(step < 5'000, "task lost: counter never reached target");
-        twist::ed::std::this_thread::yield();
+#define FIBERS_WAIT_BOUNDED(condition, message)                 \
+    for (std::size_t step_ = 0; !(condition); ++step_) {        \
+        TWIST_ASSERT_M(step_ < 5'000, message);                 \
+        twist::ed::std::this_thread::yield();                   \
     }
 #else
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (counter.load() < target) {
-        TWIST_ASSERT_M(std::chrono::steady_clock::now() < deadline,
-                       "task lost: counter never reached target");
-        twist::ed::std::this_thread::yield();
+#define FIBERS_WAIT_BOUNDED(condition, message)                                       \
+    for (const auto deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30); \
+         !(condition);) {                                                             \
+        TWIST_ASSERT_M(std::chrono::steady_clock::now() < deadline_, message);        \
+        twist::ed::std::this_thread::yield();                                         \
     }
 #endif
+
+void wait_until(Counter& counter, std::size_t target) {
+    FIBERS_WAIT_BOUNDED(counter.load() >= target, "task lost: counter never reached target");
+}
+
+// Until every worker sleeps (they must: nothing is queued).
+template <class Pool>
+void wait_all_parked(const Pool& pool) {
+    FIBERS_WAIT_BOUNDED(pool.parked_workers() == pool.num_workers(),
+                        "idle workers never all parked");
 }
 
 void count_task(void* memo) noexcept { static_cast<Counter*>(memo)->fetch_add(1); }
@@ -275,6 +286,119 @@ TYPED_TEST(ThreadPoolTwist, StopDropsPendingTasks) {
         }  // queues destroyed: pending tasks dropped
         TWIST_ASSERT_M(ran.load() + dropped.load() == kTasks,
                        "each task is either run or dropped, exactly once");
+    });
+}
+
+// ---- parking: every lost wakeup must surface as a Twist deadlock (all
+// threads blocked, e.g. in stop()'s join) or a failed bounded wait.
+
+TYPED_TEST(ThreadPoolTwist, AllParkedThenExternalSubmit) {
+    using Pool = TypeParam;
+    check([] {
+        Counter done{0};
+        Pool pool(tiny(2));
+        wait_all_parked(pool);
+        pool.submit(count(done));
+        wait_until(done, 1);
+        wait_all_parked(pool);
+        std::vector<tp::Task> batch;
+        for (int i = 0; i < 3; ++i) {
+            batch.push_back(count(done));
+        }
+        pool.submit_batch(batch);
+        wait_until(done, 4);
+        pool.stop();
+        TWIST_ASSERT_M(done.load() == 4, "every task runs exactly once");
+    });
+}
+
+TYPED_TEST(ThreadPoolTwist, SingleWorkerParkUnparkRace) {
+    using Pool = TypeParam;
+    // No waiting for the worker to park: submits race with it going to sleep.
+    check([] {
+        static constexpr std::size_t kTasks = 4;
+        Counter done{0};
+        Pool pool(tiny(1));
+        for (std::size_t i = 0; i < kTasks; ++i) {
+            pool.submit(count(done));
+            wait_until(done, i + 1);
+        }
+        pool.stop();
+        TWIST_ASSERT_M(done.load() == kTasks, "every task runs exactly once");
+    });
+}
+
+TYPED_TEST(ThreadPoolTwist, BurstIdleBurst) {
+    using Pool = TypeParam;
+    check([] {
+        Counter done{0};
+        Pool pool(tiny(2));
+
+        // A task that spawns two children locally (into its main_box).
+        struct Spawner {
+            Pool* pool;
+            Counter* done;
+            static void run(void* memo) noexcept {
+                auto* self = static_cast<Spawner*>(memo);
+                tp::Task children[2] = {count(*self->done), count(*self->done)};
+                self->pool->submit_batch(children, 2);
+                self->pool->submit(count(*self->done));
+                self->done->fetch_add(1);
+            }
+        } spawner{&pool, &done};
+
+        for (int round = 1; round <= 2; ++round) {
+            pool.submit(tp::Task(&spawner, &Spawner::run, nullptr));
+            pool.submit(count(done));
+            pool.submit(count(done));
+            wait_until(done, 6 * static_cast<std::size_t>(round));
+            wait_all_parked(pool);  // idle in between
+        }
+        pool.stop();
+        TWIST_ASSERT_M(done.load() == 12, "every task runs exactly once");
+    });
+}
+
+TYPED_TEST(ThreadPoolTwist, StopWhileParked) {
+    using Pool = TypeParam;
+    check([] {
+        Counter done{0};
+        Pool pool(tiny(2));
+        pool.submit(count(done));
+        wait_until(done, 1);
+        wait_all_parked(pool);
+        pool.stop();  // a parked worker that is not woken deadlocks this join
+    });
+}
+
+TYPED_TEST(ThreadPoolTwist, StopRacesWithParking) {
+    using Pool = TypeParam;
+    check([] {
+        Counter done{0};
+        Pool pool(tiny(2));
+        pool.submit(count(done));
+        pool.stop();  // workers may be anywhere between RUNNING and PARKED
+        TWIST_ASSERT_M(done.load() <= 1, "at most the one task ran");
+    });
+}
+
+TYPED_TEST(ThreadPoolTwist, ExternalProducersRaceWithParking) {
+    using Pool = TypeParam;
+    check([] {
+        Counter done{0};
+        Pool pool(tiny(2));
+        auto produce = [&] {
+            pool.submit(count(done));
+            twist::ed::std::this_thread::yield();
+            pool.submit(count(done));
+        };
+        twist::ed::std::thread p1(produce);
+        twist::ed::std::thread p2(produce);
+        p1.join();
+        p2.join();
+        wait_until(done, 4);
+        pool.stop();
+        TWIST_ASSERT_M(done.load() == 4, "every task runs exactly once");
     });
 }
 

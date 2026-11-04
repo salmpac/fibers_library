@@ -38,6 +38,11 @@ endwhile()
 # cc-wrapper.
 set(FMT_MODULE OFF CACHE BOOL "Build fmt as a C++20 module (not needed by Twist)")
 
+# Parked ThreadPool workers sleep in atomic::wait (TwistSync::Atomic<uint32_t>);
+# Twist only provides atomic wait / notify with this option. Cache variable, so
+# presets and nix builds get it alike (Twist's option() keeps an existing value).
+set(TWIST_ED_STD_ATOMIC_WAIT ON CACHE BOOL "Support std::atomic::wait in Twist")
+
 FetchContent_Declare(
     twist
     GIT_REPOSITORY https://gitlab.com/Lipovsky/twist.git

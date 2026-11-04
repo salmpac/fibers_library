@@ -13,18 +13,27 @@
 // 3. ExternalSpammer: a non-worker thread submits 10M tasks, round-robin into
 //    the workers' mail_boxes.
 //
+// 4. Parking: WakeLatency (submit to a fully parked pool -> task start, p50 /
+//    p99), SparsePingPong (pairs of tasks re-submitting each other on an
+//    otherwise idle pool: time per handoff and cores kept busy) and IdleCpu
+//    (process CPU time while the pool sits idle for one second).
+//
 // Spammers submit one by one (batch = 1, ThreadPool::submit) or in batches
 // (ThreadPool::submit_batch); backoff = ThreadPoolOptions::max_steal_backoff
 // (0 = idle thieves never pause).
 //
 // In 2 and 3 the queues may overflow by design; overflow_locks reports how
-// often the SlowQueue mutex was taken (per iteration).
+// often the SlowQueue mutex was taken (per iteration), parks how often a
+// worker went to sleep (per iteration).
 //
 // Each pool benchmark runs for both main_box implementations (LockedPool =
 // LockedSPSCQueue, LockFreePool = LockFreeSPMCQueue). Narrow the argument
 // sets with --benchmark_filter, e.g. 'workers:(4|16)/batch:(1|256)/backoff:256'.
 
 #include <benchmark/benchmark.h>
+
+#include <sys/resource.h>
+#include <sys/time.h>
 
 #include <algorithm>
 #include <array>
@@ -259,6 +268,17 @@ void spammer_task(void* memo) noexcept {
     ctx->finished.store(true, std::memory_order_release);
 }
 
+// Times any worker went to sleep, if the pool parks at all (this file also
+// builds against pools without parking, for comparisons).
+template <class Pool>
+double parks_of(const Pool& pool) {
+    if constexpr (requires { pool.park_count(); }) {
+        return static_cast<double>(pool.park_count());
+    } else {
+        return 0;
+    }
+}
+
 void report_spam(benchmark::State& state, std::size_t overflow, double submit_ns) {
     const double iterations = static_cast<double>(state.iterations());
     state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations() * kSpamTasks));
@@ -290,6 +310,7 @@ void BM_ThreadPool_BlockedSpammer(benchmark::State& state) {
         while (!ctx.finished.load(std::memory_order_acquire)) std::this_thread::yield();
     }
 
+    state.counters["parks"] = parks_of(pool) / static_cast<double>(state.iterations());
     report_spam(state, g_overflow_locks.load() - overflow_before,
                 static_cast<double>(ctx.spam_ns.load()));
 }
@@ -325,6 +346,7 @@ void BM_ThreadPool_ExternalSpammer(benchmark::State& state) {
         wait_for_sum(done, kSpamTasks);
     }
 
+    state.counters["parks"] = parks_of(pool) / static_cast<double>(state.iterations());
     report_spam(state, g_overflow_locks.load() - overflow_before, submit_ns);
 }
 
@@ -336,6 +358,186 @@ BENCHMARK_TEMPLATE(BM_ThreadPool_ExternalSpammer, LockedPool)
 BENCHMARK_TEMPLATE(BM_ThreadPool_ExternalSpammer, LockFreePool)
     ->ArgNames({"workers", "batch", "backoff"})
     ->ArgsProduct({{1, 2, 4, 8, 16}, {1, 32, 256}, {0, 256}})
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+// ------------------------------------------------------------ parking
+
+std::chrono::nanoseconds process_cpu_time() {
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    const auto tv = [](const timeval& t) {
+        return std::chrono::seconds(t.tv_sec) + std::chrono::microseconds(t.tv_usec);
+    };
+    return tv(usage.ru_utime) + tv(usage.ru_stime);
+}
+
+// Waits (bounded) until every worker sleeps, if the pool can park at all
+// (this file also builds against pools without parking, for comparisons).
+template <class Pool>
+void wait_all_parked(const Pool& pool) {
+    if constexpr (requires { pool.parked_workers(); }) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (pool.parked_workers() != pool.num_workers() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+}
+
+double percentile(std::vector<double>& v, double p) {
+    if (v.empty()) return 0;
+    const auto k = static_cast<std::size_t>(p * static_cast<double>(v.size() - 1));
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+    return v[k];
+}
+
+using Clock = std::chrono::steady_clock;
+
+struct WakeProbe {
+    std::atomic<std::int64_t> started_ns{0};
+};
+
+void wake_probe_task(void* memo) noexcept {
+    auto* probe = static_cast<WakeProbe*>(memo);
+    probe->started_ns.store(Clock::now().time_since_epoch().count(), std::memory_order_release);
+    probe->started_ns.notify_one();
+}
+
+// 4a. Wake latency: an external thread submits one task to an idle pool about
+// every millisecond (after the workers have parked, when the pool parks); time
+// from submit() to the task starting. Median and p99 over all submits.
+template <class Pool>
+void BM_ThreadPool_WakeLatency(benchmark::State& state) {
+    const auto workers = static_cast<std::size_t>(state.range(0));
+    Pool pool(tp::ThreadPoolOptions{.num_workers = workers});
+    std::vector<double> latencies_us;
+    WakeProbe probe;
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        wait_all_parked(pool);
+        probe.started_ns.store(0);
+        state.ResumeTiming();
+
+        const std::int64_t submitted = Clock::now().time_since_epoch().count();
+        pool.submit(tp::Task(&probe, &wake_probe_task, nullptr));
+        std::int64_t started = 0;
+        while ((started = probe.started_ns.load(std::memory_order_acquire)) == 0) {
+            probe.started_ns.wait(0);
+        }
+        latencies_us.push_back(static_cast<double>(started - submitted) / 1e3);
+    }
+
+    state.counters["p50_us"] = percentile(latencies_us, 0.50);
+    state.counters["p99_us"] = percentile(latencies_us, 0.99);
+}
+
+BENCHMARK_TEMPLATE(BM_ThreadPool_WakeLatency, LockFreePool)
+    ->ArgNames({"workers"})
+    ->Arg(1)->Arg(4)->Arg(16)
+    ->Iterations(1000)
+    ->UseRealTime()
+    ->Unit(benchmark::kMicrosecond);
+
+// 4b. Sparse ping-pong: `pairs` pairs of tasks, each task re-submitting its
+// partner from inside a worker (a fiber-like handoff), `steps` handoffs per
+// pair; the other workers have nothing to do. Reports time per handoff and how
+// many cores the process kept busy (cpu_cores = CPU time / wall time).
+template <class Pool>
+struct PingPong {
+    Pool* pool;
+    PingPong* partner;
+    std::size_t* remaining;  // shared by the pair: only one of them runs at a time
+    std::atomic<std::size_t>* finished;
+};
+
+template <class Pool>
+void ping_pong_step(void* memo) noexcept {
+    auto* self = static_cast<PingPong<Pool>*>(memo);
+    if (--*self->remaining != 0) {
+        self->pool->submit(tp::Task(self->partner, &ping_pong_step<Pool>, nullptr));
+        return;
+    }
+    self->finished->fetch_add(1, std::memory_order_acq_rel);
+    self->finished->notify_all();
+}
+
+template <class Pool>
+void BM_ThreadPool_SparsePingPong(benchmark::State& state) {
+    const auto workers = static_cast<std::size_t>(state.range(0));
+    const auto pairs = static_cast<std::size_t>(state.range(1));
+    const auto steps = static_cast<std::size_t>(state.range(2));
+    Pool pool(tp::ThreadPoolOptions{.num_workers = workers});
+    std::vector<PingPong<Pool>> tasks(2 * pairs);
+    std::vector<std::size_t> remaining(pairs);
+    std::atomic<std::size_t> finished{0};
+    std::chrono::nanoseconds cpu{0};
+    std::chrono::nanoseconds wall{0};
+
+    for (auto _ : state) {
+        finished.store(0);
+        for (std::size_t p = 0; p < pairs; ++p) {
+            remaining[p] = steps;
+            tasks[2 * p] = PingPong<Pool>{&pool, &tasks[2 * p + 1], &remaining[p], &finished};
+            tasks[2 * p + 1] = PingPong<Pool>{&pool, &tasks[2 * p], &remaining[p], &finished};
+        }
+        const auto cpu_start = process_cpu_time();
+        const auto wall_start = Clock::now();
+        for (std::size_t p = 0; p < pairs; ++p) {
+            pool.submit(tp::Task(&tasks[2 * p], &ping_pong_step<Pool>, nullptr));
+        }
+        for (std::size_t v; (v = finished.load(std::memory_order_acquire)) != pairs;) {
+            finished.wait(v);
+        }
+        wall += Clock::now() - wall_start;
+        cpu += process_cpu_time() - cpu_start;
+    }
+
+    const double handoffs = static_cast<double>(pairs * steps);
+    state.counters["time/handoff"] = benchmark::Counter(
+        handoffs, benchmark::Counter::kIsIterationInvariantRate | benchmark::Counter::kInvert);
+    state.counters["cpu_cores"] =
+        static_cast<double>(cpu.count()) / static_cast<double>(std::max<std::int64_t>(wall.count(), 1));
+}
+
+BENCHMARK_TEMPLATE(BM_ThreadPool_SparsePingPong, LockFreePool)
+    ->ArgNames({"workers", "pairs", "steps"})
+    ->ArgsProduct({{1, 4, 16}, {1, 2}, {1'000'000}})
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+// 4c. Idle CPU: the pool does nothing for one second; process CPU time spent
+// meanwhile (ms per second of idleness; a spinning worker costs ~1000).
+template <class Pool>
+void BM_ThreadPool_IdleCpu(benchmark::State& state) {
+    const auto workers = static_cast<std::size_t>(state.range(0));
+    Pool pool(tp::ThreadPoolOptions{.num_workers = workers});
+    {
+        // Make sure every worker has started and seen some work.
+        std::atomic<std::size_t> done{0};
+        for (std::size_t i = 0; i < 4 * workers; ++i) {
+            pool.submit(tp::Task(&done, [](void* m) noexcept {
+                static_cast<std::atomic<std::size_t>*>(m)->fetch_add(1);
+            }, nullptr));
+        }
+        while (done.load() != 4 * workers) std::this_thread::yield();
+    }
+    std::chrono::nanoseconds cpu{0};
+    for (auto _ : state) {
+        const auto start = process_cpu_time();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        cpu += process_cpu_time() - start;
+    }
+    state.counters["cpu_ms_per_s"] =
+        static_cast<double>(cpu.count()) / 1e6 / static_cast<double>(state.iterations());
+}
+
+BENCHMARK_TEMPLATE(BM_ThreadPool_IdleCpu, LockFreePool)
+    ->ArgNames({"workers"})
+    ->Arg(1)->Arg(4)->Arg(16)
+    ->Iterations(1)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 

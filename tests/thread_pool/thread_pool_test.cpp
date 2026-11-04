@@ -1,8 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <sys/resource.h>
+#include <sys/time.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -369,4 +373,210 @@ TYPED_TEST(ThreadPoolTest, WorksWithoutStealBackoff) {
     std::atomic<std::size_t> counter{0};
     pool.submit(heap_task([&] { spawn_tree(pool, counter, kDepth); }));
     EXPECT_TRUE(wait_for(counter, (std::size_t{1} << (kDepth + 1)) - 1));
+}
+
+// ------------------------------------------------------------ parking
+
+namespace {
+
+std::chrono::microseconds process_cpu_time() {
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    const auto tv = [](const timeval& t) {
+        return std::chrono::seconds(t.tv_sec) + std::chrono::microseconds(t.tv_usec);
+    };
+    return tv(usage.ru_utime) + tv(usage.ru_stime);
+}
+
+// Waits (bounded) until every worker of `pool` sleeps.
+template <class Pool>
+bool wait_all_parked(const Pool& pool, std::chrono::seconds timeout = 10s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (pool.parked_workers() != pool.num_workers()) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::sleep_for(100us);
+    }
+    return true;
+}
+
+}  // namespace
+
+TYPED_TEST(ThreadPoolTest, IdleWorkersParkAndUseNoCpu) {
+    using Pool = PoolOf<TypeParam>;
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
+    std::atomic<std::size_t> counter{0};
+    for (int i = 0; i < 1'000; ++i) {
+        pool.submit(heap_task([&counter] { counter.fetch_add(1, std::memory_order_relaxed); }));
+    }
+    ASSERT_TRUE(wait_for(counter, 1'000));
+    ASSERT_TRUE(wait_all_parked(pool));
+    EXPECT_GE(pool.park_count(), pool.num_workers());
+
+    const auto parks_before = pool.park_count();
+    const auto cpu_before = process_cpu_time();
+    std::this_thread::sleep_for(200ms);
+    const auto cpu = process_cpu_time() - cpu_before;
+    // Spinning workers would burn ~4 x 200 ms. Allow a little scheduler noise.
+    EXPECT_LT(cpu, 20ms) << "idle pool used " << cpu.count() << " us of CPU in 200 ms";
+    EXPECT_EQ(pool.park_count(), parks_before) << "parked workers woke up without work";
+}
+
+TYPED_TEST(ThreadPoolTest, ExternalSubmitWakesFullyParkedPool) {
+    using Pool = PoolOf<TypeParam>;
+    for (std::size_t workers : {std::size_t{1}, std::size_t{4}}) {
+        Pool pool(ThreadPoolOptions{.num_workers = workers});
+        for (int round = 0; round < 50; ++round) {
+            ASSERT_TRUE(wait_all_parked(pool)) << "round " << round;
+            std::atomic<std::size_t> counter{0};
+            const auto start = std::chrono::steady_clock::now();
+            pool.submit(heap_task([&counter] { counter.fetch_add(1); }));
+            ASSERT_TRUE(wait_for(counter, 1, 10s)) << "round " << round;
+            // "Promptly": a wakeup takes microseconds; this only catches a
+            // task that waited for some unrelated event.
+            EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+        }
+    }
+}
+
+TYPED_TEST(ThreadPoolTest, BurstAfterIdle) {
+    using Pool = PoolOf<TypeParam>;
+    constexpr int kDepth = 10;
+    constexpr std::size_t kTree = (std::size_t{1} << (kDepth + 1)) - 1;
+    constexpr std::size_t kExternal = 20'000;
+    // Outlives the rounds: a task's relaxed fetch_add does not synchronize
+    // with the main thread, so the storage must not be reused meanwhile.
+    std::atomic<std::size_t> counter{0};
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
+    for (int round = 0; round < 5; ++round) {
+        ASSERT_TRUE(wait_all_parked(pool));
+        counter.store(0);
+        // Local burst: a tree spawned from inside one worker.
+        pool.submit(heap_task([&] { spawn_tree(pool, counter, kDepth); }));
+        // External burst: single submits and batches from two threads.
+        std::thread single([&] {
+            for (std::size_t i = 0; i < kExternal; ++i) {
+                pool.submit(heap_task([&counter] { counter.fetch_add(1, std::memory_order_relaxed); }));
+            }
+        });
+        std::thread batched([&] {
+            for (std::size_t i = 0; i < kExternal; i += 100) {
+                auto tasks = make_count_tasks(counter, 100);
+                pool.submit_batch(tasks);
+            }
+        });
+        single.join();
+        batched.join();
+        ASSERT_TRUE(wait_for(counter, kTree + 2 * kExternal)) << "round " << round;
+    }
+}
+
+TYPED_TEST(ThreadPoolTest, LocalBurstWakesParkedWorkers) {
+    using Pool = PoolOf<TypeParam>;
+    constexpr std::size_t kTasks = 64;
+    Pool pool(ThreadPoolOptions{.num_workers = 4});
+    ASSERT_TRUE(wait_all_parked(pool));
+    std::atomic<std::size_t> counter{0};
+    std::mutex mutex;
+    std::set<std::thread::id> ids;
+    pool.submit(heap_task([&] {
+        for (std::size_t i = 0; i < kTasks; ++i) {
+            pool.submit(heap_task([&] {
+                std::this_thread::sleep_for(1ms);
+                {
+                    std::lock_guard guard(mutex);
+                    ids.insert(std::this_thread::get_id());
+                }
+                counter.fetch_add(1);
+            }));
+        }
+    }));
+    ASSERT_TRUE(wait_for(counter, kTasks));
+    std::lock_guard guard(mutex);
+    EXPECT_GT(ids.size(), 1u) << "the overload wake never brought a parked worker in";
+}
+
+TYPED_TEST(ThreadPoolTest, SingleWorkerParkUnparkRace) {
+    using Pool = PoolOf<TypeParam>;
+    constexpr std::size_t kTasks = 20'000;
+    // Park after a single failed round: the worker parks between almost every
+    // pair of submits, racing with them.
+    Pool pool(ThreadPoolOptions{.num_workers = 1, .max_steal_backoff = 0,
+                                .idle_spins_before_park = 1});
+    std::atomic<std::size_t> counter{0};
+    for (std::size_t i = 0; i < kTasks; ++i) {
+        pool.submit(heap_task([&counter] { counter.fetch_add(1, std::memory_order_relaxed); }));
+        if (i % 64 == 0) std::this_thread::sleep_for(20us);
+    }
+    EXPECT_TRUE(wait_for(counter, kTasks, 30s));
+    EXPECT_GT(pool.park_count(), 0u);
+}
+
+// An outside thread submits one task and waits for it, many times: every
+// submit races with the worker(s) going back to sleep right after the
+// previous task. A lost wakeup hangs one round (caught by the bound).
+TYPED_TEST(ThreadPoolTest, SubmitAndWaitPingPong) {
+    using Pool = PoolOf<TypeParam>;
+    constexpr std::size_t kRounds = 50'000;
+    for (std::size_t workers : {std::size_t{1}, std::size_t{4}}) {
+        Pool pool(ThreadPoolOptions{.num_workers = workers, .max_steal_backoff = 0,
+                                    .idle_spins_before_park = 1});
+        std::atomic<std::size_t> counter{0};
+        for (std::size_t i = 1; i <= kRounds; ++i) {
+            pool.submit(Task(&counter, &count_task, nullptr));
+            const auto deadline = std::chrono::steady_clock::now() + 5s;
+            while (counter.load() < i) {
+                ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+                    << "lost wakeup in round " << i << " with " << workers << " worker(s)";
+            }
+        }
+        EXPECT_GT(pool.park_count(), 0u);
+    }
+}
+
+TYPED_TEST(ThreadPoolTest, StopWhileAllParked) {
+    using Pool = PoolOf<TypeParam>;
+    for (std::size_t workers : {std::size_t{1}, std::size_t{4}, std::size_t{16}}) {
+        auto pool = std::make_unique<Pool>(ThreadPoolOptions{.num_workers = workers});
+        ASSERT_TRUE(wait_all_parked(*pool));
+        const auto start = std::chrono::steady_clock::now();
+        pool->stop();
+        EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
+        pool.reset();
+    }
+}
+
+// Many external producers with pauses, so workers keep parking and waking
+// while tasks arrive. Every task must run exactly once.
+TYPED_TEST(ThreadPoolTest, SubmitStormWithParking) {
+    using Pool = PoolOf<TypeParam>;
+    constexpr std::size_t kProducers = 8;
+    constexpr std::size_t kPerProducer = 20'000;
+    for (std::size_t spins_before_park : {std::size_t{1}, std::size_t{8192}}) {
+        Pool pool(ThreadPoolOptions{.num_workers = 4, .max_steal_backoff = 16,
+                                    .idle_spins_before_park = spins_before_park});
+        std::atomic<std::size_t> counter{0};
+        std::vector<std::thread> producers;
+        for (std::size_t p = 0; p < kProducers; ++p) {
+            producers.emplace_back([&, p] {
+                std::size_t submitted = 0;
+                for (std::size_t i = 0; submitted < kPerProducer; ++i) {
+                    if (p % 2 == 0 && i % 4 == 0 && kPerProducer - submitted >= 3) {
+                        auto tasks = make_count_tasks(counter, 3);
+                        pool.submit_batch(tasks);
+                        submitted += 3;
+                    } else {
+                        pool.submit(heap_task([&counter] { counter.fetch_add(1, std::memory_order_relaxed); }));
+                        submitted += 1;
+                    }
+                    if (i % (256 + 32 * p) == 0) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(50 * p));
+                    }
+                }
+            });
+        }
+        for (auto& t : producers) t.join();
+        EXPECT_TRUE(wait_for(counter, kProducers * kPerProducer, 30s))
+            << "lost tasks with idle_spins_before_park = " << spins_before_park;
+        EXPECT_GT(pool.park_count(), 0u);
+    }
 }

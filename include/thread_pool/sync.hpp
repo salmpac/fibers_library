@@ -30,7 +30,10 @@ inline void cpu_relax() noexcept {
 // from here, so a checker (e.g. Twist) can be plugged in by providing its own
 // policy:
 //
-//   Atomic<T>                    std::atomic-compatible (incl. memory orders)
+//   Atomic<T>                    std::atomic-compatible (incl. memory orders);
+//                                Atomic<std::uint32_t> also needs C++20
+//                                wait / notify_one / notify_all (parking)
+//   atomic_thread_fence(order)   std::atomic_thread_fence
 //   Mutex                        Lockable (lock / try_lock / unlock)
 //   Thread                       constructible from a callable, has join()
 //   spin_hint()                  called on every busy-wait iteration
@@ -39,8 +42,12 @@ inline void cpu_relax() noexcept {
 //                                checker: its controlled randomness, so runs
 //                                are reproducible yet differ between runs)
 template <class S>
-concept SyncPolicy = requires {
+concept SyncPolicy = requires(typename S::template Atomic<std::uint32_t>& word) {
     typename S::template Atomic<std::size_t>;
+    word.wait(std::uint32_t{0}, std::memory_order_acquire);
+    word.notify_one();
+    word.notify_all();
+    S::atomic_thread_fence(std::memory_order_seq_cst);
     typename S::Mutex;
     typename S::Thread;
     S::spin_hint();
@@ -60,6 +67,10 @@ struct StdSync {
     using Thread = std::thread;
 
     static void spin_hint() noexcept { cpu_relax(); }
+
+    static void atomic_thread_fence(std::memory_order order) noexcept {
+        std::atomic_thread_fence(order);
+    }
 
     template <class T>
     static T& thread_local_instance() noexcept {
