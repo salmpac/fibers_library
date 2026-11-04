@@ -577,6 +577,14 @@ TYPED_TEST(ThreadPoolTest, SubmitStormWithParking) {
         for (auto& t : producers) t.join();
         EXPECT_TRUE(wait_for(counter, kProducers * kPerProducer, 30s))
             << "lost tasks with idle_spins_before_park = " << spins_before_park;
+        // Whether workers park *during* the storm depends on timing (dense
+        // under sanitizers); after it, an idle pool must park completely.
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (pool.parked_workers() < pool.num_workers() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(1ms);
+        }
+        EXPECT_EQ(pool.parked_workers(), pool.num_workers());
         EXPECT_GT(pool.park_count(), 0u);
     }
 }

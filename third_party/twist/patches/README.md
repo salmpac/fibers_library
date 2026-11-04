@@ -24,3 +24,13 @@ equivalent.
 Only Twist itself is patched. Its dependencies (sure, sure-stack, futex_like,
 ...) are pinned only by `flake.lock`; a non-nix build fetches them at whatever
 revision Twist's CMake asks for.
+
+## Authorship and licensing
+
+Twist is written by Roman Lipovsky (https://gitlab.com/Lipovsky/twist); all
+rights to Twist belong to its author. At the time of writing the upstream
+repository carries no license file, so these patches (which contain fragments
+of Twist's code as diff context and changes derived from it) are published
+here solely to build and test this project. They are intended to be proposed
+upstream as a merge request; if the author objects to them being published
+here, they will be removed.
