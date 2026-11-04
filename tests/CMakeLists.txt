@@ -3,3 +3,5 @@ include(GoogleTest)
 
 add_subdirectory(thread_pool)
 add_subdirectory(object_pool)
+add_subdirectory(poller)
+add_subdirectory(ipc)

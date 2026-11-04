@@ -66,8 +66,21 @@ add_library(fibers::object_pool ALIAS fibers_object_pool)
 set_target_properties(fibers_object_pool PROPERTIES EXPORT_NAME object_pool)
 target_link_libraries(fibers_object_pool INTERFACE fibers_thread_pool)  # Sync policy
 
+# Header-only reactor thread (epoll, timers, polling sources): include/poller.
+add_library(fibers_poller INTERFACE)
+add_library(fibers::poller ALIAS fibers_poller)
+set_target_properties(fibers_poller PROPERTIES EXPORT_NAME poller)
+target_link_libraries(fibers_poller INTERFACE fibers_thread_pool)  # Sync policy, Task
+
+# Header-only shared-memory SPSC rings for other processes: include/ipc.
+add_library(fibers_ipc INTERFACE)
+add_library(fibers::ipc ALIAS fibers_ipc)
+set_target_properties(fibers_ipc PROPERTIES EXPORT_NAME ipc)
+target_link_libraries(fibers_ipc INTERFACE fibers_poller)
+
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(TARGETS fibers_thread_pool fibers_object_pool EXPORT fibersTargets)
+install(TARGETS fibers_poller fibers_ipc EXPORT fibersTargets)
 install(EXPORT fibersTargets
     NAMESPACE fibers::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fibers)
