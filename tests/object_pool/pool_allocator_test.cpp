@@ -18,7 +18,6 @@
 #include <mutex>
 #include <new>
 #include <set>
-#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -60,7 +59,7 @@ void* counted_new(std::size_t bytes, std::size_t align) {
                   ? std::malloc(bytes == 0 ? 1 : bytes)
                   : std::aligned_alloc(align, round_up(bytes == 0 ? 1 : bytes, align));
     if (p == nullptr) {
-        throw std::bad_alloc();
+        std::abort();  // fail fast, like the library
     }
     return p;
 }
@@ -87,25 +86,17 @@ void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::fre
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 // The nothrow forms too: a sanitizer runtime would otherwise provide them with
 // its own allocator, mismatching our deletes.
-void* operator new(std::size_t n, const std::nothrow_t&) noexcept try {
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
     return counted_new(n, alignof(std::max_align_t));
-} catch (...) {
-    return nullptr;
 }
-void* operator new[](std::size_t n, const std::nothrow_t&) noexcept try {
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
     return counted_new(n, alignof(std::max_align_t));
-} catch (...) {
-    return nullptr;
 }
-void* operator new(std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept try {
+void* operator new(std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
     return counted_new(n, static_cast<std::size_t>(a));
-} catch (...) {
-    return nullptr;
 }
-void* operator new[](std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept try {
+void* operator new[](std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
     return counted_new(n, static_cast<std::size_t>(a));
-} catch (...) {
-    return nullptr;
 }
 void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
@@ -128,10 +119,10 @@ struct AllocStats {
         std::size_t align;
     };
 
-    void* allocate(std::size_t bytes, std::size_t align) {
+    void* allocate(std::size_t bytes, std::size_t align) noexcept {
         void* p = std::aligned_alloc(align, round_up(bytes == 0 ? 1 : bytes, align));
         if (p == nullptr) {
-            throw std::bad_alloc();
+            std::abort();  // fail fast
         }
         std::lock_guard guard(mutex);
         if (reinterpret_cast<std::uintptr_t>(p) % align != 0 || live_count == live.size()) {
@@ -195,7 +186,7 @@ public:
     CountingAllocator(const CountingAllocator&) = delete;
     CountingAllocator& operator=(const CountingAllocator&) = delete;
 
-    void* allocate(std::size_t bytes, std::size_t align) {
+    void* allocate(std::size_t bytes, std::size_t align) noexcept {
         return stats_->allocate(bytes, align);
     }
     void deallocate(void* p, std::size_t bytes, std::size_t align) noexcept {
@@ -235,24 +226,20 @@ struct alignas(128) Wide {
     unsigned char bytes[200] = {};
 };
 
-// Throws from the constructor when the throw_at-th object would be built.
-struct Throwing {
-    static inline int constructed = 0;
-    static inline int destroyed = 0;
-    static inline int throw_at = -1;
+// Not nothrow default constructible: the pools must reject it at compile time.
+struct ThrowingCtor {
+    ThrowingCtor() {}  // NOLINT: deliberately not noexcept
+};
 
-    Throwing() {
-        if (constructed + 1 == throw_at) {
-            throw std::runtime_error("Throwing: planned failure");
-        }
-        ++constructed;
-    }
-    ~Throwing() { ++destroyed; }
+template <class T>
+concept Poolable = requires { typename op::DefaultPool<T>; };
 
-    static void reset(int at) {
-        constructed = 0;
-        destroyed = 0;
-        throw_at = at;
+// A memory resource that refuses: the pool must fail fast, not throw.
+class RefusingResource : public std::pmr::memory_resource {
+    void* do_allocate(std::size_t, std::size_t) override { throw std::bad_alloc(); }
+    void do_deallocate(void*, std::size_t, std::size_t) override {}
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
     }
 };
 
@@ -442,92 +429,36 @@ TEST(PoolAllocator, ConcurrentGrowth) {
     EXPECT_EQ(stats.live_count, 0u);
 }
 
-// ------------------------------------------------------------ exceptions
+// ------------------------------------------------------------ fail fast
 
-// T() throws while the constructor preallocates: the pool constructor fails,
-// the built objects are destroyed and every block goes back to the allocator.
-TEST(PoolAllocator, ThrowingConstructorDuringPreallocation) {
-    warm_up();
-    AllocStats stats;
-    Throwing::reset(5);
-    using Pool = op::DefaultPool<Throwing, op::StdSync, CountingAllocator>;
-    EXPECT_THROW(Pool({.shards = 2, .initial_objects = 8}, CountingAllocator(stats, 1)),
-                 std::runtime_error);
-    EXPECT_EQ(Throwing::constructed, 4);
-    EXPECT_EQ(Throwing::destroyed, 4);
-    EXPECT_EQ(stats.allocs, 3u);  // directory, shards, the failed chunk
-    EXPECT_EQ(stats.errors, 0u);
-    EXPECT_EQ(stats.deallocs, stats.allocs);
-    EXPECT_EQ(stats.live_count, 0u);
+static_assert(Poolable<Object>);
+static_assert(!Poolable<ThrowingCtor>, "throwing T() must be rejected");
+
+void build_pool_on_refusing_resource() {
+    RefusingResource resource;
+    op::DefaultPool<Object, op::StdSync, op::PmrAllocator> pool({.shards = 2}, &resource);
 }
 
-// T() throws while acquire() grows: acquire throws, the partial chunk is
-// rolled back, and the pool stays usable.
-TEST(PoolAllocator, ThrowingConstructorDuringGrowth) {
-    warm_up();
-    AllocStats stats;
-    Throwing::reset(-1);
-    {
-        using Pool = op::DefaultPool<Throwing, op::StdSync, CountingAllocator>;
-        Pool pool({.shards = 2, .initial_objects = 4, .grow_chunk = 6}, CountingAllocator(stats, 1));
-        std::vector<Throwing*> held;
-        for (int i = 0; i < 4; ++i) held.push_back(pool.acquire());
-        Throwing::throw_at = 4 + 3;  // third object of the next chunk
-        EXPECT_THROW(pool.acquire(), std::runtime_error);
-        EXPECT_EQ(Throwing::constructed, 6);
-        EXPECT_EQ(Throwing::destroyed, 2);
-        EXPECT_EQ(pool.capacity(), 4u);
-        EXPECT_EQ(stats.allocs, 4u);
-        EXPECT_EQ(stats.deallocs, 1u);  // the failed chunk only
+struct Tiny {
+    unsigned char byte = 0;
+};
 
-        Throwing::throw_at = -1;
-        held.push_back(pool.acquire());  // grows again
-        EXPECT_EQ(pool.capacity(), 10u);
-        for (Throwing* t : held) pool.release(t);
-    }
-    EXPECT_EQ(Throwing::constructed, 4 + 2 + 6);
-    EXPECT_EQ(Throwing::destroyed, Throwing::constructed);
-    EXPECT_EQ(stats.errors, 0u);
-    EXPECT_EQ(stats.deallocs, stats.allocs);
-    EXPECT_EQ(stats.live_count, 0u);
+// One growth that needs more 2^24-node entries than the directory has; the
+// size check happens before any allocation.
+void build_pool_beyond_index_space() {
+    op::DefaultPool<Tiny> pool({.shards = 1, .initial_objects = std::size_t{1} << 33});
 }
 
-// The allocator itself fails: nothing leaks, the pool stays usable.
-TEST(PoolAllocator, ThrowingAllocator) {
-    struct Budget {
-        AllocStats* stats;
-        int* left;
-        void* allocate(std::size_t bytes, std::size_t align) {
-            if ((*left)-- <= 0) throw std::bad_alloc();
-            return stats->allocate(bytes, align);
-        }
-        void deallocate(void* p, std::size_t bytes, std::size_t align) noexcept {
-            stats->deallocate(p, bytes, align);
-        }
-    };
-    using Pool = op::DefaultPool<Object, op::StdSync, Budget>;
-    for (int budget = 0; budget < 3; ++budget) {  // fail directory, shards, chunk
-        AllocStats stats;
-        int left = budget;
-        EXPECT_THROW(Pool({.shards = 2, .initial_objects = 4}, Budget{&stats, &left}),
-                     std::bad_alloc);
-        EXPECT_EQ(stats.errors, 0u);
-        EXPECT_EQ(stats.deallocs, stats.allocs);
-    }
-    AllocStats stats;
-    int left = 3;
-    {
-        Pool pool({.shards = 2, .initial_objects = 1, .grow_chunk = 1}, Budget{&stats, &left});
-        Object* a = pool.acquire();
-        EXPECT_THROW(pool.acquire(), std::bad_alloc);
-        left = 1;
-        Object* b = pool.acquire();
-        pool.release(a);
-        pool.release(b);
-    }
-    EXPECT_EQ(stats.errors, 0u);
-    EXPECT_EQ(stats.deallocs, stats.allocs);
-    EXPECT_EQ(stats.live_count, 0u);
+// Allocation failure is fatal: no exception escapes the pool.
+TEST(PoolAllocatorDeathTest, RefusedMemoryTerminates) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(build_pool_on_refusing_resource(), "");
+}
+
+// Running out of 32-bit node indices is detected and reported.
+TEST(PoolAllocatorDeathTest, IndexSpaceExhaustionTerminates) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(build_pool_beyond_index_space(), "node index space exhausted");
 }
 
 // ------------------------------------------------------------ over-alignment

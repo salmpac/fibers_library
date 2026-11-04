@@ -18,6 +18,7 @@
 // same allocator instance on destruction.
 
 #include <cstddef>
+#include <type_traits>
 #include <new>
 #include <utility>
 
@@ -30,7 +31,7 @@ namespace object_pool {
 
 template <class T, class Stack, SyncPolicy Sync = StdSync,
           PoolAllocator Alloc = DefaultAllocator>
-    requires std::default_initializable<T>
+    requires std::is_nothrow_default_constructible_v<T>
 class ShardedPool {
     using Arena = detail::NodeArena<T, Sync, Alloc>;
     using Hook = typename Arena::Hook;
@@ -41,17 +42,13 @@ public:
     using allocator_type = Alloc;
 
     // `alloc` is moved into the pool and used for all of its memory.
-    explicit ShardedPool(PoolOptions options = {}, Alloc alloc = Alloc())
+    // Fail fast: out of memory here terminates the process.
+    explicit ShardedPool(PoolOptions options = {}, Alloc alloc = Alloc()) noexcept
         : options_(detail::normalize(options)),
           arena_(std::move(alloc)),
           shared_(options_),
           shards_(options_, arena_.allocator()) {
-        try {
-            preallocate();
-        } catch (...) {
-            shards_.destroy(arena_.allocator());
-            throw;
-        }
+        preallocate();
     }
 
     ShardedPool(const ShardedPool&) = delete;
@@ -59,7 +56,8 @@ public:
 
     ~ShardedPool() { shards_.destroy(arena_.allocator()); }
 
-    T* acquire() {
+    // Grows the pool when every shard is empty; out of memory terminates.
+    T* acquire() noexcept {
         detail::PoolThreadState& thread = detail::pool_thread_state<Sync>();
         const std::size_t n = options_.shards;
         const std::size_t start = next_shard(thread) % n;
@@ -75,7 +73,7 @@ public:
         return grow_and_take(start, thread);
     }
 
-    void release(T* object) {
+    void release(T* object) noexcept {
         detail::PoolThreadState& thread = detail::pool_thread_state<Sync>();
         Hook* node = Arena::hook_of(object);
         shards_[next_shard(thread) % options_.shards].stack.push_chain(arena_, shared_, thread,
@@ -83,13 +81,13 @@ public:
     }
 
     // Total number of objects owned by the pool (in use + free).
-    std::size_t capacity() const { return arena_.capacity(); }
+    std::size_t capacity() const noexcept { return arena_.capacity(); }
 
     const Alloc& get_allocator() const noexcept { return arena_.allocator(); }
 
 private:
     struct alignas(kCacheLineSize) Shard {
-        explicit Shard(const PoolOptions& options) : stack(options) {}
+        explicit Shard(const PoolOptions& options) noexcept : stack(options) {}
         Stack stack;
     };
 
@@ -99,16 +97,13 @@ private:
     // pool constructor fails after the shards were built.
     class Shards {
     public:
-        Shards(const PoolOptions& options, Alloc& alloc) : count_(options.shards) {
+        static_assert(std::is_nothrow_constructible_v<Shard, const PoolOptions&>,
+                      "shard stacks must be nothrow constructible");
+
+        Shards(const PoolOptions& options, Alloc& alloc) noexcept : count_(options.shards) {
             data_ = static_cast<Shard*>(alloc.allocate(bytes(), alignof(Shard)));
-            std::size_t built = 0;
-            try {
-                for (; built < count_; ++built) {
-                    ::new (static_cast<void*>(data_ + built)) Shard(options);
-                }
-            } catch (...) {
-                destroy(alloc, built);
-                throw;
+            for (std::size_t i = 0; i < count_; ++i) {
+                ::new (static_cast<void*>(data_ + i)) Shard(options);
             }
         }
         Shards(const Shards&) = delete;

@@ -18,13 +18,14 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <type_traits>
 #include <cstdint>
 #include <mutex>
 #include <new>
-#include <stdexcept>
 #include <utility>
 
 #include "object_pool/pool_allocator.hpp"
+#include "thread_pool/fail_fast.hpp"
 #include "thread_pool/sync.hpp"
 
 namespace object_pool::detail {
@@ -53,7 +54,9 @@ struct NodeHook {
     NodeIndex self = kNullNode;  // own index, immutable after construction
 };
 
+// T must be nothrow default constructible (fail-fast library: no exceptions).
 template <class T, SyncPolicy Sync, PoolAllocator Alloc = DefaultAllocator>
+    requires std::is_nothrow_default_constructible_v<T>
 class NodeArena {
 public:
     using Hook = NodeHook<Sync>;
@@ -73,7 +76,7 @@ public:
     // run out before the 32-bit index space does.
     static constexpr std::size_t kGrowDivisor = 16;
 
-    explicit NodeArena(Alloc alloc = Alloc()) : alloc_(std::move(alloc)) {
+    explicit NodeArena(Alloc alloc = Alloc()) noexcept : alloc_(std::move(alloc)) {
         void* memory = alloc_.allocate(sizeof(Directory), alignof(Directory));
         directory_ = ::new (memory) Directory{};
     }
@@ -110,32 +113,20 @@ public:
 
     // Allocates max(min_count, capacity / kGrowDivisor) nodes (at least 1)
     // and returns them as one chain.
-    Chain grow(std::size_t min_count) {
+    Chain grow(std::size_t min_count) noexcept {
         std::lock_guard guard(lock_);
         const std::size_t count =
             std::max<std::size_t>({min_count, capacity_ / kGrowDivisor, 1});
         const std::size_t entries = (count + kEntryNodes - 1) / kEntryNodes;
         if (entries > kEntries - next_entry_) {
-            throw std::length_error("object_pool: node index space exhausted");
+            thread_pool::fail_fast("object_pool: node index space exhausted");
         }
 
         auto* memory = static_cast<std::byte*>(alloc_.allocate(count * kStride, kAlign));
-        std::size_t constructed = 0;
-        try {
-            for (; constructed < count; ++constructed) {
-                std::byte* node = memory + constructed * kStride;
-                Hook* h = ::new (static_cast<void*>(node)) Hook{};
-                try {
-                    ::new (static_cast<void*>(node + kValueOffset)) T();
-                } catch (...) {
-                    h->~Hook();
-                    throw;
-                }
-            }
-        } catch (...) {
-            destroy_nodes(memory, constructed);
-            alloc_.deallocate(memory, count * kStride, kAlign);
-            throw;
+        for (std::size_t i = 0; i < count; ++i) {
+            std::byte* node = memory + i * kStride;
+            ::new (static_cast<void*>(node)) Hook{};
+            ::new (static_cast<void*>(node + kValueOffset)) T();  // nothrow (required)
         }
         // Cannot overflow: every block takes at least one of the
         // kEntries - 1 usable entries, checked above.

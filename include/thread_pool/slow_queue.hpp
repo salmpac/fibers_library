@@ -14,14 +14,15 @@ namespace thread_pool {
 template <class T, SyncPolicy Sync = StdSync>
 class SlowQueue {
 public:
-    void push(T&& value) {
+    // Out of memory (deque growth) terminates: fail fast.
+    void push(T&& value) noexcept {
         std::lock_guard guard(mutex_);
         queue_.push_back(std::move(value));
         size_.store(queue_.size(), std::memory_order_relaxed);
     }
 
     // Moves all of items[0..count) under a single lock.
-    void push_batch(T* items, std::size_t count) {
+    void push_batch(T* items, std::size_t count) noexcept {
         if (count == 0) {
             return;
         }
@@ -32,7 +33,7 @@ public:
         size_.store(queue_.size(), std::memory_order_relaxed);
     }
 
-    std::size_t try_pop_batch(T* out, std::size_t max) {
+    std::size_t try_pop_batch(T* out, std::size_t max) noexcept {
         if (!maybe_nonempty()) {
             return 0;
         }
@@ -48,7 +49,7 @@ public:
 
     // Like try_pop_batch, but never waits for the mutex: for thieves, so they
     // cannot form a convoy that blocks the producer or the owner.
-    std::size_t try_steal_batch(T* out, std::size_t max) {
+    std::size_t try_steal_batch(T* out, std::size_t max) noexcept {
         if (!maybe_nonempty()) {
             return 0;
         }

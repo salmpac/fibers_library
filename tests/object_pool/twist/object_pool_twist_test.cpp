@@ -118,8 +118,12 @@ void wait_until(Pred&& done) {
 }
 
 struct Object {
-    twist::ed::std::atomic<int> owner{0};  // thread holding it, 0 = free
-    twist::assist::Shared<int> payload{0};
+    // Twist's atomic/Shared constructors are not declared noexcept; the pool
+    // requires a nothrow T(), so promise it here (a throw would terminate).
+    Object() noexcept : owner(0), payload(0) {}
+
+    twist::ed::std::atomic<int> owner;  // thread holding it, 0 = free
+    twist::assist::Shared<int> payload;
 };
 
 void take(Object* o, int me) {

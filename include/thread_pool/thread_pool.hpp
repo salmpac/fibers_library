@@ -98,19 +98,16 @@ template <class Sync>
 template <SyncPolicy Sync = StdSync, MainQueue Q = LockFreeSPMCQueue<Task, Sync>>
 class ThreadPool {
 public:
-    explicit ThreadPool(ThreadPoolOptions options = {}) : options_(normalize(options)) {
+    // Fail fast: if a worker thread or memory cannot be had, the process
+    // terminates (std::system_error / std::bad_alloc hit noexcept).
+    explicit ThreadPool(ThreadPoolOptions options = {}) noexcept : options_(normalize(options)) {
         workers_.reserve(options_.num_workers);
         for (std::size_t i = 0; i < options_.num_workers; ++i) {
             workers_.push_back(std::make_unique<Worker>(options_));
         }
         threads_.reserve(options_.num_workers);
-        try {
-            for (std::size_t i = 0; i < options_.num_workers; ++i) {
-                threads_.emplace_back([this, i] { worker_loop(i); });
-            }
-        } catch (...) {
-            stop();
-            throw;
+        for (std::size_t i = 0; i < options_.num_workers; ++i) {
+            threads_.emplace_back([this, i] { worker_loop(i); });
         }
     }
 
@@ -123,7 +120,7 @@ public:
     // From a worker of this pool: into its own main_box.
     // From any other thread: round-robin into some worker's mail_box.
     // Falls back to the target worker's overflow_box when queues are full.
-    void submit(Task task) {
+    void submit(Task task) noexcept {
         if (!task) {
             return;
         }
@@ -148,7 +145,7 @@ public:
     // From any other thread: chunks of batch_size go round-robin to the
     // workers' mail_boxes, one shard lock and one publication per chunk.
     // Whatever does not fit goes to the target's overflow_box under one lock.
-    void submit_batch(Task* tasks, std::size_t count) {
+    void submit_batch(Task* tasks, std::size_t count) noexcept {
         assert(std::all_of(tasks, tasks + count, [](const Task& t) { return static_cast<bool>(t); }));
         if (count == 0) {
             return;
@@ -169,12 +166,12 @@ public:
         }
     }
 
-    void submit_batch(std::span<Task> tasks) { submit_batch(tasks.data(), tasks.size()); }
+    void submit_batch(std::span<Task> tasks) noexcept { submit_batch(tasks.data(), tasks.size()); }
 
     // Requests stop and joins workers. Each worker exits instead of running its
     // next task. Pending tasks stay queued and are dropped on destruction.
     // Idempotent. Must not be called from a worker of this pool.
-    void stop() {
+    void stop() noexcept {
         assert(!in_worker_thread() && "ThreadPool::stop() called from its own worker");
         stop_requested_.store(true, std::memory_order_release);
         for (auto& thread : threads_) {
