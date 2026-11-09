@@ -291,31 +291,41 @@ TEST(Fiber, ManyFibersManyWorkers) {
     EXPECT_LE(scheduler.stacks().mapped_stacks(), scheduler.stacks().max_stacks());
 }
 
-// Woken by an external thread each time: external submits go round-robin
-// over the workers, so the fiber runs on several threads.
+// Woken by an external thread each time, after a pause in which the idle
+// workers park: an external submit then goes to the next worker of the
+// submitting thread's round robin, so the fiber hops between threads. (A
+// worker that is still spinning would be preferred, hence the pause and the
+// loop until a second thread is seen.) Also a regression test for
+// ThreadPool::pick_target: with every worker parked and at most kTargetScan
+// workers, its scan used to advance the round robin by exactly the worker
+// count, so every external submit went to the same worker.
 TEST(Fiber, MigratesBetweenThreads) {
-    constexpr int kHops = 64;
+    constexpr int kMaxHops = 500;
     Latch done(1);
     std::atomic<Fiber*> parked{nullptr};
+    std::atomic<bool> finished{false};
     std::set<std::thread::id> seen;  // only the fiber touches it
     std::atomic<std::size_t> distinct{0};
     Scheduler scheduler(options(4));
     fiber::go(scheduler, [&]() noexcept {
-        for (int i = 0; i < kHops; ++i) {
-            seen.insert(current_thread_id());
+        seen.insert(current_thread_id());
+        for (int i = 0; i < kMaxHops && seen.size() < 2; ++i) {
             Fiber* self = this_fiber::self().get();
             parked.store(self, std::memory_order_release);
             this_fiber::park();
+            seen.insert(current_thread_id());
         }
-        seen.insert(current_thread_id());
         distinct.store(seen.size());
+        finished.store(true, std::memory_order_release);
         done.count_down();
     });
-    for (int i = 0; i < kHops; ++i) {
-        Fiber* f = nullptr;
-        while ((f = parked.exchange(nullptr, std::memory_order_acquire)) == nullptr) {
+    while (!finished.load(std::memory_order_acquire)) {
+        Fiber* f = parked.exchange(nullptr, std::memory_order_acquire);
+        if (f == nullptr) {
             std::this_thread::yield();
+            continue;
         }
+        std::this_thread::sleep_for(2ms);  // let the workers park
         f->wake();
     }
     ASSERT_TRUE(done.wait());
