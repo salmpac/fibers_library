@@ -114,23 +114,30 @@ struct Server {
 
 bool server_http10 = false;
 
-// --http10: read up to the end of the request head, answer, close_notify.
+// --http10: read up to the end of the request head (an empty line, CRLF or
+// bare LF like s_server accepts; any length), answer, close_notify.
 void serve_http10(tls::TlsStream& s) {
-    char buf[8192];
-    std::size_t have = 0;
-    while (have < sizeof buf) {
-        const net::IoResult r = s.read_some(buf + have, sizeof buf - have);
+    char buf[4096];
+    bool line_empty = false;  // nothing but '\r' since the last '\n'
+    for (;;) {
+        const net::IoResult r = s.read_some(buf, sizeof buf);
         if (!r || r.bytes == 0) {
             return;
         }
-        have += r.bytes;
-        if (std::string_view(buf, have).find("\r\n\r\n") != std::string_view::npos) {
-            static constexpr char kReply[] =
-                "HTTP/1.0 200 ok\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nok\n";
-            if (s.write_all(kReply, sizeof kReply - 1)) {
-                static_cast<void>(s.shutdown());
+        for (std::size_t i = 0; i < r.bytes; ++i) {
+            if (buf[i] == '\n') {
+                if (line_empty) {
+                    static constexpr char kReply[] =
+                        "HTTP/1.0 200 ok\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nok\n";
+                    if (s.write_all(kReply, sizeof kReply - 1)) {
+                        static_cast<void>(s.shutdown());
+                    }
+                    return;
+                }
+                line_empty = true;
+            } else if (buf[i] != '\r') {
+                line_empty = false;
             }
-            return;
         }
     }
 }

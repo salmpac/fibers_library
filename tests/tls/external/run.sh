@@ -21,7 +21,13 @@
 # ("DEFAULT:@SECLEVEL=0": the TLS 1.2 scripts use SHA-1 signatures and
 # static RSA). A script that fails the same way on both is OpenSSL's policy
 # or the script's expectations; a different result on tls_echo points at our
-# BIO pump. A run that reaches its timeout is a hang.
+# BIO pump. A run that reaches its timeout is a hang. Known noise: for
+# oversized / padded handshake messages (test-tls13-keyupdate "large
+# KeyUpdate message", test-tls13-finished "padding ...") OpenSSL's alert
+# description (decode_error vs illegal_parameter) depends on how the bytes
+# were split across reads, and it flips between runs on BOTH servers; and
+# s_server -www sometimes misses "app data split, conversation with
+# KeyUpdate msg" (it answers a KeyUpdate only with its next write).
 #
 # testssl.sh scans a second tls_echo with the library's default policy.
 #
@@ -75,6 +81,8 @@ sleep 1
 
 status=0
 
+# (test-tls13-lengths.py is left out: it needs more than 300 s against
+# either server.)
 scripts="
 test-tls13-conversation.py
 test-conversation.py
@@ -104,10 +112,20 @@ test-empty-extensions.py
 test-large-hello.py
 test-client-hello-max-size.py
 test-ccs.py
+test-renegotiation-disabled.py
+test-hello-request-by-client.py
+test-interleaved-application-data-in-renegotiation.py
+test-aes-gcm-nonces.py
+test-ecdhe-rsa-key-exchange-with-bad-messages.py
+test-tls13-record-layer-limits.py
+test-tls13-zero-content-type.py
+test-tls13-multiple-ccs-messages.py
+test-tls13-session-resumption.py
 test-tls13-count-tickets.py
 "
 if [ -n "$quick" ]; then
-    scripts="test-tls13-conversation.py test-tls13-keyupdate.py test-truncating-of-client-hello.py"
+    # "quick": a few scripts (or $TLSFUZZ_SCRIPTS), no testssl.sh.
+    scripts=${TLSFUZZ_SCRIPTS:-"test-tls13-conversation.py test-tls13-keyupdate.py test-truncating-of-client-hello.py"}
 fi
 
 printf '%-48s %-14s %-14s\n' "tlsfuzzer script" tls_echo "s_server -www" > "$out/summary.txt"
