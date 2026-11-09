@@ -3,3 +3,7 @@ target_link_libraries(fiber_tests PRIVATE fibers::fiber fibers::sched fibers::wa
 target_compile_options(fiber_tests PRIVATE -Wall -Wextra -Wpedantic)
 
 gtest_discover_tests(fiber_tests DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 300)
+
+if(FIBERS_TWIST)
+    add_subdirectory(twist)
+endif()
