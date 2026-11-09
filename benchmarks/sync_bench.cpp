@@ -9,6 +9,16 @@
 //                             WaitGroup's own cost.
 //   EventBroadcast/N/W        N fibers wait on one Event, the root sets it;
 //                             items/s = woken fibers.
+//   OneshotRequestResponse/P/W
+//   FutureRequestResponse/P/W P client / server fiber pairs, each running
+//                             1000 request / response round trips: the
+//                             client sends {i, reply promise} through the
+//                             server's current request channel, the server
+//                             answers {i + 1, promise of its next request
+//                             channel}. Oneshot: both channels on the
+//                             fibers' stacks; Future: pooled pairs from the
+//                             scheduler's TaskMemoryPool. items/s = round
+//                             trips (2 hand-offs, 2 parks / wakes each).
 //
 // Run pinned to CPUs 0-9: `taskset -c 0-9 sync_bench`. Counters cpu_min /
 // cpu_max are sched_getcpu() of the fibers (sampled), cpu_main that of the
@@ -21,9 +31,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <utility>
 
 #include "fibers/fiber/event.hpp"
 #include "fibers/fiber/fiber.hpp"
+#include "fibers/fiber/future.hpp"
+#include "fibers/fiber/oneshot.hpp"
 #include "fibers/fiber/wait_group.hpp"
 #include "fibers/sched/scheduler.hpp"
 
@@ -199,5 +213,135 @@ void BM_EventBroadcast(benchmark::State& state) {
     cpus.report(state);
 }
 BENCHMARK(BM_EventBroadcast)->Args({1000, 1})->Args({1000, 4})->Args({1000, 8})->UseRealTime();
+
+// ---- request / response ------------------------------------------------------
+
+constexpr int kRoundTrips = 1000;
+
+// The same message types for both variants: a fiber::Promise is the same
+// type whether its state is in a Oneshot or in a pooled block.
+struct Request;
+struct Reply {
+    int value = 0;
+    fiber::Promise<Request> next;  // the server's next request channel
+};
+struct Request {
+    int value = 0;
+    fiber::Promise<Reply> reply;
+};
+
+// Client of one pair (spawns its server). Oneshot: every channel lives on
+// the stack of the fiber that receives on it.
+void oneshot_pair(Latch& done, CpuRange& cpus) {
+    fiber::Oneshot<fiber::Promise<Request>> hello;
+    fiber::go([&done, p = hello.promise()]() mutable noexcept {  // server
+        std::optional<fiber::Oneshot<Request>> slots[2];
+        slots[0].emplace();
+        p.set(slots[0]->promise());
+        for (int i = 0;; ++i) {
+            fibers::wait::Result<Request> rq = slots[i % 2]->get();
+            if (!rq) {
+                break;  // the client has gone
+            }
+            fiber::Oneshot<Request>& next = slots[(i + 1) % 2].emplace();
+            rq->reply.set(Reply{rq->value + 1, next.promise()});
+        }
+        done.count_down();
+    });
+    fiber::Promise<Request> to_server = *hello.get();
+    int bad = 0;
+    for (int i = 0; i < kRoundTrips; ++i) {
+        fiber::Oneshot<Reply> reply;
+        to_server.set(Request{i, reply.promise()});
+        fibers::wait::Result<Reply> r = reply.get();
+        bad += r->value != i + 1 ? 1 : 0;
+        to_server = std::move(r->next);
+        if (i % 256 == 0) {
+            cpus.sample();
+        }
+    }
+    benchmark::DoNotOptimize(bad);
+}
+
+// The same with pooled Promise / Future pairs (scheduler.task_memory()).
+void future_pair(Scheduler& scheduler, Latch& done, CpuRange& cpus) {
+    auto [hello_promise, hello] = fiber::make_promise_future<fiber::Promise<Request>>(scheduler);
+    fiber::go([&scheduler, &done, p = std::move(hello_promise)]() mutable noexcept {  // server
+        auto [first_promise, first] = fiber::make_promise_future<Request>(scheduler);
+        p.set(std::move(first_promise));
+        fiber::Future<Request> current = std::move(first);
+        for (;;) {
+            fibers::wait::Result<Request> rq = current.get();
+            if (!rq) {
+                break;
+            }
+            auto [next_promise, next] = fiber::make_promise_future<Request>(scheduler);
+            rq->reply.set(Reply{rq->value + 1, std::move(next_promise)});
+            current = std::move(next);
+        }
+        done.count_down();
+    });
+    fiber::Promise<Request> to_server = *hello.get();
+    int bad = 0;
+    for (int i = 0; i < kRoundTrips; ++i) {
+        auto [reply_promise, reply] = fiber::make_promise_future<Reply>(scheduler);
+        to_server.set(Request{i, std::move(reply_promise)});
+        fibers::wait::Result<Reply> r = reply.get();
+        bad += r->value != i + 1 ? 1 : 0;
+        to_server = std::move(r->next);
+        if (i % 256 == 0) {
+            cpus.sample();
+        }
+    }
+    benchmark::DoNotOptimize(bad);
+}
+
+template <bool kPooled>
+void request_response(benchmark::State& state) {
+    const auto pairs = static_cast<int>(state.range(0));
+    Scheduler scheduler(options(static_cast<std::size_t>(state.range(1))));
+    Latch done;
+    CpuRange cpus;
+    for (auto _ : state) {
+        done.reset(2 * pairs);  // clients and servers
+        for (int p = 0; p < pairs; ++p) {
+            fiber::go(scheduler, [&]() noexcept {
+                if constexpr (kPooled) {
+                    future_pair(scheduler, done, cpus);
+                } else {
+                    oneshot_pair(done, cpus);
+                }
+                done.count_down();
+            });
+        }
+        done.wait();
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * pairs * kRoundTrips);
+    cpus.report(state);
+}
+
+void BM_OneshotRequestResponse(benchmark::State& state) { request_response<false>(state); }
+void BM_FutureRequestResponse(benchmark::State& state) { request_response<true>(state); }
+
+BENCHMARK(BM_OneshotRequestResponse)
+    ->Args({1, 1})
+    ->Args({1, 2})
+    ->Args({1, 4})
+    ->Args({1, 8})
+    ->Args({64, 1})
+    ->Args({64, 2})
+    ->Args({64, 4})
+    ->Args({64, 8})
+    ->UseRealTime();
+BENCHMARK(BM_FutureRequestResponse)
+    ->Args({1, 1})
+    ->Args({1, 2})
+    ->Args({1, 4})
+    ->Args({1, 8})
+    ->Args({64, 1})
+    ->Args({64, 2})
+    ->Args({64, 4})
+    ->Args({64, 8})
+    ->UseRealTime();
 
 }  // namespace
