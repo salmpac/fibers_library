@@ -132,6 +132,16 @@
 // edge and hangs a reader. The relaxed ones (READY consumption, observing
 // CLOSED, NOTIFYING) carry no data.
 //
+// Socket errors. EPOLLERR (with or without EPOLLHUP) notifies BOTH words, so
+// a parked reader and a parked writer both wake and retry. Before that the
+// callback reads SO_ERROR (which clears it in the kernel) and keeps it in
+// error_ (sticky until the next open()). The retried syscalls then report
+// end of stream / EPIPE (the kernel's view once SO_ERROR is gone); the
+// Stream maps those to error_after_shutdown(), so both get e.g. ECONNRESET
+// (after any data still buffered has been read). An operation that is not
+// parked and races with the callback may read SO_ERROR itself first; the
+// first error recorded wins either way.
+//
 // The scheduler's pollers must be running while descriptors are closed
 // (the unwatch is a posted timer). If the poller is destroyed first, the
 // timer is delivered with kCancelled on the destroying thread while the
@@ -143,6 +153,7 @@
 // callback on the owning poller fits without changing the states above.
 
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 
 #include <cerrno>
@@ -232,6 +243,7 @@ public:
         closer_ = nullptr;
         rd_.store(kEmpty, std::memory_order_relaxed);
         wr_.store(kEmpty, std::memory_order_relaxed);
+        error_.store(0, std::memory_order_relaxed);
         epollable_ = poller::Epollable{fd, this, &on_events};
         // Events can arrive from here on (the callback only touches rd_ /
         // wr_, initialised above; epoll_ctl orders them before the report).
@@ -383,6 +395,28 @@ public:
         return 0;
     }
 
+    // ---- socket errors (EPOLLERR) ----------------------------------------------
+
+    // The pending socket error (SO_ERROR) the poller took when it reported
+    // EPOLLERR, 0 if none. Sticky until the next open(). See "Socket errors"
+    // in the top comment. Any thread.
+    int error() const noexcept { return error_.load(std::memory_order_acquire); }
+
+    // After a syscall reported end of stream (0) or EPIPE on a socket: the
+    // error that really ended it, if any (the poller's sticky one, else a
+    // pending SO_ERROR that nobody has taken yet), 0 if it was an orderly
+    // shutdown. Between enter() and leave().
+    int error_after_shutdown() noexcept {
+        if (const int e = error(); e != 0) {
+            return e;
+        }
+        if (const int e = take_so_error(fd_); e != 0) {
+            record_error(e);
+            return error();
+        }
+        return error();  // the poller may have taken it meanwhile
+    }
+
     // Racy snapshot: false between close() and the next open().
     bool is_open_approx() const noexcept {
         return (refs_.load(std::memory_order_relaxed) & kClosedBit) == 0;
@@ -474,9 +508,36 @@ private:
         }
     }
 
+    // SO_ERROR (reading it clears it in the kernel); 0 if none or not a
+    // socket.
+    static int take_so_error(int fd) noexcept {
+        int so_error = 0;
+        socklen_t len = sizeof so_error;
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) {
+            return 0;
+        }
+        return so_error;
+    }
+
+    // First error wins (a later SO_ERROR is a consequence of the first).
+    void record_error(int e) noexcept {
+        int expected = 0;
+        // release / acquire with error(): the value is all that is handed
+        // over; the waiters it concerns are woken after it (fiber wake).
+        error_.compare_exchange_strong(expected, e, std::memory_order_release, std::memory_order_relaxed);
+    }
+
     // Epollable callback (poller thread).
     static void on_events(void* memo, std::uint32_t events, poller::TaskBatch& out) noexcept {
         auto* self = static_cast<BasicPollDesc*>(memo);
+        if ((events & EPOLLERR) != 0) {
+            // Before the wakes below: both woken waiters (and later
+            // operations) find the error that ended the connection, not the
+            // EOF / EPIPE the kernel reports once SO_ERROR has been read.
+            if (const int e = take_so_error(self->fd_); e != 0) {
+                self->record_error(e);
+            }
+        }
         if ((events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLPRI)) != 0) {
             notify(self->rd_, out);
         }
@@ -565,6 +626,7 @@ private:
 
     Word rd_{kEmpty};
     Word wr_{kEmpty};
+    typename SyncPolicy::template Atomic<int> error_{0};
     typename SyncPolicy::template Atomic<std::uint32_t> refs_{kClosedBit};
     int fd_ = -1;
     Sched* scheduler_ = nullptr;

@@ -29,7 +29,12 @@
 //   * at most one fiber waits per direction (one reader, one writer at a
 //     time; a second parked reader fails fast);
 //   * errors are returned (errno values), never thrown. ECANCELED: the
-//     socket was closed while the operation waited.
+//     socket was closed while the operation waited. A connection that the
+//     peer reset, or that keepalive / TCP_USER_TIMEOUT gave up on, fails
+//     both directions with that error (ECONNRESET, ETIMEDOUT, ...): EPOLLERR
+//     wakes the parked reader and writer, and the end of stream / EPIPE the
+//     kernel then reports is mapped back to the error (see "Socket errors"
+//     in poll_desc.hpp).
 //
 // Objects are neither copyable nor movable (the poller holds their address
 // while they are open). A closed object can be opened again (accept into it,
@@ -47,6 +52,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -146,6 +152,44 @@ inline int set_nonblocking(int fd) noexcept {
 // -errno on failure (PollDesc::io convention), else the result.
 inline ssize_t sys(ssize_t r) noexcept { return r >= 0 ? r : -static_cast<ssize_t>(errno); }
 
+template <class Desc>
+int set_option(Desc& desc, int level, int name, const void* value, socklen_t size) noexcept {
+    typename Desc::Guard guard(desc);
+    if (!guard) {
+        return EBADF;
+    }
+    return ::setsockopt(desc.fd(), level, name, value, size) == 0 ? 0 : errno;
+}
+
+template <class Desc>
+int set_nodelay(Desc& desc, bool on) noexcept {
+    const int value = on ? 1 : 0;
+    return set_option(desc, IPPROTO_TCP, TCP_NODELAY, &value, sizeof value);
+}
+
+template <class Desc>
+int set_keepalive(Desc& desc, std::chrono::seconds idle, std::chrono::seconds interval, int count) noexcept {
+    const int on = idle.count() > 0 ? 1 : 0;
+    if (const int e = set_option(desc, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on); e != 0 || on == 0) {
+        return e;
+    }
+    const int idle_s = static_cast<int>(idle.count());
+    const int interval_s = static_cast<int>(interval.count());
+    if (const int e = set_option(desc, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof idle_s); e != 0) {
+        return e;
+    }
+    if (const int e = set_option(desc, IPPROTO_TCP, TCP_KEEPINTVL, &interval_s, sizeof interval_s); e != 0) {
+        return e;
+    }
+    return set_option(desc, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof count);
+}
+
+template <class Desc>
+int set_user_timeout(Desc& desc, std::chrono::milliseconds timeout) noexcept {
+    const unsigned value = static_cast<unsigned>(timeout.count());
+    return set_option(desc, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, sizeof value);
+}
+
 }  // namespace detail
 
 template <NetScheduler Sched = sched::Scheduler>
@@ -192,7 +236,12 @@ public:
         int error = 0;
         {
             typename PollDesc::Guard guard(desc_);  // cannot fail: nobody else has it
-            const ssize_t r = desc_.io(Direction::kWrite, [fd]() noexcept -> ssize_t {
+            const ssize_t r = desc_.io(Direction::kWrite, [this, fd]() noexcept -> ssize_t {
+                // A failed connect is reported with EPOLLERR, and the poller
+                // takes SO_ERROR into the descriptor's sticky error then.
+                if (const int e = desc_.error(); e != 0) {
+                    return -static_cast<ssize_t>(e);
+                }
                 int so_error = 0;
                 socklen_t len = sizeof so_error;
                 if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) {
@@ -229,6 +278,11 @@ public:
         const ssize_t r = desc_.io(Direction::kRead, [fd, buffer, size]() noexcept {
             return detail::sys(::read(fd, buffer, size));
         });
+        if (r == 0 && size != 0) {
+            // End of stream, or the connection was reset / timed out (the
+            // poller took SO_ERROR on EPOLLERR): report the error then.
+            return IoResult{0, desc_.error_after_shutdown()};
+        }
         return to_result(r);
     }
 
@@ -261,7 +315,7 @@ public:
         const ssize_t r = desc_.io(Direction::kWrite, [fd, buffer, size]() noexcept {
             return detail::sys(::send(fd, buffer, size, MSG_NOSIGNAL));
         });
-        return to_result(r);
+        return to_result(map_epipe(r));
     }
 
     // Writes all `size` bytes (several write-readiness rounds if needed).
@@ -274,9 +328,9 @@ public:
         const auto* p = static_cast<const char*>(buffer);
         std::size_t done = 0;
         while (done < size) {
-            const ssize_t r = desc_.io(Direction::kWrite, [fd, p, done, size]() noexcept {
+            const ssize_t r = map_epipe(desc_.io(Direction::kWrite, [fd, p, done, size]() noexcept {
                 return detail::sys(::send(fd, p + done, size - done, MSG_NOSIGNAL));
-            });
+            }));
             if (r < 0) {
                 return IoResult{done, static_cast<int>(-r)};
             }
@@ -295,19 +349,27 @@ public:
         return ::shutdown(desc_.fd(), how) == 0 ? 0 : errno;
     }
 
-    // TCP_NODELAY. 0 or errno.
-    int set_nodelay(bool on = true) noexcept {
-        const int value = on ? 1 : 0;
-        return set_option(IPPROTO_TCP, TCP_NODELAY, &value, sizeof value);
+    // ---- TCP options (0 or errno) ------------------------------------------
+
+    // TCP_NODELAY: send small segments at once (no Nagle).
+    int set_nodelay(bool on = true) noexcept { return detail::set_nodelay(desc_, on); }
+
+    // TCP keepalive: probe an idle connection after `idle`, every
+    // `interval`, give up after `count` unanswered probes (then pending and
+    // later operations fail with ETIMEDOUT). idle == 0 turns it off.
+    int set_keepalive(std::chrono::seconds idle, std::chrono::seconds interval, int count) noexcept {
+        return detail::set_keepalive(desc_, idle, interval, count);
     }
 
-    // setsockopt on the open socket. 0 or errno.
+    // TCP_USER_TIMEOUT: fail the connection (ETIMEDOUT) when sent data
+    // stays unacknowledged for this long; 0 = the system default.
+    int set_user_timeout(std::chrono::milliseconds timeout) noexcept {
+        return detail::set_user_timeout(desc_, timeout);
+    }
+
+    // setsockopt on the open socket.
     int set_option(int level, int name, const void* value, socklen_t size) noexcept {
-        typename PollDesc::Guard guard(desc_);
-        if (!guard) {
-            return EBADF;
-        }
-        return ::setsockopt(desc_.fd(), level, name, value, size) == 0 ? 0 : errno;
+        return detail::set_option(desc_, level, name, value, size);
     }
 
     // See the top comment and BasicPollDesc::close(). 0, or EBADF if not
@@ -330,6 +392,16 @@ public:
 private:
     template <NetScheduler>
     friend class BasicListener;
+
+    // EPIPE after a reset / timeout: the error that ended the connection.
+    ssize_t map_epipe(ssize_t r) noexcept {
+        if (r == -EPIPE) {
+            if (const int e = desc_.error_after_shutdown(); e != 0) {
+                return -static_cast<ssize_t>(e);
+            }
+        }
+        return r;
+    }
 
     static IoResult to_result(ssize_t r) noexcept {
         return r < 0 ? IoResult{0, static_cast<int>(-r)} : IoResult{static_cast<std::size_t>(r), 0};
@@ -417,6 +489,26 @@ public:
             return error;
         }
         return 0;
+    }
+
+    // ---- TCP options of accepted connections (0 or errno) ------------------
+    //
+    // Set on the listening socket; Linux copies them into every connection
+    // accepted afterwards (sk_clone: SO_KEEPALIVE and the keepalive timing,
+    // TCP_NODELAY, TCP_USER_TIMEOUT are all inherited; net_test checks it),
+    // so accept() needs no extra syscalls. Same meaning as on Stream.
+    int set_nodelay(bool on = true) noexcept { return detail::set_nodelay(desc_, on); }
+
+    int set_keepalive(std::chrono::seconds idle, std::chrono::seconds interval, int count) noexcept {
+        return detail::set_keepalive(desc_, idle, interval, count);
+    }
+
+    int set_user_timeout(std::chrono::milliseconds timeout) noexcept {
+        return detail::set_user_timeout(desc_, timeout);
+    }
+
+    int set_option(int level, int name, const void* value, socklen_t size) noexcept {
+        return detail::set_option(desc_, level, name, value, size);
     }
 
     // The bound address (e.g. the port chosen for port 0). Any thread, while

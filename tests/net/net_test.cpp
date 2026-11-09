@@ -588,6 +588,121 @@ TEST(Net, StreamReuse) {
     }
 }
 
+int get_int_option(int fd, int level, int name) {
+    int value = -1;
+    socklen_t len = sizeof value;
+    return ::getsockopt(fd, level, name, &value, &len) == 0 ? value : -1;
+}
+
+// Options set on the listener reach accepted connections (Linux inherits
+// them), and the Stream setters work on a connected socket.
+TEST(Net, TcpOptionsAndInheritance) {
+    Latch done(2);
+    std::atomic<int> errors{0};
+    Scheduler scheduler(options(2));
+    Listener listener;
+    ASSERT_EQ(listener.listen(scheduler, Endpoint::loopback_v4(0)), 0);
+    ASSERT_EQ(listener.set_nodelay(), 0);
+    ASSERT_EQ(listener.set_keepalive(std::chrono::seconds(30), std::chrono::seconds(5), 4), 0);
+    ASSERT_EQ(listener.set_user_timeout(std::chrono::milliseconds(7000)), 0);
+    const Endpoint endpoint = listener.local_endpoint();
+    Stream server;
+    Stream client;
+    fiber::go(scheduler, [&]() noexcept {
+        if (listener.accept(server) != 0) {
+            errors.fetch_add(1);
+        }
+        done.count_down();
+    });
+    fiber::go(scheduler, [&]() noexcept {
+        if (client.connect(scheduler, endpoint) != 0) {
+            errors.fetch_add(1);
+        }
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    ASSERT_EQ(errors.load(), 0);
+    const int fd = server.native_handle();
+    EXPECT_EQ(get_int_option(fd, IPPROTO_TCP, TCP_NODELAY), 1);
+    EXPECT_EQ(get_int_option(fd, SOL_SOCKET, SO_KEEPALIVE), 1);
+    EXPECT_EQ(get_int_option(fd, IPPROTO_TCP, TCP_KEEPIDLE), 30);
+    EXPECT_EQ(get_int_option(fd, IPPROTO_TCP, TCP_KEEPINTVL), 5);
+    EXPECT_EQ(get_int_option(fd, IPPROTO_TCP, TCP_KEEPCNT), 4);
+    EXPECT_EQ(get_int_option(fd, IPPROTO_TCP, TCP_USER_TIMEOUT), 7000);
+
+    const int cfd = client.native_handle();
+    EXPECT_EQ(get_int_option(cfd, SOL_SOCKET, SO_KEEPALIVE), 0);
+    EXPECT_EQ(client.set_keepalive(std::chrono::seconds(11), std::chrono::seconds(3), 2), 0);
+    EXPECT_EQ(client.set_user_timeout(std::chrono::milliseconds(1500)), 0);
+    EXPECT_EQ(client.set_nodelay(), 0);
+    EXPECT_EQ(get_int_option(cfd, SOL_SOCKET, SO_KEEPALIVE), 1);
+    EXPECT_EQ(get_int_option(cfd, IPPROTO_TCP, TCP_KEEPIDLE), 11);
+    EXPECT_EQ(get_int_option(cfd, IPPROTO_TCP, TCP_KEEPINTVL), 3);
+    EXPECT_EQ(get_int_option(cfd, IPPROTO_TCP, TCP_KEEPCNT), 2);
+    EXPECT_EQ(get_int_option(cfd, IPPROTO_TCP, TCP_USER_TIMEOUT), 1500);
+    EXPECT_EQ(get_int_option(cfd, IPPROTO_TCP, TCP_NODELAY), 1);
+    EXPECT_EQ(client.set_keepalive(std::chrono::seconds(0), std::chrono::seconds(0), 0), 0);
+    EXPECT_EQ(get_int_option(cfd, SOL_SOCKET, SO_KEEPALIVE), 0);
+    EXPECT_EQ(client.close(), 0);
+    EXPECT_EQ(server.close(), 0);
+    EXPECT_EQ(listener.close(), 0);
+    EXPECT_EQ(client.set_nodelay(), EBADF);
+}
+
+// The peer resets the connection (close with SO_LINGER 0) while one fiber
+// is parked in read_some and another in write_all (full send buffer): both
+// wake with ECONNRESET (EPOLLERR notifies both directions; the poller keeps
+// SO_ERROR), and so do later operations.
+TEST(Net, PeerResetWakesReaderAndWriter) {
+    Latch connected(2);
+    Latch done(2);
+    std::atomic<int> errors{0};
+    std::atomic<int> read_error{-1};
+    std::atomic<int> write_error{-1};
+    Scheduler scheduler(options(3));
+    Listener listener;
+    ASSERT_EQ(listener.listen(scheduler, Endpoint::loopback_v4(0)), 0);
+    const Endpoint endpoint = listener.local_endpoint();
+    Stream server;
+    Stream client;
+    fiber::go(scheduler, [&]() noexcept {
+        if (listener.accept(server) != 0) {
+            errors.fetch_add(1);
+        }
+        connected.count_down();
+    });
+    fiber::go(scheduler, [&]() noexcept {
+        if (client.connect(scheduler, endpoint) != 0) {
+            errors.fetch_add(1);
+        }
+        connected.count_down();
+    });
+    ASSERT_TRUE(connected.wait());
+    ASSERT_EQ(errors.load(), 0);
+    std::vector<char> big(32 << 20, 'z');
+    fiber::go(scheduler, [&]() noexcept {
+        char c;
+        read_error.store(client.read_some(&c, 1).error);
+        done.count_down();
+    });
+    fiber::go(scheduler, [&]() noexcept {
+        write_error.store(client.write_all(big.data(), big.size()).error);
+        done.count_down();
+    });
+    ASSERT_TRUE(eventually([&] { return parked(client, Direction::kRead) && parked(client, Direction::kWrite); }));
+    const linger reset{1, 0};
+    ASSERT_EQ(server.set_option(SOL_SOCKET, SO_LINGER, &reset, sizeof reset), 0);
+    ASSERT_EQ(server.close(), 0);  // sends RST
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(read_error.load(), ECONNRESET);
+    EXPECT_EQ(write_error.load(), ECONNRESET);
+    char c;
+    EXPECT_EQ(client.read_some(&c, 1).error, ECONNRESET);  // sticky
+    EXPECT_EQ(client.write_all("x", 1).error, ECONNRESET);
+    EXPECT_EQ(client.close(), 0);
+    EXPECT_EQ(listener.close(), 0);
+}
+
 using NetDeathTest = ::testing::Test;
 
 TEST(NetDeathTest, WaitOutsideFiberFailsFast) {
