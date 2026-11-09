@@ -140,6 +140,11 @@
               pkgs.gtest
               pkgs.gbenchmark
               pkgs.gdb
+              # fibers::tls (FIBERS_TLS): libssl / libcrypto, and the openssl
+              # CLI that generates the test certificates and runs the interop
+              # tests (s_client / s_server).
+              pkgs.openssl
+              pkgs.openssl.bin
             ];
             hardeningDisable = [ "fortify" ];
           } // twistDepsEnv pkgs);

@@ -107,6 +107,34 @@ fibers_add_component(fs fibers::fiber fibers::blocking fibers::sched fibers::fai
 # Stream, Listener, Endpoint.
 fibers_add_component(net fibers::fiber fibers::sched fibers::poller)
 
+# TLS over net::Stream (OpenSSL 3 with memory BIOs). Optional: on by default
+# when OpenSSL >= 3.0 is found, off under Twist (OpenSSL is not instrumented
+# for the simulator). Its own export set, so the installed package needs
+# OpenSSL only when it has fibers::tls (fibersConfig.cmake).
+find_package(OpenSSL 3.0 QUIET COMPONENTS SSL Crypto)
+if(OpenSSL_FOUND AND NOT FIBERS_TWIST)
+    set(_fibers_tls_default ON)
+else()
+    set(_fibers_tls_default OFF)
+endif()
+option(FIBERS_TLS "Build fibers::tls (needs OpenSSL >= 3.0)" ${_fibers_tls_default})
+if(FIBERS_TLS)
+    find_package(OpenSSL 3.0 REQUIRED COMPONENTS SSL Crypto)
+    find_program(FIBERS_OPENSSL_CLI openssl)  # test certificates, interop tests
+    add_library(fibers_tls INTERFACE)
+    add_library(fibers::tls ALIAS fibers_tls)
+    set_target_properties(fibers_tls PROPERTIES EXPORT_NAME tls)
+    target_include_directories(fibers_tls INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(fibers_tls INTERFACE cxx_std_20)
+    target_link_libraries(fibers_tls INTERFACE fibers::net fibers::fiber OpenSSL::SSL OpenSSL::Crypto)
+    install(TARGETS fibers_tls EXPORT fibersTlsTargets)
+    install(EXPORT fibersTlsTargets
+        NAMESPACE fibers::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fibers)
+endif()
+
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets
     NAMESPACE fibers::

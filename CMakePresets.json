@@ -75,6 +75,7 @@
       "inherits": "clang",
       "cacheVariables": {
         "FIBERS_TWIST": "ON",
+        "FIBERS_TLS": "OFF",
         "FIBERS_BUILD_BENCHMARKS": "OFF",
         "FIBERS_LINK_COMPILE_COMMANDS": "OFF",
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
