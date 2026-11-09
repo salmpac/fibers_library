@@ -21,3 +21,7 @@ target_compile_options(coro_bench PRIVATE -Wall -Wextra)
 add_executable(fiber_bench fiber_bench.cpp)
 target_link_libraries(fiber_bench PRIVATE fibers::fiber fibers::sched benchmark::benchmark_main)
 target_compile_options(fiber_bench PRIVATE -Wall -Wextra)
+
+add_executable(fs_bench fs_bench.cpp)
+target_link_libraries(fs_bench PRIVATE fibers::fs benchmark::benchmark_main)
+target_compile_options(fs_bench PRIVATE -Wall -Wextra)
