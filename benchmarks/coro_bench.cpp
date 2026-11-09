@@ -5,6 +5,15 @@
 //                             coroutine bookkeeping)
 //   CoroutineAwaiterRoundTrip resume() + ctx.suspend(awaiter) + the resumer
 //                             calling awaiter.await_suspend()
+//   CoroutineRandomOrder/N/S  N coroutines resumed in a pseudo-random order
+//                             (one resume() = round trip), each suspending
+//                             at one of S distinct call sites chosen by its
+//                             own pseudo-random sequence. RoundTrip above is
+//                             a best case: one coroutine, one suspend site,
+//                             so the switch's indirect jump always goes to
+//                             the same place and its stack stays in L1.
+//                             S = 1 isolates the cost of many stacks;
+//                             S = 4 / 8 adds mispredicted jump targets.
 //   MakeCoroutineRun          make_coroutine on a reused stack + run to
 //                             completion (setup, first switch, exit)
 //   MakeCoroutinePooled       the same with the stack acquired from and
@@ -22,7 +31,10 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <thread>
+#include <vector>
 
 #include "fibers/context/context.hpp"
 #include "fibers/coro/coroutine.hpp"
@@ -113,6 +125,89 @@ void BM_CoroutineAwaiterRoundTrip(benchmark::State& state) {
     state.counters["cpu"] = current_cpu();
 }
 BENCHMARK(BM_CoroutineAwaiterRoundTrip);
+
+// Distinct suspend sites. Every case is "asm marker; suspend; different
+// work": the marker (an asm volatile with its own text) keeps the compiler
+// from hoisting the common suspend above the switch, and the different work
+// after it keeps it from sinking the suspends into one call. So each site has
+// its own call into the switch, i.e. its own return address (checked with
+// objdump: one switch_stacks call per site).
+#define FIBERS_SITE(n, work)                       \
+    case n:                                        \
+        asm volatile("nop # suspend site " #n ::: "memory"); \
+        ctx.suspend();                             \
+        work;                                      \
+        break
+
+struct RandomSiteBody {
+    std::uint64_t rng;
+    std::uint64_t sites;
+    std::uint64_t sink = 0;
+    bool stop = false;
+
+    void operator()(coro::SuspendContext ctx) noexcept {
+        while (!stop) {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            switch (rng % sites) {
+                FIBERS_SITE(0, sink += 1);
+                FIBERS_SITE(1, sink ^= 0x55);
+                FIBERS_SITE(2, sink *= 3);
+                FIBERS_SITE(3, sink -= 7);
+                FIBERS_SITE(4, sink += rng);
+                FIBERS_SITE(5, sink ^= rng >> 3);
+                FIBERS_SITE(6, sink = (sink << 1) | 1);
+                FIBERS_SITE(7, sink = ~sink);
+                default:
+                    break;
+            }
+            benchmark::DoNotOptimize(sink);
+        }
+    }
+};
+#undef FIBERS_SITE
+
+void BM_CoroutineRandomOrder(benchmark::State& state) {
+    const auto count = static_cast<std::size_t>(state.range(0));
+    const auto sites = static_cast<std::uint64_t>(state.range(1));
+    std::vector<stack::Stack> stacks;
+    std::vector<RandomSiteBody> bodies(count);
+    std::vector<std::unique_ptr<coro::Coroutine>> coroutines;
+    stacks.reserve(count);
+    coroutines.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        stacks.push_back(stack::Stack::allocate(16 * 1024));
+        bodies[i].rng = 0x9E3779B97F4A7C15ull * (i + 1);
+        bodies[i].sites = sites;
+        coroutines.push_back(std::make_unique<coro::Coroutine>(stacks[i].view(), bodies[i]));
+        coroutines[i]->resume();  // to its first suspend
+    }
+    // Resume order: a precomputed pseudo-random sequence (no RNG in the loop).
+    constexpr std::size_t kOrder = 1 << 16;
+    std::vector<std::uint32_t> order(kOrder);
+    std::uint64_t x = 0x2545F4914F6CDD1Dull;
+    for (auto& o : order) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        o = static_cast<std::uint32_t>(x % count);
+    }
+    std::size_t next = 0;
+    for (auto _ : state) {
+        coroutines[order[next]]->resume();
+        next = (next + 1) & (kOrder - 1);
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        bodies[i].stop = true;
+        coroutines[i]->resume();
+    }
+    state.counters["cpu"] = current_cpu();
+}
+BENCHMARK(BM_CoroutineRandomOrder)
+    ->Args({1, 1})->Args({1, 4})
+    ->Args({256, 1})->Args({256, 4})->Args({256, 8})
+    ->Args({4096, 1})->Args({4096, 8});
 
 void BM_MakeCoroutineRun(benchmark::State& state) {
     stack::Stack s = stack::Stack::allocate();
