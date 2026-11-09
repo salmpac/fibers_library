@@ -94,6 +94,12 @@
 //     fiber from something the fiber publishes after this store (with
 //     release), so by coherence its CAS reads RUNNING or a later value.
 //   * yield's QUEUED store is relaxed: nobody may wake a yielding fiber.
+//     A fiber that has published itself (a WaitNode, its handle, a timer)
+//     must park, never yield or complete, until it is woken: a wake that
+//     arrived meanwhile (NOTIFIED) would be lost, and a later one would hit a
+//     QUEUED or destroyed fiber. Release builds trust this rule (plain store);
+//     debug builds (NDEBUG not defined) check it: yield exchanges the state
+//     and completion loads it, and either fails fast if NOTIFIED was set.
 //   * reason_ (yield / park) and the current-fiber slot are plain: written
 //     and read on one thread around the switch.
 //
@@ -131,7 +137,8 @@ using thread_pool::Task;
 
 // What a fiber needs from its scheduler (sched::BasicScheduler, or a smaller
 // test double): a context-switching Sync policy, a pool to submit Tasks to
-// and a StackPool. this_fiber::sleep_* additionally use poller().
+// and a StackPool. this_fiber::sleep_* additionally use pollers(), now()
+// and the Timer type (sched::BasicScheduler).
 template <class S>
 concept FiberScheduler = sync::ContextSyncPolicy<typename S::SyncPolicy> &&
                          requires(S& s, Task task, stack::Stack* stack) {
@@ -312,22 +319,23 @@ public:
         ctx_->suspend(awaiter);
     }
 
-    // Parks until the scheduler's poller fires a timer at `deadline` (on the
-    // poller's clock, see Poller::now()). The timer node lives on this stack;
-    // the poller does not touch it once its callback is entered, and the
-    // callback's wake is the only one (no cancellation). A deadline in the
-    // past fires at once, possibly before the fiber has left its stack
-    // (NOTIFIED). There is one poller per scheduler, so every fiber's timers
-    // go to it.
+    // Parks until a poller fires a timer at `deadline` (on the pollers'
+    // clock, see Scheduler::now()). The timer node lives on this stack and
+    // goes to scheduler().pollers().schedule(): the next poller in the
+    // calling thread's round robin (PollerPool::next()). The poller does not
+    // touch the node once its callback is entered, and the callback's wake
+    // is the only one (no cancellation, so no lazy-removal reference
+    // outlives the sleep). A deadline in the past fires at once, possibly
+    // before the fiber has left its stack (NOTIFIED). Zero allocation.
     void sleep_until(poller::TimePoint deadline) noexcept {
-        typename Sched::Poller::Timer timer(this, &on_timer);
+        typename Sched::Timer timer(this, &on_timer);
         timer.deadline = deadline;
-        scheduler().poller().schedule(timer);
+        scheduler().pollers().schedule(timer);
         park();
     }
 
     void sleep_for(poller::Duration duration) noexcept {
-        sleep_until(scheduler().poller().now() + duration);
+        sleep_until(scheduler().now() + duration);
     }
 
     // Racy snapshot of the state word (tests).
@@ -379,12 +387,27 @@ private:
             const coro::ResumeResult r = fiber->coroutine_.resume();
             current.fiber = nullptr;
             if (r.completed()) {
+#ifndef NDEBUG
+                if (fiber->state_.load(std::memory_order_relaxed) != kRunning) [[unlikely]] {
+                    fail::fail_fast("fiber: completed with a pending wake (a fiber that published "
+                                    "itself must park until woken)");
+                }
+#endif
                 fiber->destroy();
                 return;
             }
             if (fiber->reason_ == Reason::kYield) {
                 Sched& scheduler = fiber->scheduler();
+#ifndef NDEBUG
+                // Debug builds catch a broken contract (see "yield" in the
+                // top comment) at the cost of an RMW per yield.
+                if (fiber->state_.exchange(kQueued, std::memory_order_relaxed) != kRunning) [[unlikely]] {
+                    fail::fail_fast("fiber: yield() with a pending wake (a fiber that published "
+                                    "itself must park, not yield)");
+                }
+#else
                 fiber->state_.store(kQueued, std::memory_order_relaxed);
+#endif
                 scheduler.pool().submit(fiber->task());
                 return;  // the fiber may already run elsewhere
             }

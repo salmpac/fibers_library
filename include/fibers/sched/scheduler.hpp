@@ -4,7 +4,7 @@
 //
 //   Scheduler {
 //       ThreadPool      workers (one per core): run Tasks
-//       Poller          reactor thread: fds, timers (sleep_for), polling sources
+//       PollerPool      reactor threads: fds, timers (sleep_for), polling sources
 //       BlockingPool    a few threads for calls that block in the kernel
 //       StackPool       fiber stacks
 //       TaskMemoryPool  blocks for plain-callback tasks
@@ -16,17 +16,20 @@
 // ThreadPool. Fibers are spawned with fiber::go(scheduler, f)
 // (fibers/fiber/fiber.hpp).
 //
-// One Poller: timers of every fiber (this_fiber::sleep_for) go to it. Should
-// the scheduler ever own several, the choice must stay deterministic per
-// fiber (e.g. by worker index), see fiber::BasicFiber::sleep_until.
+// Pollers: a PollerPool of SchedulerOptions::pollers.num_pollers reactors
+// (default 1), all emitting into the ThreadPool. A fiber's timer
+// (this_fiber::sleep_for) goes to pollers().schedule(), i.e. the next poller
+// of the calling worker's round robin (PollerPool::next()); the timer
+// remembers its poller. All pollers share one clock (the backend's), so
+// deadlines are built from any of them (now()).
 //
 // Lifecycle, like ThreadPool: the constructor starts every thread (workers,
 // the reactor, the blocking threads); stop() stops and joins them all
 // (idempotent, not from a thread of this scheduler); the destructor stops.
-// Stop order: the poller (no new timer wake-ups), the workers, the blocking
+// Stop order: the pollers (no new timer wake-ups), the workers, the blocking
 // threads. Members are destroyed in reverse declaration order, so the
 // queue owners drop their leftovers while the memory pools still exist:
-//   ~Poller        delivers kCancelled to pending timers (sleeping fibers
+//   ~PollerPool    delivers kCancelled to pending timers (sleeping fibers
 //                  get their wake Task, into the stopped ThreadPool's queues)
 //   ~BlockingPool  drops queued ops (their continuation's delete_ptr)
 //   ~ThreadPool    drops queued Tasks (delete_ptr): a callback's closure is
@@ -51,6 +54,7 @@
 #include "fibers/blocking/blocking_pool.hpp"
 #include "fibers/poller/epoll_backend.hpp"
 #include "fibers/poller/poller.hpp"
+#include "fibers/poller/poller_pool.hpp"
 #include "fibers/sched/task_header.hpp"
 #include "fibers/sched/task_memory_pool.hpp"
 #include "fibers/stack/stack_pool.hpp"
@@ -67,7 +71,7 @@ concept SchedulerSyncPolicy = sync::ParkingSyncPolicy<S> && sync::ContextSyncPol
 
 struct SchedulerOptions {
     thread_pool::ThreadPoolOptions pool{};
-    poller::PollerOptions poller{};
+    poller::PollerPoolOptions pollers{};
     blocking::BlockingPoolOptions blocking{};
     stack::StackPoolOptions stacks{};
     TaskMemoryPoolOptions task_memory{};
@@ -79,22 +83,25 @@ public:
     using SyncPolicy = Sync;
     using Backend = B;
     using ThreadPool = thread_pool::ThreadPool<Sync>;
-    using Poller = poller::Poller<B, Sync>;
+    using PollerPool = poller::PollerPool<B, Sync>;
+    using Poller = typename PollerPool::PollerType;
+    using Timer = typename PollerPool::Timer;
     using BlockingPool = blocking::BlockingPool<Sync>;
     using StackPool = stack::StackPool<Sync>;
     using TaskMemory = TaskMemoryPool<Sync>;
     using TaskHeader = BasicTaskHeader<BasicScheduler>;
 
-    // Starts every thread. `backend_args` construct the poller's backend.
+    // Starts every thread. Every poller constructs its backend from copies
+    // of `backend_args`.
     // Fail fast if threads or memory cannot be had.
     template <class... BackendArgs>
-    explicit BasicScheduler(SchedulerOptions options = {}, BackendArgs&&... backend_args) noexcept
+    explicit BasicScheduler(SchedulerOptions options = {}, const BackendArgs&... backend_args) noexcept
         : stacks_(options.stacks),
           task_memory_(options.task_memory),
           pool_(options.pool),
           blocking_(options.blocking),
-          poller_(poller::TaskSink::of(pool_), options.poller, std::forward<BackendArgs>(backend_args)...) {
-        poller_.start();
+          pollers_(poller::TaskSink::of(pool_), options.pollers, backend_args...) {
+        pollers_.start();
     }
 
     BasicScheduler(const BasicScheduler&) = delete;
@@ -106,7 +113,7 @@ public:
     // scheduler (a worker, the reactor, a blocking thread). What is still
     // queued is dropped on destruction (see the top comment).
     void stop() noexcept {
-        poller_.stop();
+        pollers_.stop();
         pool_.stop();
         blocking_.stop();
     }
@@ -148,7 +155,10 @@ public:
     // ---- parts --------------------------------------------------------------
 
     ThreadPool& pool() noexcept { return pool_; }
-    Poller& poller() noexcept { return poller_; }
+    PollerPool& pollers() noexcept { return pollers_; }
+
+    // The pollers' clock (the same for all of them).
+    poller::TimePoint now() noexcept { return pollers_.at(0).now(); }
     BlockingPool& blocking() noexcept { return blocking_; }
     StackPool& stacks() noexcept { return stacks_; }
     TaskMemory& task_memory() noexcept { return task_memory_; }
@@ -190,7 +200,7 @@ private:
     TaskMemory task_memory_;
     ThreadPool pool_;
     BlockingPool blocking_;
-    Poller poller_;
+    PollerPool pollers_;
 };
 
 using Scheduler = BasicScheduler<>;

@@ -71,9 +71,11 @@ private:
     std::atomic<std::int64_t> count_;
 };
 
-sched::SchedulerOptions options(std::size_t workers) {
+// Two pollers everywhere: sleep_for's timers go round robin over them.
+sched::SchedulerOptions options(std::size_t workers, std::size_t pollers = 2) {
     sched::SchedulerOptions o;
     o.pool.num_workers = workers;
+    o.pollers.num_pollers = pollers;
     o.blocking.num_threads = 1;
     o.stacks.max_stacks = 4096;
     return o;
@@ -384,6 +386,34 @@ TEST(FiberDeathTest, DoubleWake) {
         "double wake");
 }
 
+#ifndef NDEBUG
+// Debug builds check the "published fibers park" rule on yield.
+TEST(FiberDeathTest, YieldWithPendingWake) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            std::atomic<Fiber*> published{nullptr};
+            std::atomic<bool> release{false};
+            Scheduler scheduler(options(1));
+            fiber::go(scheduler, [&]() noexcept {
+                published.store(this_fiber::self().get());
+                while (!release.load()) {
+                    fibers::sync::cpu_relax();
+                }
+                this_fiber::yield();  // wrong: must park
+            });
+            Fiber* f = nullptr;
+            while ((f = published.load()) == nullptr) {
+                std::this_thread::yield();
+            }
+            f->wake();
+            release.store(true);
+            std::this_thread::sleep_for(10s);
+        },
+        "pending wake");
+}
+#endif
+
 TEST(FiberDeathTest, YieldOutsideFiber) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_DEATH(this_fiber::yield(), "outside a fiber");
@@ -567,10 +597,10 @@ TEST(Sleep, WakesInDeadlineOrderAndNotEarly) {
     // Spawned in reverse deadline order.
     for (int i = kFibers - 1; i >= 0; --i) {
         fiber::go(scheduler, [&, i]() noexcept {
-            const auto start = scheduler.poller().now();
+            const auto start = scheduler.now();
             const auto duration = std::chrono::milliseconds(20 * (i + 1));
             this_fiber::sleep_for(duration);
-            if (scheduler.poller().now() < start + duration) {
+            if (scheduler.now() < start + duration) {
                 early.store(true);
             }
             order[i].store(sequence.fetch_add(1));
@@ -594,13 +624,16 @@ TEST(Sleep, ZeroAndPastDeadline) {
                 if ((i + k) % 2 == 0) {
                     this_fiber::sleep_for(0ns);
                 } else {
-                    this_fiber::sleep_until(scheduler.poller().now() - 1s);
+                    this_fiber::sleep_until(scheduler.now() - 1s);
                 }
             }
             done.count_down();
         });
     }
     ASSERT_TRUE(done.wait());
+    // Round robin over both pollers.
+    EXPECT_GT(scheduler.pollers().at(0).stats().timers_fired, 0u);
+    EXPECT_GT(scheduler.pollers().at(1).stats().timers_fired, 0u);
 }
 
 // The timer fires while the fiber is still on its stack (it waits for the
@@ -620,7 +653,7 @@ TEST(Sleep, TimerFiresWhileFiberStillRunning) {
         for (int i = 0; i < kRounds; ++i) {
             Ctx ctx;
             ctx.fiber = this_fiber::self().get();
-            Scheduler::Poller::Timer timer(&ctx, [](void* memo, fibers::poller::TimerEvent,
+            Scheduler::Timer timer(&ctx, [](void* memo, fibers::poller::TimerEvent,
                                                     fibers::poller::TaskBatch& out) noexcept {
                 auto* c = static_cast<Ctx*>(memo);
                 Fiber* f = c->fiber;
@@ -631,8 +664,8 @@ TEST(Sleep, TimerFiresWhileFiberStillRunning) {
                     out.push(f->task());
                 }
             });
-            timer.deadline = scheduler.poller().now() - 1ms;  // already due
-            scheduler.poller().schedule(timer);
+            timer.deadline = scheduler.now() - 1ms;  // already due
+            scheduler.pollers().schedule(timer);
             while (!ctx.fired.load(std::memory_order_acquire)) {
                 fibers::sync::cpu_relax();
             }

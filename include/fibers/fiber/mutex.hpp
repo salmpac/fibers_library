@@ -14,8 +14,9 @@
 // once), so no post-switch hook is needed. After a wake the fiber tries
 // again from the start (it may be overtaken and queue again).
 //
-// lock() must be called from a fiber of a scheduler of type Sched (fail fast
-// otherwise); try_lock() and unlock() from anywhere (unlock by the holder).
+// lock() must be called from a fiber of a scheduler of type Sched: when it
+// has to wait outside such a fiber it fails fast (it never blocks a thread).
+// try_lock() and unlock() work from anywhere (unlock by the holder).
 // unlock() wakes at most one fiber: a submit into the waker's pool queue.
 
 #include "fibers/fail/fail_fast.hpp"
