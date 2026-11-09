@@ -237,7 +237,9 @@ struct StackHarness {
             nodes.push_back(node);
             if (i + 1 < chain.size) node = arena.hook(node->next.load());
         }
-        if (chain.size != 0) EXPECT_EQ(nodes.back(), chain.last);
+        if (chain.size != 0) {
+            EXPECT_EQ(nodes.back(), chain.last);
+        }
         return nodes;
     }
     void push(Hook* node) { push_chain(node, node); }
