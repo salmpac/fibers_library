@@ -303,10 +303,21 @@ TEST(PollerTwist, WithdrawRacesSchedulers) {
             // The owner learns that the node is free from idle() alone (its
             // acquire pairs with withdraw's release store), then reuses it:
             // it must be fully out of the poller's heap.
+            // Bounded like wait_until(): by steps under the simulator, by wall
+            // time on real threads (5'000 yields can pass before the poller
+            // thread has even started).
+#if defined(__TWIST_SIM__)
             for (std::size_t step = 0; !target.timer.idle(); ++step) {
                 TWIST_ASSERT_M(step < 5'000, "target never withdrawn");
                 twist::ed::std::this_thread::yield();
             }
+#else
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (!target.timer.idle()) {
+                TWIST_ASSERT_M(std::chrono::steady_clock::now() < deadline, "target never withdrawn");
+                twist::ed::std::this_thread::yield();
+            }
+#endif
             target.prepare(fired, cancelled, p.now());
             p.schedule(target.timer);
             wait_until(fired, 1, "reused timer never fired");
