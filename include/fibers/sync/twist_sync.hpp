@@ -44,6 +44,9 @@ struct TwistSync {
     using Thread = twist::ed::std::thread;
     using CondVar = twist::ed::std::condition_variable;
     using Clock = twist::ed::std::chrono::steady_clock;
+    // Defined in fibers/context/twist_context.hpp (include it to switch
+    // contexts; it needs the `sure` target besides `twist`).
+    using ExecutionContext = context::TwistContext;
 
     // In the simulator this is a scheduling point (yield).
     static void spin_hint() noexcept { twist::ed::CpuRelax(); }
@@ -102,5 +105,6 @@ struct TwistSync {
 static_assert(SyncPolicy<TwistSync>);
 static_assert(ParkingSyncPolicy<TwistSync>);
 static_assert(SleepSyncPolicy<TwistSync>);
+static_assert(ContextSyncPolicy<TwistSync>);
 
 }  // namespace fibers::sync

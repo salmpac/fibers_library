@@ -14,6 +14,16 @@
 #include <immintrin.h>
 #endif
 
+// The execution contexts the policies name (ExecutionContext below). Only
+// declared here: the definitions live in the context component
+// (fibers/context/machine_context.hpp, fibers/context/twist_context.hpp), so
+// that the sync policies do not pull in assembly, sure or the x86-64-only
+// context code. Code that switches contexts includes those headers.
+namespace fibers::context {
+class MachineContext;
+class TwistContext;
+}  // namespace fibers::context
+
 namespace fibers::sync {
 
 // std::hardware_destructive_interference_size triggers -Winterference-size in
@@ -79,6 +89,19 @@ concept SleepSyncPolicy = SyncPolicy<S> && requires {
     S::Clock::now();
 };
 
+// ContextSyncPolicy: SyncPolicy plus the user-level context switch the
+// coroutine layer uses (fibers/coro):
+//
+//   ExecutionContext   a context::SwitchableContext (see
+//                      fibers/context/context.hpp): StdSync -> our
+//                      MachineContext, TwistSync -> TwistContext, an adapter
+//                      over twist::ed::sure, so Twist sees every switch
+//
+// Only the name is checked here (the type is incomplete until its header is
+// included); the coroutine layer checks SwitchableContext where it uses it.
+template <class S>
+concept ContextSyncPolicy = SyncPolicy<S> && requires { typename S::ExecutionContext; };
+
 namespace detail {
 template <class T>
 inline thread_local T std_thread_local_instance{};
@@ -93,6 +116,7 @@ struct StdSync {
     using Thread = std::thread;
     using CondVar = std::condition_variable;
     using Clock = std::chrono::steady_clock;
+    using ExecutionContext = context::MachineContext;  // fibers/context/machine_context.hpp
 
     static void spin_hint() noexcept { cpu_relax(); }
 
@@ -130,5 +154,6 @@ struct StdSync {
 static_assert(SyncPolicy<StdSync>);
 static_assert(ParkingSyncPolicy<StdSync>);
 static_assert(SleepSyncPolicy<StdSync>);
+static_assert(ContextSyncPolicy<StdSync>);
 
 }  // namespace fibers::sync

@@ -83,6 +83,9 @@ fibers_add_component(poller fibers::sync fibers::fail fibers::thread_pool)
 fibers_add_component(ipc fibers::sync fibers::poller)
 # Blocking-operations pool (spawn_blocking), ops with continuations, RWF_NOWAIT.
 fibers_add_component(blocking fibers::sync fibers::fail fibers::thread_pool)
+# Execution contexts: our x86-64 context switch (MachineContext, StdSync) and
+# the Twist adapter (TwistContext, TwistSync; needs the twist and sure targets).
+fibers_add_component(context fibers::fail)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets
