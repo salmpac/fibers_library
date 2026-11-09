@@ -99,6 +99,8 @@ fibers_add_component(sched fibers::sync fibers::fail fibers::thread_pool fibers:
 # Stackful fibers on a Scheduler (go, this_fiber, state machine), their
 # primitives (Mutex) and this_fiber::blocking (calls on the BlockingPool).
 fibers_add_component(fiber fibers::sched fibers::coro fibers::wait fibers::context fibers::blocking)
+# File I/O for fibers: RWF_NOWAIT inline, the rest through this_fiber::blocking.
+fibers_add_component(fs fibers::fiber fibers::blocking fibers::sched fibers::fail)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets
