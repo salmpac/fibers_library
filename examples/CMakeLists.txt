@@ -19,3 +19,13 @@ if(FIBERS_TLS)
         add_dependencies(tls_echo tls_echo_certs)
     endif()
 endif()
+
+# HTTP examples (need FIBERS_HTTP): a hello-world server (the wrk benchmark
+# target) and a small REST service.
+if(FIBERS_HTTP)
+    foreach(example http_hello http_rest)
+        add_executable(${example} ${example}.cpp)
+        target_link_libraries(${example} PRIVATE fibers::http fibers::sync)
+        target_compile_options(${example} PRIVATE -Wall -Wextra)
+    endforeach()
+endif()

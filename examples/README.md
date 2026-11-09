@@ -1,4 +1,4 @@
-# Examples: echo over fibers
+# Examples: echo and HTTP over fibers
 
 | binary | what |
 |---|---|
@@ -183,3 +183,123 @@ fiber: workers 0,4,6, poller 2; epoll 3t: 0,4,6; epoll 4t: 0,2,4,6; client: work
   requests arrive spread out, which a busy-polling epoll thread does not
   pay. p99.9 and max are similar (2-5 ms; scheduler noise of the loopback
   path on both).
+
+# HTTP over fibers (`fibers::http`, `FIBERS_HTTP=ON`)
+
+| binary | what |
+|---|---|
+| `http_hello` | `GET /hello` -> `Hello, World!` (keep-alive; the benchmark target) |
+| `http_rest` | a tiny REST service: `GET /items`, `GET / POST / DELETE /items/{id}` on an in-memory map behind a `fiber::Mutex` |
+| `http_bench.py` | benchmark driver: starts the server, runs wrk (closed loop) and wrk2 (fixed rate), accounts client / server CPU from `/proc/stat` |
+
+Both servers take echo_server's placement flags (`--workers --worker-cpus
+--pollers --poller-cpus --blocking --blocking-cpus --idle-spins
+--max-connections --stack-kb`, `sync::CpuList` syntax) plus `--port`,
+`--host`, `--grace-ms`, and stop gracefully on SIGINT / SIGTERM
+(`Server::stop(grace)`: idle keep-alive connections close at once,
+requests in flight finish with `Connection: close`).
+
+```sh
+cmake --preset clang-release && cmake --build --preset clang-release -j 6 --target http_hello http_rest
+build/clang-release/examples/http_rest --port=8080 --workers=2 --worker-cpus=0,4 --pollers=1 --poller-cpus=2
+curl -X POST --data 'hello' localhost:8080/items/a; curl localhost:8080/items/a; curl -X DELETE localhost:8080/items/a
+
+# benchmark (wrk / wrk2 are in the dev shell)
+examples/http_bench.py --server build/clang-release/examples/http_hello \
+    --server-args="--workers=1 --worker-cpus=0 --pollers=1 --poller-cpus=2 --blocking=1 --blocking-cpus=1" \
+    --server-cpus=0,2 --client-cpus=6-9,12-15 --connections=1,100,1000 \
+    --rates=100:50000,1000:150000
+```
+
+## Measurements (indicative)
+
+Same machine as above (i5-14400F, Linux 7.2, clang-release, loopback),
+keep-alive `GET /hello` (14-byte body, ~120-byte response), 2 s warm-up +
+10 s measured per point. **Indicative**: the machine was shared with two
+other build/test agents; their load was light while measuring (load average
+0.9-2.4 before the runs, most of it our own spinning worker, poller and wrk
+threads) but not zero. Server on distinct physical P-cores, HT siblings
+idle: A = 1 worker on CPU 0 + poller on CPU 2; B = 2 workers on CPUs 0, 4 +
+poller on CPU 2 (blocking thread on the idle sibling 1). wrk / wrk2: one
+thread per CPU on 6-9 and E-cores 12-15 (never 10-11).
+
+Client CPU (`client`) is the busy time of the client CPUs summed, then the
+busiest of them, measured over the run (it includes loopback kernel work);
+`wrk` is wrk's own CPU (rusage). No client CPU passed 76 %, so no point is
+client-bound. Server CPU: the fiber worker spins while idle (default
+`idle_spins_before_park`), so it reads ~100 % even at low load.
+
+**Closed loop (wrk)**, latency from wrk:
+
+| conns | A: 1 worker + poller | B: 2 workers + poller | client cores / max CPU (A ; B) |
+|---|---|---|---|
+| 1 | **74k** rps, p50 13 µs, p99 24 µs | **53k** rps, p50 16 µs, p99 2.5 ms | 0.6 / 19 % ; 2.9 / 40 % |
+| 100 | **303k** rps, p50 310 µs, p99 429 µs | **611k** rps, p50 155 µs, p99 318 µs | 2.9 / 47 % ; 4.5 / 68 % |
+| 1000 | **261k** rps, p50 3.8 ms, p99 4.6 ms | **588k** rps, p50 1.8 ms, p99 4.0 ms | 4.0 / 76 % ; 4.6 / 67 % |
+
+**Fixed rate (wrk2)**: corrected latency (from the intended send time) and,
+in brackets, uncorrected (service) latency, p50 / p99 / p99.9. wrk2 sends
+on a millisecond timer, so its corrected numbers have a floor of ~0.6-1 ms
+even at 1 % load (at 1 connection x 1000 rps: corrected p50 623 µs,
+uncorrected 12 µs); the uncorrected column shows the server.
+
+| server | conns | rate | achieved | corrected p50 / p99 / p99.9 | (uncorrected p50 / p99 / p99.9) | client cores / max CPU |
+|---|---|---|---|---|---|---|
+| A | 100 | 50k | 50k | 642 µs / 1.2 ms / 2.7 ms | (22 µs / 88 µs / 1.9 ms) | 0.5 / 10 % |
+| A | 100 | 150k | 150k | 940 µs / 2.2 ms / 3.7 ms | (49 µs / 297 µs / 1.8 ms) | 1.4 / 21 % |
+| A | 100 | 250k | 249k | 1.1 ms / 2.9 ms / 6.1 ms | (187 µs / 323 µs / 523 µs) | 2.0 / 31 % |
+| A | 1000 | 50k | 48k | 845 µs / 1.9 ms / 3.7 ms | (63 µs / 261 µs / 2.5 ms) | 0.7 / 12 % |
+| A | 1000 | 150k | 145k | 880 µs / 2.0 ms / 4.7 ms | (70 µs / 610 µs / 2.9 ms) | 1.7 / 28 % |
+| A | 1000 | 250k | 242k | 1.1 ms / 2.6 ms / 4.8 ms | (176 µs / 1.5 ms / 3.7 ms) | 2.6 / 37 % |
+| B | 100 | 100k | 100k | 763 µs / 1.4 ms / 3.0 ms | (32 µs / 133 µs / 2.0 ms) | 0.9 / 15 % |
+| B | 100 | 300k | 299k | 1.0 ms / 2.2 ms / 3.8 ms | (49 µs / 206 µs / 327 µs) | 2.2 / 32 % |
+| B | 100 | 450k | 449k | 1.6 ms / 151 ms / 171 ms | (136 µs / 375 µs / 1.4 ms) | 4.5 / 62 % |
+| B | 1000 | 100k | 97k | 940 µs / 2.7 ms / 4.2 ms | (121 µs / 1.7 ms / 2.8 ms) | 1.6 / 31 % |
+| B | 1000 | 300k | 291k | 1.1 ms / 2.5 ms / 4.0 ms | (160 µs / 1.1 ms / 2.7 ms) | 3.4 / 55 % |
+| B | 1000 | 450k | 432k | 1.2 ms / 3.5 ms / 7.3 ms | (276 µs / 1.8 ms / 4.2 ms) | 3.8 / 54 % |
+
+Reading them:
+
+- One worker + poller serves ~300k keep-alive requests/s, two workers
+  ~600k: the HTTP layer (llhttp parse, routing, response head into the
+  write buffer, one `send`) scales with workers like the echo server does
+  and costs little on top of the fiber / netpoller round trip (echo
+  group A: 335k rps at 100 x 1).
+- At 1 connection B is slower than A (53k vs 74k, p99 2.5 ms): the only
+  fiber hops between two workers and the second one parks and wakes; with
+  one connection a single worker is the better placement.
+- 1000 connections cost ~15 % throughput on one worker vs 100 (fiber /
+  socket working set); on two workers the difference is within noise.
+- Fixed rate up to ~80 % of the closed-loop maximum keeps the service
+  latency (uncorrected) at p99 0.1-0.6 ms on 100 connections. The B, 100,
+  450k point had a ~150 ms stall in its corrected tail (p90 99 ms) with a
+  normal uncorrected histogram, i.e. wrk2 fell behind its schedule for a
+  moment (shared machine); treat that row as an outlier.
+
+## Conformance checks
+
+Besides the unit tests (`tests/http`, all presets) the parser path was
+checked against outside test material and tools:
+
+- **llhttp's and picohttpparser's own test suites** (MIT;
+  `tests/http/corpus`, attribution in `THIRD_PARTY_NOTICES`): 185 request
+  cases replayed through the server's connection loop, whole, split at every
+  byte and byte by byte (`HttpCorpus.*`). 166 behave exactly as upstream
+  expects, 19 are documented deviations (`corpus/deviations.inc`: no
+  protocol upgrades, CONNECT 501, no HTTP/0.9, close instead of an error
+  after `Connection: close`, and picohttpparser leniencies we reject:
+  obs-fold, raw non-ASCII targets, whitespace after a chunk size, bare LF).
+- **smuggler** (defparam/smuggler, MIT; `tests/http/external/run_smuggler.sh`
+  against `http_rest`): all 1768 CL.TE / TE.CL mutations of its default,
+  doubles and exhaustive configs, POST and GET: OK, no desync signal; 400
+  for every ambiguous framing, 2xx only where the "TE" is not a
+  Transfer-Encoding header at all (`Transfer_Encoding`, `X: X\tTransfer-Encoding`).
+- **http-garden** (GPLv3; only invoked, never copied): its mutators,
+  imported at runtime by `tests/http/external/garden_fuzz.py`, produced
+  2 x 20000 mutated request streams against an ASan + UBSan `http_rest`:
+  no crash, hang, malformed response stream or error response followed by
+  more responses. (Its full differential harness needs docker images of
+  every target server and was not run.)
+- **REDbot** (MIT) on `http_hello` and `http_rest` responses (200, 404):
+  no protocol findings (Date correct, Content-Length correct; the only
+  notes are about caching, as the examples send no Cache-Control).
