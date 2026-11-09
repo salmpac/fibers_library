@@ -96,9 +96,9 @@ fibers_add_component(wait fibers::sync fibers::fail)
 # TaskHeader, plain-callback tasks.
 fibers_add_component(sched fibers::sync fibers::fail fibers::thread_pool fibers::poller
     fibers::blocking fibers::stack fibers::object_pool)
-# Stackful fibers on a Scheduler (go, this_fiber, state machine) and their
-# primitives (Mutex).
-fibers_add_component(fiber fibers::sched fibers::coro fibers::wait fibers::context)
+# Stackful fibers on a Scheduler (go, this_fiber, state machine), their
+# primitives (Mutex) and this_fiber::blocking (calls on the BlockingPool).
+fibers_add_component(fiber fibers::sched fibers::coro fibers::wait fibers::context fibers::blocking)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets

@@ -304,10 +304,10 @@ enum class ReadPath {
 // "Read: try nowait, else offload with continuation". Set the op's
 // continuation first (it is used only on kOffloaded).
 //
-// A fiber layer that suspends the fiber before publishing it splits this in
-// two: try_complete_inline() while running; if it returns false, suspend,
-// and after the context switch pool.submit(op) (see "Fiber integration" in
-// ops.hpp).
+// The fiber layer (fs::pread) uses the two halves itself:
+// try_complete_inline() on the worker; if it returns false, it submits the
+// op with a continuation that wakes the fiber and parks (see "Fiber
+// integration" in ops.hpp).
 template <class Pool, class Sync>
 [[nodiscard]] ReadPath read_nowait_or_offload(Pool& pool, BasicPreadOp<Sync>& op, NowaitSupport::Fs fs = {},
                                               NowaitSupport& support = process_nowait_support()) noexcept {

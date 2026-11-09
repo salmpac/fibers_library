@@ -116,10 +116,11 @@
 // * A lock-free push cannot check "stopped?" and enqueue atomically; an
 //   exact false would need a producer-side RMW or lock on every submit.
 //   Afterwards the only exact answer is "dropped".
-// * Fibers: by the time the scheduler's post-switch hook submits, the fiber
-//   is suspended. A false would have to resume it with ECANCELED: exactly
-//   what the continuation's delete_ptr does for ops dropped by stop(). One
-//   path instead of two, and no retry loop anywhere.
+// * Fibers (fiber/blocking.hpp) submit and then park. A false would have to
+//   be handled on the submitting fiber, as a second path next to ops that
+//   stop() drops after they were queued; with the drop, both go through the
+//   continuation's delete_ptr (it wakes the fiber, which then runs the call
+//   inline). One path instead of two, and no retry loop anywhere.
 // * ThreadPool also drops (delete_ptr) what it will not run.
 // The drop runs on the submitting thread (delete_ptr is user code).
 //

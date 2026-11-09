@@ -41,27 +41,29 @@
 // policy (Basic*Op<Sync>, Op<Derived, Sync>, CallOp<F, Sync>); the plain
 // names (BlockingOp, PreadOp, ...) are the StdSync ones.
 //
-// Fiber integration (intended flow; the fiber layer does not exist yet)
+// Fiber integration (fiber/blocking.hpp: this_fiber::blocking_op /
+// this_fiber::blocking; fs/file.hpp builds file I/O on them)
 // ----------------------------------------------------------------------
 // A fiber F running on a worker of the main ThreadPool calls, say,
-// read(fd, buf, len, offset):
+// fs::pread(fd, buf, len, offset):
 //  1. Fast path (nowait.hpp): PreadOp op on F's stack; try_complete_inline(op)
 //     with preadv2(RWF_NOWAIT). Page-cache hit: return op.result() at once,
 //     F never suspends.
-//  2. Would block: op.set_continuation(<Task that resumes F>,
-//     Sink::of(thread_pool)) and suspend F. Only AFTER the context switch
-//     (in the scheduler's post-switch hook, on the worker's own stack)
-//     blocking_pool.submit(op): publishing before F is fully suspended would
-//     let a fast completion resume F while it still runs. The op stays valid:
-//     it lives on F's (suspended) stack. submit() never blocks and never
+//  2. Would block: op.set_continuation(<Task that wakes F>, Sink::run_inline()),
+//     blocking_pool.submit(op), then F parks. Submitting before F has left
+//     its stack is safe: a completion that arrives first finds F's state
+//     word RUNNING and only marks it NOTIFIED, and F's park then returns at
+//     once (fiber.hpp). The op stays valid: it lives on F's stack, which
+//     F cannot leave before the wake. submit() never blocks and never
 //     fails: no retry loop, no "queue full" status.
 //  3. A BlockingPool thread runs pread (it may sleep on the disk), stores the
-//     result and calls thread_pool.submit(resume F) (an external submit: it
-//     never blocks; see ThreadPool).
-//  4. Some worker runs the continuation, F resumes and reads op.result().
+//     result and runs the continuation, which wakes F: a state-word CAS and,
+//     if F had parked, thread_pool.submit(F) (an external submit: it never
+//     blocks; see ThreadPool).
+//  4. Some worker resumes F, which reads op.result().
 //  * Pool stopped (before or after the submit): the continuation is dropped
-//    (its delete_ptr); the fiber layer decides whether that resumes F with
-//    ECANCELED or destroys it. It is the same code path in both cases.
+//    (its delete_ptr), which wakes F as well; F then runs the call inline on
+//    its worker. It is the same code path in both cases.
 
 #include <sys/types.h>
 #include <unistd.h>
