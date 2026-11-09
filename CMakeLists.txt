@@ -90,6 +90,15 @@ fibers_add_component(context fibers::fail)
 fibers_add_component(stack fibers::context fibers::fail fibers::object_pool fibers::sync)
 # Stackful coroutines over Sync::ExecutionContext.
 fibers_add_component(coro fibers::context fibers::fail fibers::sync)
+# Waiter-agnostic cores of waiting primitives over WaitNode (MutexCore).
+fibers_add_component(wait fibers::sync fibers::fail)
+# Scheduler { ThreadPool, Poller, BlockingPool, StackPool, TaskMemoryPool },
+# TaskHeader, plain-callback tasks.
+fibers_add_component(sched fibers::sync fibers::fail fibers::thread_pool fibers::poller
+    fibers::blocking fibers::stack fibers::object_pool)
+# Stackful fibers on a Scheduler (go, this_fiber, state machine) and their
+# primitives (Mutex).
+fibers_add_component(fiber fibers::sched fibers::coro fibers::wait fibers::context)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets
