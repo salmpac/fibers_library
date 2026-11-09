@@ -168,6 +168,7 @@ public:
     void schedule(Timer& timer) noexcept {
         assert(timer.idle() && "schedule(): timer is still owned by the poller");
         assert(timer.callback != nullptr);
+        timer.poller_ = this;
         timer.state_.store(Timer::kPending, std::memory_order_relaxed);  // published by push
         const std::int64_t deadline = timer.deadline.time_since_epoch().count();
         queue_.push(&timer);  // seq_cst exchange (P1)

@@ -144,6 +144,13 @@ public:
     // did with it happens-before).
     bool idle() const noexcept { return state_.load(std::memory_order_acquire) == kIdle; }
 
+    // The poller the node was last handed to by schedule() / post() (nullptr
+    // before the first one). Lets PollerPool::cancel() reach the right poller.
+    // Written by schedule() on the scheduling thread, so it may be read by
+    // whoever is allowed to cancel the timer (the owner, or a thread the
+    // owner synchronised with after scheduling).
+    void* poller() const noexcept { return poller_; }
+
 private:
     template <class Backend, sync::SyncPolicy S>
     friend class Poller;
@@ -153,6 +160,7 @@ private:
     enum : std::uint32_t { kIdle = 0, kPending = 1, kCancelled = 2 };
 
     typename Sync::template Atomic<std::uint32_t> state_{kIdle};
+    void* poller_ = nullptr;  // see poller()
     // Pairing heap links (poller thread only).
     BasicTimer* child_ = nullptr;
     BasicTimer* sibling_ = nullptr;
