@@ -15,6 +15,10 @@
 //                           unlock}; M = fiber::Mutex (parks the fiber) or
 //                           std::mutex (blocks the worker thread).
 //                           per_op = wall time per critical section.
+//   MutexWithWork<M>/N/W/S  the same with S steps of dependent arithmetic
+//                           (~100 ns / ~500 ns) after each unlock: work
+//                           outside the critical section.
+//   DependentWork/S         calibration of those steps.
 //   SleepWakeLatency/P      one fiber: sleep_for(50us), measure how late it
 //                           runs after its deadline (overshoot_ns, mean);
 //                           P pollers.
@@ -35,6 +39,7 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/fiber/mutex.hpp"
@@ -112,6 +117,11 @@ sched::SchedulerOptions options(std::size_t workers, std::size_t pollers = 1) {
 benchmark::Counter per_op(double ops) {
     return benchmark::Counter(ops, benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
 }
+
+// dependent_work() steps for ~100 ns / ~500 ns (calibrated by
+// BM_DependentWork on the i5-14400F P-cores, ~0.93 ns per step).
+constexpr int kWork100ns = 108;
+constexpr int kWork500ns = 540;
 
 void BM_GoRunToCompletion(benchmark::State& state) {
     constexpr int kFibers = 1000;
@@ -251,10 +261,97 @@ void BM_MutexContention(benchmark::State& state) {
     state.counters["per_op"] = per_op(static_cast<double>(state.iterations()) * fibers * kOps);
     cpus.report(state);
 }
-BENCHMARK(BM_MutexContention<fiber::Mutex>)
-    ->Args({1, 1})->Args({8, 1})->Args({8, 4})->Args({64, 4})->Args({64, 8})->UseRealTime();
-BENCHMARK(BM_MutexContention<std::mutex>)
-    ->Args({1, 1})->Args({8, 1})->Args({8, 4})->Args({64, 4})->Args({64, 8})->UseRealTime();
+// Dependent arithmetic (an LCG chain: one imul + add per step, ~4 cycles,
+// not vectorisable or foldable): CPU work that does not touch memory.
+[[gnu::noinline]] std::uint64_t dependent_work(std::uint64_t x, int steps) noexcept {
+    for (int i = 0; i < steps; ++i) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        asm volatile("" : "+r"(x));
+    }
+    return x;
+}
+
+void BM_DependentWork(benchmark::State& state) {
+    const int steps = static_cast<int>(state.range(0));
+    std::uint64_t x = 1;
+    for (auto _ : state) {
+        x = dependent_work(x, steps);
+    }
+    benchmark::DoNotOptimize(x);
+}
+BENCHMARK(BM_DependentWork)->Arg(kWork100ns)->Arg(kWork500ns);
+
+// MutexContention plus `steps` of dependent_work() outside the critical
+// section (between unlock and the next lock): contention depends on the
+// ratio of the work to the critical section and the number of workers.
+template <class M>
+void BM_MutexWithWork(benchmark::State& state) {
+    constexpr int kOps = 2000;
+    const int fibers = static_cast<int>(state.range(0));
+    const int steps = static_cast<int>(state.range(2));
+    Scheduler scheduler(options(static_cast<std::size_t>(state.range(1))));
+    Latch done;
+    CpuRange cpus;
+    M mutex;
+    std::int64_t counter = 0;
+    std::atomic<std::uint64_t> sink{0};
+    for (auto _ : state) {
+        done.reset(fibers);
+        for (int f = 0; f < fibers; ++f) {
+            fiber::go(scheduler, [&, f]() noexcept {
+                std::uint64_t x = static_cast<std::uint64_t>(f);
+                for (int i = 0; i < kOps; ++i) {
+                    {
+                        std::lock_guard guard(mutex);
+                        ++counter;
+                    }
+                    x = dependent_work(x, steps);
+                }
+                sink.fetch_add(x, std::memory_order_relaxed);
+                cpus.sample();
+                done.count_down();
+            });
+        }
+        done.wait();
+    }
+    benchmark::DoNotOptimize(counter);
+    state.counters["per_op"] = per_op(static_cast<double>(state.iterations()) * fibers * kOps);
+    cpus.report(state);
+}
+
+// fiber::Mutex with a fixed spin budget before parking (SpinMutex<0>: park
+// at once); fiber::Mutex itself spins kDefaultSpins. Comparing WOKEN on /
+// off: build once more with MutexCore::kWoken = 0 (a plain barging mutex).
+template <std::size_t Spins>
+struct SpinMutex : fiber::Mutex {
+    SpinMutex() noexcept : fiber::Mutex(Spins) {}
+};
+
+// fibers/workers: few fibers per worker, many, many on more workers.
+void contention_grid(benchmark::Benchmark* b) {
+    b->Args({8, 4})->Args({64, 4})->Args({64, 8})->Args({512, 8})->UseRealTime();
+}
+void work_grid(benchmark::Benchmark* b) {
+    for (const int steps : {kWork100ns, kWork500ns}) {
+        for (const auto& [n, w] : {std::pair{8, 4}, std::pair{64, 4}, std::pair{64, 8}, std::pair{512, 8}}) {
+            b->Args({n, w, steps});
+        }
+    }
+    b->UseRealTime();
+}
+
+BENCHMARK(BM_MutexContention<fiber::Mutex>)->Args({1, 1})->Args({8, 1})->Apply(contention_grid);
+#define FIBERS_MUTEX_BENCH(M)                                    \
+    BENCHMARK(BM_MutexContention<M>)->Apply(contention_grid); \
+    BENCHMARK(BM_MutexWithWork<M>)->Apply(work_grid)
+FIBERS_MUTEX_BENCH(SpinMutex<0>);
+FIBERS_MUTEX_BENCH(SpinMutex<16>);
+FIBERS_MUTEX_BENCH(SpinMutex<64>);
+FIBERS_MUTEX_BENCH(SpinMutex<256>);
+FIBERS_MUTEX_BENCH(SpinMutex<1024>);
+BENCHMARK(BM_MutexWithWork<std::mutex>)->Apply(work_grid);
+#undef FIBERS_MUTEX_BENCH
+BENCHMARK(BM_MutexContention<std::mutex>)->Args({1, 1})->Args({8, 1})->Apply(contention_grid);
 
 void BM_SleepWakeLatency(benchmark::State& state) {
     constexpr int kSleeps = 200;
