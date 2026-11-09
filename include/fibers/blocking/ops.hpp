@@ -1,31 +1,45 @@
 #pragma once
 
 // Blocking operations with completion delivery: caller-owned objects that
-// carry a call's parameters and result plus a continuation Task and a Sink.
+// carry a call's parameters and result, a continuation Task and a Sink, plus
+// the intrusive link by which BlockingPool queues them.
 //
 //   PreadOp op(fd, buf, len, offset);
 //   op.set_continuation(resume_task, Sink::of(thread_pool));
-//   if (!try_submit_op(blocking_pool, op)) { /* full: retry later */ }
+//   blocking_pool.submit(op);
 //   ... a pool thread runs pread, stores op.result(), then hands
 //   resume_task to thread_pool.submit(); resume_task reads op.result().
 //
-// Nothing is allocated: the op lives wherever the caller puts it (a fiber's
-// frame, an object pool). Lifetime: from submission until its continuation
-// runs (or is dropped). The pool thread does not touch the op after handing
-// the continuation to the sink, so the continuation may free it.
+// Nothing is allocated, and the pool's queue has no capacity: the op itself
+// is the queue node. It lives wherever the caller puts it (a fiber's frame,
+// an object pool). Lifetime: from submit() until its continuation runs (or
+// is dropped). The pool does not touch the op after handing the continuation
+// to the sink, so the continuation may free or resubmit it. An op must not
+// be submitted again while it is still queued or running. A fire-and-forget
+// op (no continuation) has no completion signal: the pool still stores its
+// result after execute() returns, so such an op must stay valid until the
+// pool is stopped (signalling from inside execute() is too early).
 //
-// Memory: the result is written by the pool thread before the sink's submit;
-// the sink (e.g. ThreadPool::submit) publishes the continuation with release
-// / acquire, so the continuation sees the result.
+// Memory: the op's fields are published to the pool thread by the queue
+// (release / acquire on the link). The result is written by the pool thread
+// before the sink's submit; the sink (e.g. ThreadPool::submit) publishes the
+// continuation with release / acquire, so the continuation sees the result.
 //
-// Dropped ops: if the pool drops the op's Task (stop() with the op still
-// queued), the op drops its continuation (Task::reset, i.e. its delete_ptr);
-// the continuation never runs. A fiber layer that must always resume can give
-// its continuation a delete_ptr that resumes with a "cancelled" status.
+// Dropped ops: if the pool drops the op (stop() with the op still queued, or
+// a submit() after stop(), see BlockingPool), the op drops its continuation
+// (Task::reset, i.e. its delete_ptr); the continuation never runs. A fiber
+// layer that must always resume can give its continuation a delete_ptr that
+// resumes with a "cancelled" status.
 //
 // User-defined blocking calls: derive from Op<YourOp> and give it
 //   IoResult execute() noexcept;
 // or wrap a callable in CallOp<F> (getaddrinfo, a blocking library, ...).
+// There is no plain-Task submission: arbitrary work is a CallOp, which is
+// caller-owned like every op, so the queue never needs storage.
+//
+// Sync policy: ops carry a Sync::Atomic link, so they are templates on the
+// policy (Basic*Op<Sync>, Op<Derived, Sync>, CallOp<F, Sync>); the plain
+// names (BlockingOp, PreadOp, ...) are the StdSync ones.
 //
 // Fiber integration (intended flow; the fiber layer does not exist yet)
 // ----------------------------------------------------------------------
@@ -37,19 +51,17 @@
 //  2. Would block: op.set_continuation(<Task that resumes F>,
 //     Sink::of(thread_pool)) and suspend F. Only AFTER the context switch
 //     (in the scheduler's post-switch hook, on the worker's own stack)
-//     try_submit_op(blocking_pool, op): publishing before F is fully
-//     suspended would let a fast completion resume F while it still runs.
-//     The op stays valid: it lives on F's (suspended) stack.
+//     blocking_pool.submit(op): publishing before F is fully suspended would
+//     let a fast completion resume F while it still runs. The op stays valid:
+//     it lives on F's (suspended) stack. submit() never blocks and never
+//     fails: no retry loop, no "queue full" status.
 //  3. A BlockingPool thread runs pread (it may sleep on the disk), stores the
 //     result and calls thread_pool.submit(resume F) (an external submit: it
 //     never blocks; see ThreadPool).
 //  4. Some worker runs the continuation, F resumes and reads op.result().
-//  * Queue full (try_submit_op returned false in step 2): resume F with a
-//    "retry" status; F yields to the scheduler and tries again. Its worker
-//    keeps running other fibers: nothing blocks.
-//  * Pool stopped with the op queued: the continuation is dropped (its
-//    delete_ptr); the fiber layer decides whether that resumes F with
-//    ECANCELED or destroys it.
+//  * Pool stopped (before or after the submit): the continuation is dropped
+//    (its delete_ptr); the fiber layer decides whether that resumes F with
+//    ECANCELED or destroys it. It is the same code path in both cases.
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -60,6 +72,7 @@
 #include <utility>
 
 #include "fibers/fail/fail_fast.hpp"
+#include "fibers/sync/sync.hpp"
 #include "fibers/thread_pool/task.hpp"
 
 namespace fibers::blocking {
@@ -103,13 +116,30 @@ struct Sink {
     }
 };
 
-// Base of every op. Not movable: the pool holds a pointer to it.
-class BlockingOp {
-public:
-    using ExecuteFn = IoResult (*)(BlockingOp&) noexcept;
+template <sync::ParkingSyncPolicy Sync>
+class BlockingPool;
 
-    BlockingOp(const BlockingOp&) = delete;
-    BlockingOp& operator=(const BlockingOp&) = delete;
+namespace detail {
+
+// The intrusive link. A base of every op, and the queue's stub node.
+template <sync::SyncPolicy Sync>
+struct OpLink {
+    typename Sync::template Atomic<OpLink*> next{nullptr};
+};
+
+template <sync::SyncPolicy Sync>
+class OpQueue;
+
+}  // namespace detail
+
+// Base of every op. Not movable: the pool holds a pointer to it.
+template <sync::SyncPolicy Sync = sync::StdSync>
+class BasicBlockingOp : private detail::OpLink<Sync> {
+public:
+    using ExecuteFn = IoResult (*)(BasicBlockingOp&) noexcept;
+
+    BasicBlockingOp(const BasicBlockingOp&) = delete;
+    BasicBlockingOp& operator=(const BasicBlockingOp&) = delete;
 
     // What to deliver, and where, once the call has returned. An empty
     // continuation means fire-and-forget. Set before submission.
@@ -127,25 +157,24 @@ public:
     // Records a result without running the call (inline fast paths).
     void set_result(IoResult result) noexcept { result_ = result; }
 
-    // The Task to hand to a BlockingPool (memo = this op). Running it runs
-    // the call, stores the result and delivers the continuation; dropping it
-    // drops the continuation. Prefer try_submit_op(), which does not drop the
-    // op's continuation when the pool refuses the task.
-    Task task() noexcept { return Task(this, &call, &drop); }
-
 protected:
-    explicit BlockingOp(ExecuteFn execute) noexcept : execute_(execute) {}
-    ~BlockingOp() = default;
+    explicit BasicBlockingOp(ExecuteFn execute) noexcept : execute_(execute) {}
+    ~BasicBlockingOp() = default;
 
 private:
-    static void call(void* memo) noexcept {
-        auto* op = static_cast<BlockingOp*>(memo);
-        op->result_ = op->execute_(*op);
-        Task continuation = std::move(op->continuation_);
+    friend class detail::OpQueue<Sync>;
+    template <sync::ParkingSyncPolicy S>
+    friend class BlockingPool;
+
+    // Runs the call, stores the result, delivers the continuation. The op
+    // may be gone when this returns.
+    void run() noexcept {
+        result_ = execute_(*this);
+        Task continuation = std::move(continuation_);
         if (!continuation) {
             return;
         }
-        const Sink sink = op->sink_;
+        const Sink sink = sink_;
         if (!sink) {
             fail::fail_fast("BlockingOp: continuation without a sink");
         }
@@ -153,7 +182,8 @@ private:
         sink.submit(sink.target, std::move(continuation));
     }
 
-    static void drop(void* memo) noexcept { static_cast<BlockingOp*>(memo)->continuation_.reset(); }
+    // The pool will not run the op: drop its continuation (delete_ptr).
+    void drop() noexcept { continuation_.reset(); }
 
     ExecuteFn execute_;
     Task continuation_;
@@ -161,25 +191,17 @@ private:
     IoResult result_;
 };
 
+using BlockingOp = BasicBlockingOp<sync::StdSync>;
+
 // CRTP helper: Derived provides `IoResult execute() noexcept`.
-template <class Derived>
-class Op : public BlockingOp {
+template <class Derived, sync::SyncPolicy Sync = sync::StdSync>
+class Op : public BasicBlockingOp<Sync> {
 protected:
     Op() noexcept
-        : BlockingOp([](BlockingOp& self) noexcept -> IoResult { return static_cast<Derived&>(self).execute(); }) {}
+        : BasicBlockingOp<Sync>([](BasicBlockingOp<Sync>& self) noexcept -> IoResult {
+              return static_cast<Derived&>(self).execute();
+          }) {}
 };
-
-// Submits `op` to `pool` (anything with try_submit(Task&&) -> bool). On false
-// (full / stopped) nothing happened: the op and its continuation are intact.
-template <class Pool>
-[[nodiscard]] bool try_submit_op(Pool& pool, BlockingOp& op) noexcept {
-    Task task = op.task();
-    if (pool.try_submit(std::move(task))) {
-        return true;
-    }
-    static_cast<void>(task.release());  // the op stays with the caller: do not drop it
-    return false;
-}
 
 // ---------------------------------------------------------------------------
 // Ready-made ops. Each runs ONE syscall (retried on EINTR) with its usual
@@ -200,10 +222,11 @@ inline IoResult with_prefix(std::size_t transferred, ssize_t ret, int error) noe
 }
 }  // namespace detail
 
-class PreadOp final : public Op<PreadOp> {
+template <sync::SyncPolicy Sync = sync::StdSync>
+class BasicPreadOp final : public Op<BasicPreadOp<Sync>, Sync> {
 public:
-    PreadOp() noexcept = default;
-    PreadOp(int fd_, void* buf_, std::size_t len_, off_t offset_) noexcept
+    BasicPreadOp() noexcept = default;
+    BasicPreadOp(int fd_, void* buf_, std::size_t len_, off_t offset_) noexcept
         : fd(fd_), buf(buf_), len(len_), offset(offset_) {}
 
     int fd = -1;
@@ -222,10 +245,11 @@ public:
     }
 };
 
-class PwriteOp final : public Op<PwriteOp> {
+template <sync::SyncPolicy Sync = sync::StdSync>
+class BasicPwriteOp final : public Op<BasicPwriteOp<Sync>, Sync> {
 public:
-    PwriteOp() noexcept = default;
-    PwriteOp(int fd_, const void* buf_, std::size_t len_, off_t offset_) noexcept
+    BasicPwriteOp() noexcept = default;
+    BasicPwriteOp(int fd_, const void* buf_, std::size_t len_, off_t offset_) noexcept
         : fd(fd_), buf(buf_), len(len_), offset(offset_) {}
 
     int fd = -1;
@@ -245,10 +269,11 @@ public:
 };
 
 // fsync, or fdatasync with datasync = true. result().value is 0 on success.
-class FsyncOp final : public Op<FsyncOp> {
+template <sync::SyncPolicy Sync = sync::StdSync>
+class BasicFsyncOp final : public Op<BasicFsyncOp<Sync>, Sync> {
 public:
-    FsyncOp() noexcept = default;
-    explicit FsyncOp(int fd_, bool datasync_ = false) noexcept : fd(fd_), datasync(datasync_) {}
+    BasicFsyncOp() noexcept = default;
+    explicit BasicFsyncOp(int fd_, bool datasync_ = false) noexcept : fd(fd_), datasync(datasync_) {}
 
     int fd = -1;
     bool datasync = false;
@@ -262,14 +287,18 @@ public:
     }
 };
 
+using PreadOp = BasicPreadOp<sync::StdSync>;
+using PwriteOp = BasicPwriteOp<sync::StdSync>;
+using FsyncOp = BasicFsyncOp<sync::StdSync>;
+
 // Any blocking callable: F() -> IoResult, or F() -> void (result {0, 0}).
 // Inputs and outputs beyond IoResult live in the callable's captures, i.e.
 // in caller-owned memory, e.g. for getaddrinfo:
 //   CallOp op([&] { return IoResult{0, ::getaddrinfo(host, port, &hints, &res)}; });
 // (getaddrinfo's EAI_* codes are not errno values: interpret them yourself.)
 // F must not throw (the call is noexcept: a throw terminates).
-template <class F>
-class CallOp final : public Op<CallOp<F>> {
+template <class F, sync::SyncPolicy Sync = sync::StdSync>
+class CallOp final : public Op<CallOp<F, Sync>, Sync> {
     static_assert(std::is_invocable_v<F&>, "CallOp: F must be callable without arguments");
 
 public:
@@ -287,5 +316,8 @@ public:
 private:
     F fn_;
 };
+
+template <class F>
+CallOp(F) -> CallOp<F>;
 
 }  // namespace fibers::blocking

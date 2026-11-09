@@ -1,18 +1,23 @@
 // BlockingPool benchmarks.
 //
-//   BM_Handoff         main-pool task -> blocking pool -> continuation back on
-//                      the main pool (both timestamps taken on main-pool
-//                      workers), arg 0: blocking pool idle (threads asleep,
-//                      200 us between samples), arg 1: busy (a background
-//                      submitter keeps 16 x 2 us tasks queued, threads never
-//                      sleep). median / p99 in ns.
-//   BM_Throughput      tiny blocking tasks (one relaxed increment) from 1 / 4 /
-//                      8 submitter threads into one pool of 8 threads.
-//   BM_Pread4K         4 KiB pread from the page cache: arg 0 inline
-//                      preadv2(RWF_NOWAIT), arg 1 offloaded (PreadOp through
-//                      the pool, completion seen by the caller), arg 2 plain
-//                      pread for reference.
-//   BM_IdleCpu         process CPU over 500 ms with 8 idle pool threads.
+//   BM_Handoff/busy/threads  main-pool task -> blocking pool -> continuation
+//                      back on the main pool (both timestamps taken on
+//                      main-pool workers). busy 0: blocking pool idle
+//                      (threads asleep, 200 us between samples); busy 1: a
+//                      background submitter offers a fixed load of 400k
+//                      ops/s, 2 us each (0.8 cores' worth), at most 16 in
+//                      flight; the probe shares the pool with it. A fixed
+//                      rate, so that a faster pool does not get a heavier
+//                      load (an unthrottled generator saturates every pool
+//                      thread and starves the main pool on 10 CPUs).
+//                      median / p99 in ns.
+//   BM_Throughput/submitters/threads  tiny ops (one relaxed increment) from
+//                      1 / 4 / 8 submitter threads; ops/s.
+//   BM_Pread4K/mode    4 KiB pread from the page cache: 0 inline
+//                      preadv2(RWF_NOWAIT), 1 offloaded (PreadOp through the
+//                      pool, completion seen by the caller), 2 plain pread
+//                      for reference.
+//   BM_IdleCpu/threads process CPU over 500 ms with idle pool threads.
 //
 // Latency / CPU results are counters; run with --benchmark_repetitions=3 on
 // CPUs 0-9 (taskset -c 0-9). The test file for BM_Pread4K is created in the
@@ -32,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <random>
 #include <thread>
 #include <vector>
@@ -51,6 +57,17 @@ using blocking::IoResult;
 using blocking::Sink;
 using blocking::Task;
 using MainPool = fibers::thread_pool::ThreadPool<>;
+
+// ---- the API under test (one place, so an A/B run can swap it) ----
+blocking::BlockingPoolOptions pool_options(std::size_t threads) { return {.num_threads = threads}; }
+void submit_op(BlockingPool<>& pool, blocking::BlockingOp& op) { pool.submit(op); }
+using NowaitHandle = blocking::NowaitSupport::Fs;
+NowaitHandle nowait_handle(blocking::NowaitSupport& support, int fd) { return support.filesystem(fd); }
+IoResult read_nowait(blocking::NowaitSupport& support, NowaitHandle fs, int fd, void* buf, std::size_t len,
+                     off_t offset) {
+    return blocking::try_read_nowait(fd, buf, len, offset, fs, support);
+}
+// ---- end of the API under test ----
 
 std::int64_t mono_ns() {
     timespec ts{};
@@ -81,41 +98,60 @@ void spin_for_ns(std::int64_t ns) {
 
 // ---------------------------------------------------------------------------
 
-// Keeps `inflight` 2 us tasks in the pool until stopped.
+// Offers 2 us ops at a fixed rate (at most `inflight` outstanding) until
+// destroyed.
 class BackgroundLoad {
 public:
-    BackgroundLoad(BlockingPool<>& pool, int inflight) : pool_(pool), inflight_(inflight) {
+    static constexpr int kMaxInflight = 64;
+    static constexpr std::int64_t kPeriodNs = 2'500;  // 400k ops/s
+
+    BackgroundLoad(BlockingPool<>& pool, int inflight) : pool_(pool), inflight_(std::min(inflight, kMaxInflight)) {
         thread_ = std::thread([this] { run(); });
     }
     ~BackgroundLoad() {
         stop_.store(true);
         thread_.join();
-        while (outstanding_.load() > 0) std::this_thread::yield();
+        for (int i = 0; i < inflight_; ++i) {
+            while (ops_[i].busy.load(std::memory_order_acquire)) std::this_thread::yield();
+        }
     }
     std::uint64_t completed() const { return completed_.load(); }
 
 private:
-    static void work(void* memo) noexcept {
-        auto* self = static_cast<BackgroundLoad*>(memo);
-        spin_for_ns(2'000);
-        self->completed_.fetch_add(1, std::memory_order_relaxed);
-        self->outstanding_.fetch_sub(1, std::memory_order_release);
-    }
+    struct WorkOp final : blocking::Op<WorkOp> {
+        BackgroundLoad* owner = nullptr;
+        std::atomic<bool> busy{false};
+        IoResult execute() noexcept {
+            spin_for_ns(2'000);
+            owner->completed_.fetch_add(1, std::memory_order_relaxed);
+            return IoResult{};
+        }
+        // The continuation (run inline): the pool is done with the op.
+        static void done(void* memo) noexcept {
+            static_cast<WorkOp*>(memo)->busy.store(false, std::memory_order_release);
+        }
+    };
+
     void run() {
+        std::int64_t due = mono_ns();
         while (!stop_.load(std::memory_order_relaxed)) {
-            if (outstanding_.load(std::memory_order_acquire) >= inflight_) {
-                fibers::sync::cpu_relax();
-                continue;
+            for (int i = 0; i < inflight_ && mono_ns() >= due; ++i) {
+                if (!ops_[i].busy.load(std::memory_order_acquire)) {
+                    due += kPeriodNs;
+                    ops_[i].owner = this;
+                    ops_[i].busy.store(true, std::memory_order_relaxed);
+                    ops_[i].set_continuation(Task(&ops_[i], &WorkOp::done, nullptr), Sink::run_inline());
+                    submit_op(pool_, ops_[i]);
+                }
             }
-            outstanding_.fetch_add(1);
-            if (!pool_.try_submit(Task(this, &work, nullptr))) outstanding_.fetch_sub(1);
+            fibers::sync::cpu_relax();
         }
     }
 
     BlockingPool<>& pool_;
     const int inflight_;
+    WorkOp ops_[kMaxInflight];
     std::atomic<bool> stop_{false};
-    std::atomic<int> outstanding_{0};
     std::atomic<std::uint64_t> completed_{0};
     std::thread thread_;
 };
@@ -132,7 +168,7 @@ struct HandoffProbe {
         auto* self = static_cast<HandoffProbe*>(memo);
         self->op.set_continuation(Task(self, &finish, nullptr), Sink::of(*self->main));
         self->started = mono_ns();
-        while (!blocking::try_submit_op(*self->pool, self->op)) fibers::sync::cpu_relax();
+        submit_op(*self->pool, self->op);
     }
     // The continuation, back on a main-pool worker.
     static void finish(void* memo) noexcept {
@@ -143,8 +179,9 @@ struct HandoffProbe {
 
 void BM_Handoff(benchmark::State& state) {
     const bool busy = state.range(0) == 1;
+    const auto threads = static_cast<std::size_t>(state.range(1));
     MainPool main({.num_workers = 4});
-    BlockingPool<> pool({.num_threads = 8});
+    BlockingPool<> pool(pool_options(threads));
     std::unique_ptr<BackgroundLoad> load;
     if (busy) load = std::make_unique<BackgroundLoad>(pool, 16);
     HandoffProbe probe;
@@ -163,50 +200,70 @@ void BM_Handoff(benchmark::State& state) {
             samples.push_back(finished - probe.started);
         }
     }
-    if (busy) state.counters["background_tasks"] = static_cast<double>(load->completed());
+    if (busy) {
+        state.counters["background_ops_per_s"] = benchmark::Counter(static_cast<double>(load->completed()),
+                                                                    benchmark::Counter::kIsRate);
+    }
     load.reset();
     report_percentiles(state, samples);
 }
-BENCHMARK(BM_Handoff)->Arg(0)->Arg(1)->Iterations(1)->UseRealTime()->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_Handoff)
+    ->ArgNames({"busy", "threads"})
+    ->Args({0, 2})
+    ->Args({1, 2})
+    ->Args({0, 8})
+    ->Args({1, 8})
+    ->Iterations(1)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
 
 // ---------------------------------------------------------------------------
 
+struct TickOp final : blocking::Op<TickOp> {
+    std::atomic<std::uint64_t>* done = nullptr;
+    IoResult execute() noexcept {
+        done->fetch_add(1, std::memory_order_relaxed);
+        return IoResult{};
+    }
+};
+
 void BM_Throughput(benchmark::State& state) {
     const int submitters = static_cast<int>(state.range(0));
-    constexpr std::uint64_t kTasks = 400'000;
+    const auto threads = static_cast<std::size_t>(state.range(1));
+    constexpr std::uint64_t kOps = 400'000;
     std::atomic<std::uint64_t> done{0};
-    auto tick = [](void* memo) noexcept {
-        static_cast<std::atomic<std::uint64_t>*>(memo)->fetch_add(1, std::memory_order_relaxed);
-    };
-    BlockingPool<> pool({.num_threads = 8, .queue_capacity = 1024});
+    // One op object per submitted job, allocated once: a round is "submit
+    // kOps distinct jobs and wait for all of them".
+    auto ops = std::make_unique<TickOp[]>(kOps);
+    for (std::uint64_t i = 0; i < kOps; ++i) ops[i].done = &done;
+    BlockingPool<> pool(pool_options(threads));
     std::uint64_t target = 0;
-    std::uint64_t refused = 0;
     for (auto _ : state) {
-        std::atomic<std::uint64_t> refused_now{0};
-        std::vector<std::thread> threads;
+        std::vector<std::thread> workers;
         for (int s = 0; s < submitters; ++s) {
-            threads.emplace_back([&, s] {
-                const std::uint64_t mine = kTasks / submitters + (s == 0 ? kTasks % submitters : 0);
-                std::uint64_t r = 0;
-                for (std::uint64_t i = 0; i < mine; ++i) {
-                    while (!pool.try_submit(Task(&done, tick, nullptr))) {
-                        ++r;
-                        std::this_thread::yield();
-                    }
-                }
-                refused_now.fetch_add(r);
+            workers.emplace_back([&, s] {
+                const std::uint64_t begin = kOps * s / submitters;
+                const std::uint64_t end = kOps * (s + 1) / submitters;
+                for (std::uint64_t i = begin; i < end; ++i) submit_op(pool, ops[i]);
             });
         }
-        for (auto& t : threads) t.join();
-        target += kTasks;
+        for (auto& t : workers) t.join();
+        target += kOps;
         while (done.load(std::memory_order_relaxed) < target) fibers::sync::cpu_relax();
-        refused += refused_now.load();
     }
     state.SetItemsProcessed(static_cast<std::int64_t>(target));
-    state.counters["refused_per_task"] = static_cast<double>(refused) / static_cast<double>(target);
-    state.counters["sleeps_per_task"] = static_cast<double>(pool.sleeps()) / static_cast<double>(target);
+    state.counters["sleeps_per_op"] = static_cast<double>(pool.sleeps()) / static_cast<double>(target);
 }
-BENCHMARK(BM_Throughput)->Arg(1)->Arg(4)->Arg(8)->UseRealTime()->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_Throughput)
+    ->ArgNames({"submitters", "threads"})
+    ->Args({1, 2})
+    ->Args({4, 2})
+    ->Args({8, 2})
+    ->Args({1, 8})
+    ->Args({4, 8})
+    ->Args({8, 8})
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
 
 // ---------------------------------------------------------------------------
 
@@ -236,8 +293,9 @@ private:
 void BM_Pread4K(benchmark::State& state) {
     const int mode = static_cast<int>(state.range(0));
     CachedFile file;
-    BlockingPool<> pool({.num_threads = 8});
+    BlockingPool<> pool(pool_options(2));
     blocking::NowaitSupport support;
+    const NowaitHandle fs = nowait_handle(support, file.fd());  // once per open file
     alignas(64) char buf[4096];
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> page(0, static_cast<int>(CachedFile::kSize / 4096) - 1);
@@ -246,7 +304,7 @@ void BM_Pread4K(benchmark::State& state) {
     for (auto _ : state) {
         const off_t offset = static_cast<off_t>(page(rng)) * 4096;
         if (mode == 0) {
-            const IoResult r = blocking::try_read_nowait(file.fd(), buf, sizeof(buf), offset, support);
+            const IoResult r = read_nowait(support, fs, file.fd(), buf, sizeof(buf), offset);
             if (r.value == 4096) ++inline_hits;
         } else if (mode == 1) {
             blocking::PreadOp op(file.fd(), buf, sizeof(buf), offset);
@@ -254,7 +312,7 @@ void BM_Pread4K(benchmark::State& state) {
             op.set_continuation(Task(&done, [](void* m) noexcept {
                 static_cast<std::atomic<bool>*>(m)->store(true, std::memory_order_release);
             }, nullptr), Sink::run_inline());
-            if (!blocking::try_submit_op(pool, op)) std::abort();
+            submit_op(pool, op);
             while (!done.load(std::memory_order_acquire)) fibers::sync::cpu_relax();
         } else {
             if (pread(file.fd(), buf, sizeof(buf), offset) != 4096) std::abort();
@@ -267,13 +325,14 @@ void BM_Pread4K(benchmark::State& state) {
     }
     state.SetBytesProcessed(static_cast<std::int64_t>(state.iterations()) * 4096);
 }
-BENCHMARK(BM_Pread4K)->Arg(0)->Arg(1)->Arg(2)->UseRealTime();
+BENCHMARK(BM_Pread4K)->ArgName("mode")->Arg(0)->Arg(1)->Arg(2)->UseRealTime();
 
 // ---------------------------------------------------------------------------
 
 void BM_IdleCpu(benchmark::State& state) {
+    const auto threads = static_cast<std::size_t>(state.range(0));
     for (auto _ : state) {
-        BlockingPool<> pool({.num_threads = 8});
+        BlockingPool<> pool(pool_options(threads));
         std::this_thread::sleep_for(20ms);
         const auto sleeps_before = pool.sleeps();
         const auto before = process_cpu();
@@ -284,6 +343,6 @@ void BM_IdleCpu(benchmark::State& state) {
         state.counters["sleeping_threads"] = static_cast<double>(pool.sleeping_threads());
     }
 }
-BENCHMARK(BM_IdleCpu)->Iterations(1)->UseRealTime()->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_IdleCpu)->ArgName("threads")->Arg(2)->Arg(8)->Iterations(1)->UseRealTime()->Unit(benchmark::kMillisecond);
 
 }  // namespace
