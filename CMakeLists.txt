@@ -88,6 +88,8 @@ fibers_add_component(blocking fibers::sync fibers::fail fibers::thread_pool)
 fibers_add_component(context fibers::fail)
 # Fiber stacks: mmap'ed with a guard page; StackPool on the sharded object pool.
 fibers_add_component(stack fibers::context fibers::fail fibers::object_pool fibers::sync)
+# Stackful coroutines over Sync::ExecutionContext.
+fibers_add_component(coro fibers::context fibers::fail fibers::sync)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets

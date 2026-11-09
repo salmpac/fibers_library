@@ -13,3 +13,7 @@ target_compile_options(poller_bench PRIVATE -Wall -Wextra)
 add_executable(blocking_bench blocking_bench.cpp)
 target_link_libraries(blocking_bench PRIVATE fibers::blocking fibers::thread_pool benchmark::benchmark_main)
 target_compile_options(blocking_bench PRIVATE -Wall -Wextra)
+
+add_executable(coro_bench coro_bench.cpp)
+target_link_libraries(coro_bench PRIVATE fibers::coro fibers::stack fibers::queue benchmark::benchmark_main)
+target_compile_options(coro_bench PRIVATE -Wall -Wextra)
