@@ -102,6 +102,14 @@ public:
         return hook_at(base + (index & (kEntryNodes - 1)) * kStride);
     }
 
+    // Like hook(), for an index read speculatively (possibly stale): nullptr
+    // if this thread does not see the index's chunk yet.
+    Hook* try_hook(NodeIndex index) const noexcept {
+        std::byte* base =
+            directory_->entries[index >> kOffsetBits].base.load(std::memory_order_acquire);
+        return base == nullptr ? nullptr : hook_at(base + (index & (kEntryNodes - 1)) * kStride);
+    }
+
     static T* value(Hook* hook) noexcept {
         return value_of(reinterpret_cast<std::byte*>(hook));
     }

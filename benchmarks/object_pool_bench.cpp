@@ -39,12 +39,15 @@ static_assert(sizeof(Obj) == 64);
 
 constexpr op::PoolOptions kOptions{.shards = 16, .initial_objects = 4096, .grow_chunk = 256};
 
-template <class Pool, op::ShardSelect kSelect>
+// kCache: PoolOptions::thread_cache_capacity (0 = no per-thread caches; the
+// baselines ignore it).
+template <class Pool, op::ShardSelect kSelect, std::size_t kCache = 0>
 struct Configured : Pool {
     Configured() : Pool(with_select()) {}
     static op::PoolOptions with_select() {
         op::PoolOptions options = kOptions;
         options.select = kSelect;
+        options.thread_cache_capacity = kCache;
         return options;
     }
 };
@@ -65,11 +68,19 @@ using SpinHome = Configured<op::baseline::MutexVectorPool<Obj, fibers::sync::Std
                             op::ShardSelect::kHome>;
 
 // Intrusive-node pools (sharded_pool.hpp): shard free list = spin-locked list,
-// tagged Treiber stack (DefaultPool).
+// tagged Treiber stack (DefaultPool's shards), all without per-thread caches.
 using LockedRR = Configured<op::baseline::LockedListPool<Obj>, op::ShardSelect::kRoundRobin>;
 using LockedHome = Configured<op::baseline::LockedListPool<Obj>, op::ShardSelect::kHome>;
 using TaggedRR = Configured<op::TaggedPool<Obj>, op::ShardSelect::kRoundRobin>;
 using TaggedHome = Configured<op::TaggedPool<Obj>, op::ShardSelect::kHome>;
+// Tagged shards with per-thread caches of 4, 8, 16 objects (batch = half);
+// _C8 is DefaultPool's default configuration.
+using TaggedRR_C4 = Configured<op::TaggedPool<Obj>, op::ShardSelect::kRoundRobin, 4>;
+using TaggedRR_C8 = Configured<op::TaggedPool<Obj>, op::ShardSelect::kRoundRobin, 8>;
+using TaggedRR_C16 = Configured<op::TaggedPool<Obj>, op::ShardSelect::kRoundRobin, 16>;
+using TaggedHome_C4 = Configured<op::TaggedPool<Obj>, op::ShardSelect::kHome, 4>;
+using TaggedHome_C8 = Configured<op::TaggedPool<Obj>, op::ShardSelect::kHome, 8>;
+using TaggedHome_C16 = Configured<op::TaggedPool<Obj>, op::ShardSelect::kHome, 16>;
 
 static_assert(op::ObjectPool<NewDelete>);
 static_assert(op::ObjectPool<MutexRR>);
@@ -184,5 +195,11 @@ REGISTER_POOL(LockedRR);
 REGISTER_POOL(LockedHome);
 REGISTER_POOL(TaggedRR);
 REGISTER_POOL(TaggedHome);
+REGISTER_POOL(TaggedRR_C4);
+REGISTER_POOL(TaggedRR_C8);
+REGISTER_POOL(TaggedRR_C16);
+REGISTER_POOL(TaggedHome_C4);
+REGISTER_POOL(TaggedHome_C8);
+REGISTER_POOL(TaggedHome_C16);
 
 }  // namespace

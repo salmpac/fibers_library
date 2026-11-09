@@ -176,6 +176,7 @@ void churn(op::PoolOptions options, int threads, int rounds) {
                     give_back(b, t);
                     pool.release(b);
                 }
+                pool.flush_thread_cache();
             });
         }
         for (auto& w : workers) {
@@ -200,6 +201,7 @@ void single_churn(op::PoolOptions options, int threads, int rounds) {
                     give_back(o, t);
                     pool.release(o);
                 }
+                pool.flush_thread_cache();
             });
         }
         for (auto& w : workers) {
@@ -222,6 +224,7 @@ void hand_off(op::PoolOptions options, int items) {
                 give_back(o, 1);
                 pool.release(o);
             }
+            pool.flush_thread_cache();
         });
         for (int i = 0; i < items; ++i) {
             Object* o = pool.acquire();
@@ -237,6 +240,7 @@ void hand_off(op::PoolOptions options, int items) {
                 give_back(o, 2);
                 pool.release(o);
             }
+            pool.flush_thread_cache();
         });
         consumer.join();
         other.join();
@@ -248,7 +252,109 @@ op::PoolOptions tiny(std::size_t shards, std::size_t objects, op::ShardSelect se
     return op::PoolOptions{.shards = shards,
                            .initial_objects = objects,
                            .grow_chunk = 1,
-                           .select = select};
+                           .select = select,
+                           .thread_cache_capacity = 0};  // uncached scenarios
+}
+
+// Tiny pool with tiny per-thread caches: capacity 2, batch `batch` (2: every
+// refill is a batch pop walking one link, every flush a 2-node chain).
+op::PoolOptions tiny_cached(std::size_t shards, std::size_t objects, op::ShardSelect select,
+                            std::size_t batch) {
+    op::PoolOptions options = tiny(shards, objects, select);
+    options.thread_cache_capacity = 2;
+    options.thread_cache_batch = batch;  // max_cached_threads: default (64)
+    return options;
+}
+
+std::uint32_t my_slot() { return op::detail::pool_thread_state<TwistSync>().cache_slot; }
+
+// The calling thread has a cache in a pool with default max_cached_threads:
+// ids are recycled when threads exit (and, in the simulator, the registry is
+// a TWISTED_STATIC that restarts with every run), so they stay small;
+// otherwise the cached scenarios would silently test the uncached path.
+void check_has_cache_slot() {
+    TWIST_ASSERT_M(my_slot() < 16, "thread id not recycled / not reset: no cache slot");
+}
+
+// ------------------------------------------------------------ batch pop
+
+using Arena = op::detail::NodeArena<Object, TwistSync>;
+using Hook = Arena::Hook;
+using Stack = op::TaggedStack<TwistSync>;
+
+// `threads` threads on ONE tagged stack of `nodes` nodes, each `rounds`
+// times: batch-pop up to 2 nodes (or single-pop every third round), own them,
+// push them back as one chain (or one by one in odd rounds). Pops racing with
+// pushes and other pops hit the speculative walk and its validation.
+void stack_batch_churn(std::size_t nodes, int threads, int rounds) {
+    check([=] {
+        const op::PoolOptions options;
+        Arena arena;
+        Stack::Shared shared(options);
+        Stack stack(options);
+        auto& state = op::detail::pool_thread_state<TwistSync>();
+        {
+            const auto chain = arena.grow(nodes);
+            stack.push_chain(arena, shared, state, chain.first, chain.last);
+        }
+        std::vector<twist::ed::std::thread> workers;
+        for (int t = 1; t <= threads; ++t) {
+            workers.emplace_back([&, t] {
+                auto& me = op::detail::pool_thread_state<TwistSync>();
+                for (int r = 0; r < rounds; ++r) {
+                    std::vector<Hook*> held;
+                    wait_until([&] {
+                        if (r % 3 == 2) {
+                            if (Hook* node = stack.try_pop(arena, shared, me)) {
+                                held.push_back(node);
+                            }
+                        } else {
+                            const auto chain = stack.try_pop_chain(arena, shared, me, 2);
+                            Hook* node = chain.first;
+                            for (std::size_t i = 0; i < chain.size; ++i) {
+                                held.push_back(node);
+                                if (i + 1 < chain.size) {
+                                    node = arena.hook(node->next.load(std::memory_order_relaxed));
+                                }
+                            }
+                            TWIST_ASSERT_M(chain.size == 0 || held.back() == chain.last,
+                                           "chain.last is not the last node");
+                        }
+                        return !held.empty();
+                    });
+                    for (Hook* node : held) {
+                        take(Arena::value(node), t);
+                    }
+                    for (Hook* node : held) {
+                        give_back(Arena::value(node), t);
+                    }
+                    if (r % 2 == 0) {
+                        for (std::size_t i = 0; i + 1 < held.size(); ++i) {
+                            held[i]->next.store(held[i + 1]->self, std::memory_order_relaxed);
+                        }
+                        stack.push_chain(arena, shared, me, held.front(), held.back());
+                    } else {
+                        for (Hook* node : held) {
+                            stack.push_chain(arena, shared, me, node, node);
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+        // All nodes back exactly once.
+        std::vector<Hook*> all;
+        while (Hook* node = stack.try_pop(arena, shared, state)) {
+            TWIST_ASSERT_M(all.size() < nodes, "more nodes than were pushed");
+            for (Hook* seen : all) {
+                TWIST_ASSERT_M(seen != node, "a node was in the stack twice");
+            }
+            all.push_back(node);
+        }
+        TWIST_ASSERT_M(all.size() == nodes, "a node was lost");
+    });
 }
 
 template <class Pool>
@@ -277,4 +383,102 @@ TYPED_TEST(PoolTwist, TwoShardsRoundRobin) {
 
 TYPED_TEST(PoolTwist, CrossThreadHandOff) {
     hand_off<TypeParam>(tiny(1, 2, op::ShardSelect::kHome), kItems);
+}
+
+// ------------------------------------------------------------ per-thread caches
+//
+// Caches of capacity 2 in front of a tiny pool: objects move between threads
+// only through flushes (push_chain) and refills (try_pop_chain), so the
+// Shared<int> payload checks that this hand-off orders the previous owner's
+// writes before the next owner's.
+
+// One shard, 3 objects, 3 threads holding two each (ABA pattern), batch 2:
+// refills race with flushes and with each other on one stack; the pool grows.
+TYPED_TEST(PoolTwist, CachedOneShardAbaChurn) {
+    churn<TypeParam>(tiny_cached(1, 3, op::ShardSelect::kHome, 2), 3, kRounds);
+}
+
+// Same with batch 1 (single-node refills and flushes through the chain path).
+TYPED_TEST(PoolTwist, CachedOneShardAbaChurnBatch1) {
+    churn<TypeParam>(tiny_cached(1, 3, op::ShardSelect::kHome, 1), 3, kRounds);
+}
+
+// Two shards, round robin: refills probe the other shard, flushes spread.
+TYPED_TEST(PoolTwist, CachedTwoShardsRoundRobin) {
+    churn<TypeParam>(tiny_cached(2, 4, op::ShardSelect::kRoundRobin, 2), 3, kRounds);
+}
+
+// Producer acquires, consumer releases: every object migrates via a flush of
+// the consumer's cache and a refill of the producer's.
+TYPED_TEST(PoolTwist, CachedCrossThreadHandOff) {
+    hand_off<TypeParam>(tiny_cached(1, 3, op::ShardSelect::kHome, 2), kItems);
+}
+
+// A thread exits WITHOUT flushing; a thread started after it inherits its id
+// and with it the cached objects. The hand-over of the cache (and of the
+// objects' payloads) is ordered only by the id registry: lease destructor
+// -> registry mutex -> next thread's first pool operation. A third thread
+// churns on the shards meanwhile.
+TYPED_TEST(PoolTwist, CachedSlotInheritedAfterExit) {
+    check([] {
+        TypeParam pool(tiny_cached(1, 3, op::ShardSelect::kHome, 2));
+        check_has_cache_slot();
+        std::uint32_t exited_slot = op::detail::kNoCacheSlot;
+        twist::ed::std::atomic<bool> second_done{false};
+        twist::ed::std::atomic<bool> churner_has_id{false};
+        twist::ed::std::thread churner([&] {
+            check_has_cache_slot();
+            churner_has_id.store(true);
+            for (int r = 0; r < kRounds; ++r) {
+                Object* o = pool.acquire();
+                take(o, 3);
+                give_back(o, 3);
+                pool.release(o);
+            }
+            // Keep this id until `second` has its own: then the only freed
+            // small id is the one `first` returned.
+            wait_until([&] { return second_done.load(); });
+            pool.flush_thread_cache();
+        });
+        // Ids are taken on the first pool operation: let the churner take its
+        // own first, so that it cannot grab the one `first` frees.
+        wait_until([&] { return churner_has_id.load(); });
+        twist::ed::std::thread first([&] {
+            check_has_cache_slot();
+            exited_slot = my_slot();
+            Object* a = pool.acquire();
+            take(a, 1);
+            give_back(a, 1);
+            pool.release(a);  // stays in this thread's cache
+        });
+        first.join();
+        twist::ed::std::thread second([&] {
+            TWIST_ASSERT_M(my_slot() == exited_slot, "the freed id was not reused");
+            TWIST_ASSERT_M(pool.thread_cached_objects() >= 1, "inherited cache is empty");
+            for (int r = 0; r < 2; ++r) {
+                Object* o = pool.acquire();
+                take(o, 2);  // checks the previous owner's payload write is ordered
+                give_back(o, 2);
+                pool.release(o);
+            }
+            pool.flush_thread_cache();
+            second_done.store(true);
+        });
+        second.join();
+        churner.join();
+        verify_all_back(pool);
+    });
+}
+
+// ------------------------------------------------------------ batch pop
+
+// 3 threads, batch pops of up to 2 and pushes (chains and single nodes) on
+// one stack of 3 nodes.
+TEST(StackTwist, BatchPopRacesPushesAndPops) {
+    stack_batch_churn(3, 3, kRounds + 1);
+}
+
+// 4 nodes: two threads can each hold a full batch while the third walks.
+TEST(StackTwist, BatchPopFourNodes) {
+    stack_batch_churn(4, 3, kRounds + 1);
 }

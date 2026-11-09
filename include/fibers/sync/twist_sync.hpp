@@ -17,6 +17,7 @@
 // twist-sim package) under which a missing seq_cst fence is observable.
 
 #include <twist/ed/static/thread_local/var.hpp>
+#include <twist/ed/static/var.hpp>
 #include <twist/ed/std/atomic.hpp>
 #include <twist/ed/std/chrono.hpp>
 #include <twist/ed/std/condition_variable.hpp>
@@ -58,6 +59,15 @@ struct TwistSync {
     template <class T>
     static T& thread_local_instance() noexcept {
         TWISTED_STATIC_THREAD_LOCAL(T, instance);
+        return *instance;
+    }
+
+    // Under the simulator a fresh instance for every simulated run, so
+    // process-wide state (e.g. the object_pool thread-id registry) restarts
+    // with it.
+    template <class T>
+    static T& global_instance() noexcept {
+        TWISTED_STATIC(T, instance);
         return *instance;
     }
 

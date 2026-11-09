@@ -42,6 +42,8 @@ inline void cpu_relax() noexcept {
 //   Thread                       constructible from a callable, has join()
 //   spin_hint()                  called on every busy-wait iteration
 //   thread_local_instance<T>()   per-thread, value-initialised T&
+//   global_instance<T>()         process-wide, value-initialised T& (one per
+//                                T; under the simulator: per simulated run)
 //   random_seed()                fresh entropy for per-thread PRNGs (under a
 //                                checker: its controlled randomness, so runs
 //                                are reproducible yet differ between runs)
@@ -53,6 +55,7 @@ concept SyncPolicy = requires {
     typename S::Thread;
     S::spin_hint();
     { S::template thread_local_instance<int>() } -> std::same_as<int&>;
+    { S::template global_instance<int>() } -> std::same_as<int&>;
     { S::random_seed() } -> std::convertible_to<std::uint64_t>;
 };
 
@@ -79,6 +82,8 @@ concept SleepSyncPolicy = SyncPolicy<S> && requires {
 namespace detail {
 template <class T>
 inline thread_local T std_thread_local_instance{};
+template <class T>
+inline T std_global_instance{};
 }  // namespace detail
 
 struct StdSync {
@@ -95,9 +100,25 @@ struct StdSync {
         std::atomic_thread_fence(order);
     }
 
+    // Types with a destructor (run at thread exit) use a block-scope
+    // thread_local: GCC 16 does not reliably run destructors of
+    // thread_local variable templates (in a minimal repro it skipped them,
+    // or re-ran a dynamic initialiser after the first write), while the
+    // block-scope form works with both compilers. Trivially destructible
+    // types keep the variable template (no guard on access).
     template <class T>
     static T& thread_local_instance() noexcept {
-        return detail::std_thread_local_instance<T>;
+        if constexpr (std::is_trivially_destructible_v<T>) {
+            return detail::std_thread_local_instance<T>;
+        } else {
+            thread_local T instance{};
+            return instance;
+        }
+    }
+
+    template <class T>
+    static T& global_instance() noexcept {
+        return detail::std_global_instance<T>;
     }
 
     static std::uint64_t random_seed() {

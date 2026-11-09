@@ -17,6 +17,10 @@
 //   Hook* try_pop(const Arena&, Shared&, PoolThreadState&);   nullptr if empty
 //   void push_chain(const Arena&, Shared&, PoolThreadState&, Hook* first, Hook* last);
 //     pushes a caller-owned chain first..last (linked via next) at once.
+//   HookChain<Hook> try_pop_chain(const Arena&, Shared&, PoolThreadState&, std::size_t max);
+//     optional (per-thread caches refill with it; ShardedPool falls back to
+//     repeated try_pop): pops up to max >= 1 nodes at once, in stack order
+//     (first = the former top), linked first..last via next; {} if empty.
 //
 // The doubly linked hooks: none of these stacks needs NodeHook::prev. Pushing
 // a whole chain in O(1) needs only its first and last node, and keeping prev
@@ -36,6 +40,15 @@ namespace fibers::object_pool {
 
 struct NoShared {
     explicit NoShared(const PoolOptions&) noexcept {}
+};
+
+// Nodes popped at once: first..last linked via next (last->next is not
+// meaningful), `size` nodes; empty: first == nullptr, size == 0.
+template <class Hook>
+struct HookChain {
+    Hook* first = nullptr;
+    Hook* last = nullptr;
+    std::size_t size = 0;
 };
 
 // ------------------------------------------------------------ TaggedStack
@@ -68,6 +81,70 @@ public:
                                             std::memory_order_acquire,
                                             std::memory_order_acquire)) {
                 return node;
+            }
+        }
+    }
+
+    // Batch pop in one CAS: read the head, walk up to max - 1 links further
+    // through `next`, then swing the head from {tag, first} to
+    // {tag + 1, next of the max-th node}.
+    //
+    // The walk is speculative like the `next` read of try_pop: the nodes may
+    // be popped and re-linked concurrently, so the walked links can be stale
+    // (relaxed atomic reads: racy by design, never a data race; the memory is
+    // type-stable, so they are never dangling). The CAS validates them all at
+    // once: while the head word is unchanged - same index AND same tag, which
+    // every push and pop bumps - no node of the stack was popped, so every
+    // link below the head is the one written before its node was pushed. A
+    // failed CAS reloads the head and the walk starts over. (Strictly, the
+    // pushes' bumps alone rule out ABA: pops only move the head down, so the
+    // same index can come back on top only through a push. Mutation testing
+    // confirms it: dropping only this bump goes unnoticed, dropping it here
+    // and in push_chain is caught. The bump is kept for uniformity with
+    // try_pop and as a margin.)
+    //
+    // Memory orders: acquire on the head load (and on CAS success/failure,
+    // since the walk starts from the value read). Every head change is an RMW,
+    // so the release-CAS of every earlier push heads a release sequence that
+    // reaches the value read: the reader synchronises with all of them, hence
+    // with the links and contents of every node in the stack, not only the
+    // top one. That is what makes the links read in the walk (and the
+    // objects handed out) current once the CAS succeeds.
+    template <class Arena>
+    HookChain<Hook> try_pop_chain(const Arena& arena, Shared&, detail::PoolThreadState&,
+                                  std::size_t max) {
+        std::uint64_t head = head_.load(std::memory_order_acquire);
+        for (;;) {
+            const detail::NodeIndex index = index_of(head);
+            if (index == detail::kNullNode) {
+                return {};
+            }
+            Hook* first = arena.hook(index);
+            Hook* last = first;
+            std::size_t size = 1;
+            detail::NodeIndex next = first->next.load(std::memory_order_relaxed);
+            bool torn = false;
+            while (size < max && next != detail::kNullNode) {
+                // A stale index may name a node whose chunk this thread has
+                // not seen yet (no happens-before with that grow); then the
+                // stack changed under us and the CAS would fail anyway.
+                Hook* node = arena.try_hook(next);
+                if (node == nullptr) {
+                    torn = true;
+                    break;
+                }
+                last = node;
+                next = node->next.load(std::memory_order_relaxed);
+                ++size;
+            }
+            if (torn) {
+                head = head_.load(std::memory_order_acquire);
+                continue;
+            }
+            if (head_.compare_exchange_weak(head, pack(next, tag_of(head) + 1),
+                                            std::memory_order_acquire,
+                                            std::memory_order_acquire)) {
+                return {first, last, size};
             }
         }
     }

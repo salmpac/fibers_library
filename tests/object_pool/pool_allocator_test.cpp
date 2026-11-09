@@ -267,8 +267,9 @@ static_assert(sizeof(op::DefaultPool<Object, fibers::sync::StdSync, op::PmrAlloc
 
 // ------------------------------------------------------------ default allocator
 
-// The default allocator is aligned ::operator new: exactly three allocations
-// for a pool that does not grow (directory, shard array, initial chunk), one
+// The default allocator is aligned ::operator new: exactly four allocations
+// for a pool that does not grow (directory, shard array, per-thread cache
+// array, initial chunk), one
 // more per growth, nothing on acquire/release.
 TEST(PoolAllocator, DefaultUsesAlignedOperatorNewOnly) {
     if (!kCountsGlobalNew) GTEST_SKIP() << "global operator new not replaceable here";
@@ -291,7 +292,7 @@ TEST(PoolAllocator, DefaultUsesAlignedOperatorNewOnly) {
         for (Object* o : held) pool.release(o);
         after_growth = g_global_news.load();
     }
-    EXPECT_EQ(after_construction - before, 3u);
+    EXPECT_EQ(after_construction - before, 4u);
     EXPECT_EQ(after_reuse, after_construction);
     EXPECT_EQ(after_growth - after_reuse, 1u);
 }
@@ -324,7 +325,7 @@ TEST(PoolAllocator, CountingAllocatorSeesAllMemory) {
     {
         CountingPool pool({.shards = 4, .initial_objects = 16}, CountingAllocator(stats, 7));
         EXPECT_EQ(pool.get_allocator().id(), 7);
-        EXPECT_EQ(stats.allocs, 3u);  // directory, shard array, initial chunk
+        EXPECT_EQ(stats.allocs, 4u);  // directory, shard array, cache array, initial chunk
         for (int round = 0; round < 50; ++round) {
             std::array<Object*, 16> held;
             for (Object*& o : held) o = pool.acquire();
@@ -334,11 +335,41 @@ TEST(PoolAllocator, CountingAllocatorSeesAllMemory) {
                 pool.release(o);
             }
         }
-        EXPECT_EQ(stats.allocs, 3u);  // reuse allocates nothing
+        EXPECT_EQ(stats.allocs, 4u);  // reuse allocates nothing
         EXPECT_EQ(stats.deallocs, 0u);
     }
     EXPECT_EQ(g_global_news.load(), global_before);
     EXPECT_EQ(std::set<Object*>(seen.begin(), seen.end()).size(), 16u);
+    EXPECT_EQ(stats.errors, 0u);
+    EXPECT_EQ(stats.deallocs, stats.allocs);
+    EXPECT_EQ(stats.live_count, 0u);
+    EXPECT_EQ(stats.bytes_live, 0u);
+}
+
+// Per-thread caches: one more block (the cache array, cache-line aligned) at
+// construction, nothing on acquire/release (hits, refills, flushes), all
+// returned at destruction, with objects still sitting in the caches.
+TEST(PoolAllocator, ThreadCachesAllocateOnceAtConstruction) {
+    warm_up();
+    AllocStats stats;
+    const std::size_t global_before = g_global_news.load();
+    {
+        CountingPool pool({.shards = 4,
+                           .initial_objects = 64,
+                           .thread_cache_capacity = 8,
+                           .max_cached_threads = 4096},
+                          CountingAllocator(stats, 3));
+        EXPECT_EQ(stats.allocs, 4u);  // directory, shard array, cache array, initial chunk
+        EXPECT_GE(stats.max_align, 64u);
+        for (int round = 0; round < 50; ++round) {
+            std::array<Object*, 40> held;
+            for (Object*& o : held) o = pool.acquire();
+            for (Object* o : held) pool.release(o);
+        }
+        EXPECT_EQ(stats.allocs, 4u);
+        EXPECT_GT(pool.thread_cached_objects(), 0u);
+    }
+    EXPECT_EQ(g_global_news.load(), global_before);
     EXPECT_EQ(stats.errors, 0u);
     EXPECT_EQ(stats.deallocs, stats.allocs);
     EXPECT_EQ(stats.live_count, 0u);
@@ -362,7 +393,7 @@ TEST(PoolAllocator, GrowthAcrossSeveralChunks) {
         for (; capacity < 100; ++growths) capacity += std::max<std::size_t>(3, capacity / 16);
         EXPECT_GT(growths, 20u);
         EXPECT_EQ(pool.capacity(), capacity);
-        EXPECT_EQ(stats.allocs, 2u + 1u + growths);  // directory, shards, initial
+        EXPECT_EQ(stats.allocs, 3u + 1u + growths);  // directory, shards, caches, initial
         EXPECT_EQ(stats.deallocs, 0u);  // type-stable: nothing freed while alive
         for (Object* o : held) pool.release(o);
         EXPECT_EQ(stats.deallocs, 0u);
@@ -390,8 +421,8 @@ TEST(PoolAllocator, InstancesAreKeptApart) {
         EXPECT_TRUE(b_stats.contains(y));
         a.release(x);
         b.release(y);
-        EXPECT_EQ(a_stats.allocs, 3u);
-        EXPECT_EQ(b_stats.allocs, 3u);  // directory, shards, first growth
+        EXPECT_EQ(a_stats.allocs, 4u);
+        EXPECT_EQ(b_stats.allocs, 4u);  // directory, shards, caches, first growth
     }
     for (AllocStats* s : {&a_stats, &b_stats}) {
         EXPECT_EQ(s->errors, 0u);
@@ -543,7 +574,7 @@ TEST(PoolAllocator, PmrDefaultResource) {
         pool.release(pool.acquire());
     }
     std::pmr::set_default_resource(previous);
-    EXPECT_EQ(resource.stats.allocs, 3u);
+    EXPECT_EQ(resource.stats.allocs, 4u);
     EXPECT_EQ(resource.stats.errors, 0u);
     EXPECT_EQ(resource.stats.deallocs, resource.stats.allocs);
 }
