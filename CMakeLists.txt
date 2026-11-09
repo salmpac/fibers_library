@@ -81,6 +81,8 @@ fibers_add_component(object_pool fibers::sync fibers::fail)
 fibers_add_component(poller fibers::sync fibers::fail fibers::thread_pool)
 # Shared-memory SPSC rings for other processes, polled by the poller.
 fibers_add_component(ipc fibers::sync fibers::poller)
+# Blocking-operations pool (spawn_blocking), ops with continuations, RWF_NOWAIT.
+fibers_add_component(blocking fibers::sync fibers::fail fibers::thread_pool)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets

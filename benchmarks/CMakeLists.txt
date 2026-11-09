@@ -9,3 +9,7 @@ endforeach()
 add_executable(poller_bench poller_bench.cpp)
 target_link_libraries(poller_bench PRIVATE fibers::poller fibers::ipc benchmark::benchmark_main)
 target_compile_options(poller_bench PRIVATE -Wall -Wextra)
+
+add_executable(blocking_bench blocking_bench.cpp)
+target_link_libraries(blocking_bench PRIVATE fibers::blocking fibers::thread_pool benchmark::benchmark_main)
+target_compile_options(blocking_bench PRIVATE -Wall -Wextra)
