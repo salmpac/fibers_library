@@ -5,6 +5,16 @@
 | `echo_server` | echo server on fibers: `net::Listener`, an accept loop in a fiber, one fiber per connection (`read_some` -> `write_all`) |
 | `echo_client` | load generator on fibers: N connections, closed loop with D requests in flight per connection, or open loop at a fixed rate with latency from the intended send time (wrk2 style, no coordinated omission); fixed-bucket log-linear histogram |
 | `echo_epoll_baseline` | the reference: plain edge-triggered epoll, one thread per core, an `SO_REUSEPORT` listener per thread, no fibers |
+| `tls_echo` | TLS echo server (`--server`) and client (`--client`) over `fibers::tls` (OpenSSL 3): handshake per connection, optional mTLS / ALPN, handshake and round-trip percentiles; built when `FIBERS_TLS` is on |
+
+`tls_echo` quick start (the build generates a throwaway PKI in
+`build/<preset>/examples/tls_certs/`; run from that directory):
+
+```sh
+tls_echo --server --port=7443 [--client-ca=tls_certs/ca.pem --require-client-cert] [--alpn=h2,http/1.1]
+tls_echo --client --port=7443 --server-name=localhost --connections=64 --messages=2000 --size=64 \
+         [--cert=tls_certs/client.pem --key=tls_certs/client.key] [--alpn=http/1.1]
+```
 
 ## Build
 
