@@ -3,6 +3,11 @@
 //   tls_echo --server --port=7443 --cert=server.pem --key=server.key
 //            [--client-ca=ca.pem --require-client-cert] [--alpn=h2,http/1.1]
 //            [--workers=2 --pollers=1 --stack-kb=64 --max-connections=10000]
+//            [--ciphers=STR]  TLS 1.2 cipher list (OpenSSL syntax; e.g.
+//                             "DEFAULT:@SECLEVEL=0" for old test clients)
+//            [--http10]       instead of echoing, answer one HTTP/1.0 request
+//                             and close (what `openssl s_server -www` does;
+//                             the external fuzz harness compares the two)
 //   tls_echo --client --host=127.0.0.1 --port=7443 --ca=ca.pem
 //            [--server-name=localhost] [--cert=client.pem --key=client.key]
 //            [--alpn=http/1.1] [--connections=16 --messages=1000 --size=64]
@@ -107,6 +112,29 @@ struct Server {
     std::atomic<std::uint64_t> failed_handshakes{0};
 };
 
+bool server_http10 = false;
+
+// --http10: read up to the end of the request head, answer, close_notify.
+void serve_http10(tls::TlsStream& s) {
+    char buf[8192];
+    std::size_t have = 0;
+    while (have < sizeof buf) {
+        const net::IoResult r = s.read_some(buf + have, sizeof buf - have);
+        if (!r || r.bytes == 0) {
+            return;
+        }
+        have += r.bytes;
+        if (std::string_view(buf, have).find("\r\n\r\n") != std::string_view::npos) {
+            static constexpr char kReply[] =
+                "HTTP/1.0 200 ok\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nok\n";
+            if (s.write_all(kReply, sizeof kReply - 1)) {
+                static_cast<void>(s.shutdown());
+            }
+            return;
+        }
+    }
+}
+
 void serve(Server& server, tls::TlsStream& s) {
     static_cast<void>(s.set_nodelay());
     if (const int e = s.handshake(); e != 0) {
@@ -114,6 +142,11 @@ void serve(Server& server, tls::TlsStream& s) {
         std::fprintf(stderr, "tls_echo: handshake failed: %s: %s\n", std::strerror(e),
                      s.error_string(reason, sizeof reason));
         server.failed_handshakes.fetch_add(1, std::memory_order_relaxed);
+        static_cast<void>(s.close());
+        return;
+    }
+    if (server_http10) {
+        serve_http10(s);
         static_cast<void>(s.close());
         return;
     }
@@ -145,6 +178,10 @@ int run_server(const examples::Args& args) {
                                                                        : tls::VerifyClient::kOptional;
     }
     so.alpn = std::span<const std::string_view>(protos, nprotos);
+    if (const char* ciphers = args.get("ciphers"); ciphers != nullptr) {
+        so.tls12_ciphers = ciphers;
+    }
+    server_http10 = args.get("http10") != nullptr;
     tls::TlsContext ctx;
     if (const int e = ctx.init_server(so); e != 0) {
         char reason[256];
@@ -208,9 +245,12 @@ int run_server(const examples::Args& args) {
 
     int signal_number = 0;
     sigwait(&signals, &signal_number);
-    std::printf("tls_echo server: signal %d, %llu accepted, %llu failed handshakes\n", signal_number,
-                static_cast<unsigned long long>(server->accepted.load()),
-                static_cast<unsigned long long>(server->failed_handshakes.load()));
+    // `active` > 0 here means connections whose fibers are still parked:
+    // with every client gone that would be a hang (external fuzz runs check it).
+    std::printf("tls_echo server: signal %d, %llu accepted, %llu failed handshakes, %zu still active\n",
+                signal_number, static_cast<unsigned long long>(server->accepted.load()),
+                static_cast<unsigned long long>(server->failed_handshakes.load()), server->active.load());
+    std::fflush(stdout);
     static_cast<void>(listener.close());
     while (!accept_done.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

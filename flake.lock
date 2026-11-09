@@ -19,6 +19,8 @@
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
+        "tlsfuzzer": "tlsfuzzer",
+        "tlslite-ng": "tlslite-ng",
         "twist": "twist",
         "twist-backward": "twist-backward",
         "twist-fmt": "twist-fmt",
@@ -28,6 +30,38 @@
         "twist-spin-wait": "twist-spin-wait",
         "twist-sure": "twist-sure",
         "twist-sure-stack": "twist-sure-stack"
+      }
+    },
+    "tlsfuzzer": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784459703,
+        "narHash": "sha256-+8Lf1sbuu8D7fiWt6iyNgY5RZv3bKXbwuEZARj2NXPQ=",
+        "owner": "tlsfuzzer",
+        "repo": "tlsfuzzer",
+        "rev": "5eebc4464e5197a7f7392fb9acda99cfc32441f7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tlsfuzzer",
+        "repo": "tlsfuzzer",
+        "type": "github"
+      }
+    },
+    "tlslite-ng": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785754391,
+        "narHash": "sha256-l0M/pR0RUF2e03dpLh/qL8no22/owGn0dgGTq/yV/Y4=",
+        "owner": "tlsfuzzer",
+        "repo": "tlslite-ng",
+        "rev": "7e95ea1a86c0d42d8d931ff14134d31f01ce1d76",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tlsfuzzer",
+        "repo": "tlslite-ng",
+        "type": "github"
       }
     },
     "twist": {

@@ -24,6 +24,12 @@
     twist-fmt = { url = "github:fmtlib/fmt"; flake = false; };
     twist-json = { url = "https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz"; flake = false; };
     twist-backward = { url = "github:bombela/backward-cpp"; flake = false; };
+
+    # tlsfuzzer (GPL-2.0, not in nixpkgs): an external tool the TLS fuzz
+    # script (tests/tls/external/) runs against tls_echo. Only invoked, never
+    # copied into the repo. Its matching tlslite-ng (LGPL-2.1) is pinned too.
+    tlsfuzzer = { url = "github:tlsfuzzer/tlsfuzzer"; flake = false; };
+    tlslite-ng = { url = "github:tlsfuzzer/tlslite-ng"; flake = false; };
   };
 
   outputs = { self, nixpkgs, ... }@inputs:
@@ -145,8 +151,21 @@
               # tests (s_client / s_server).
               pkgs.openssl
               pkgs.openssl.bin
+              # External TLS test tools (GPL; invoked only, see
+              # tests/tls/external/): testssl.sh, and tlsfuzzer's Python.
+              pkgs.testssl
+              # python-ecdsa is flagged in nixpkgs for its timing side
+              # channel (CVE-2024-23342); irrelevant for a local test client,
+              # so the flag is lifted for this one package only.
+              (pkgs.python3.withPackages (ps: [
+                (ps.ecdsa.overridePythonAttrs (old: {
+                  meta = old.meta // { knownVulnerabilities = [ ]; };
+                }))
+              ]))
             ];
             hardeningDisable = [ "fortify" ];
+            FIBERS_TLSFUZZER = "${inputs.tlsfuzzer}";
+            FIBERS_TLSLITE_NG = "${inputs.tlslite-ng}";
           } // twistDepsEnv pkgs);
         });
     };
