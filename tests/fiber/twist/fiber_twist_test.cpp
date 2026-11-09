@@ -305,7 +305,7 @@ TEST(FiberTwist, MutexCounter) {
         constexpr int kFibers = 3;
         constexpr int kIncrements = 2;
         Counter done{0};
-        Mutex mutex;
+        Mutex mutex(0);  // park at once
         twist::assist::Shared<int> counter{0};
         MiniScheduler scheduler(2);
         for (int f = 0; f < kFibers; ++f) {
@@ -326,13 +326,14 @@ TEST(FiberTwist, MutexCounter) {
     });
 }
 
-// Mutex without yields: short critical sections, barging, try_lock.
+// Mutex without yields: short critical sections, barging, try_lock, a few
+// spins before parking.
 TEST(FiberTwist, MutexBargingTryLock) {
     map_test_stacks();
     check([] {
         constexpr int kFibers = 3;
         Counter done{0};
-        Mutex mutex;
+        Mutex mutex(4);  // spin a little before parking
         twist::assist::Shared<int> counter{0};
         MiniScheduler scheduler(2);
         for (int f = 0; f < kFibers; ++f) {

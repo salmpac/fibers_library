@@ -431,11 +431,15 @@ TEST(FiberDeathTest, YieldOutsideFiber) {
 
 // ------------------------------------------------------------------- Mutex
 
-TEST(Mutex, CounterUnderContention) {
+// Parking at once (spins 0) and spinning first (spins 64).
+class MutexSpins : public ::testing::TestWithParam<std::size_t> {};
+INSTANTIATE_TEST_SUITE_P(Mutex, MutexSpins, ::testing::Values(std::size_t{0}, std::size_t{64}));
+
+TEST_P(MutexSpins, CounterUnderContention) {
     constexpr int kFibers = 64;
     constexpr int kIncrements = 2'000;
     Latch done(kFibers);
-    fiber::Mutex mutex;
+    fiber::Mutex mutex(GetParam());
     std::int64_t counter = 0;  // guarded by mutex
     std::atomic<int> inside{0};
     std::atomic<bool> overlap{false};
@@ -465,13 +469,13 @@ TEST(Mutex, CounterUnderContention) {
 // Lost wakeups would leave fibers parked forever (the latch times out).
 // Short critical sections with yields outside them: fibers keep barging
 // past woken ones, which must re-queue and still get through.
-TEST(Mutex, BargingNoLostWakeups) {
+TEST_P(MutexSpins, BargingNoLostWakeups) {
     constexpr int kRounds = 20;
     constexpr int kFibers = 200;
     constexpr int kIterations = 200;
     for (int round = 0; round < kRounds; ++round) {
         Latch done(kFibers);
-        fiber::Mutex mutex;
+        fiber::Mutex mutex(GetParam());
         std::int64_t counter = 0;
         Scheduler scheduler(options(4));
         for (int i = 0; i < kFibers; ++i) {

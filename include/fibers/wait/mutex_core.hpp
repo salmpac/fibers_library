@@ -85,6 +85,7 @@
 // has a window "tail exchanged, prev->next not linked yet" where unlock()
 // would have to spin. Reversing a taken batch is O(1) amortised per waiter.
 
+#include <cstddef>
 #include <cstdint>
 
 #include "fibers/fail/fail_fast.hpp"
@@ -109,6 +110,21 @@ public:
     // One RMW, no waiting.
     bool try_lock() noexcept {
         return (state_.fetch_or(kLocked, std::memory_order_acquire) & kLocked) == 0;
+    }
+
+    // Up to `spins` rounds of test-and-test-and-set: a plain load while the
+    // lock is held (no RMW traffic on the line), one try_lock() when it looks
+    // free. Worth it only while the holder runs on another thread: critical
+    // sections are short, so it usually releases within tens of ns, which is
+    // cheaper than a park/wake round trip.
+    bool try_lock_spinning(std::size_t spins) noexcept {
+        for (std::size_t i = 0; i < spins; ++i) {
+            if ((state_.load(std::memory_order_relaxed) & kLocked) == 0 && try_lock()) {
+                return true;
+            }
+            Sync::spin_hint();
+        }
+        return false;
     }
 
     // true: acquired. false: `node` (next is overwritten, self / wake must
