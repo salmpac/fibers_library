@@ -16,6 +16,7 @@
 #include "fibers/queue/locked_spsc_queue.hpp"
 #include "fibers/queue/sharded_queue.hpp"
 #include "fibers/queue/slow_queue.hpp"
+#include "fibers/sync/affinity.hpp"
 #include "fibers/sync/sync.hpp"
 #include "fibers/thread_pool/task.hpp"
 
@@ -44,6 +45,9 @@ struct ThreadPoolOptions {
     // holds at least this many tasks or the task went to its overflow_box,
     // some worker is parked and none is searching. Minimum 1.
     std::size_t overload_wake_threshold = 2;
+    // Pin worker i to cpus[i % cpus.size()] (empty: no pinning). See
+    // fibers/sync/affinity.hpp.
+    sync::CpuList cpus{};
 };
 
 // Interface of a worker's main_box. The owning worker is its only producer;
@@ -384,6 +388,7 @@ private:
     bool stopping() const noexcept { return stop_requested_.load(std::memory_order_acquire); }
 
     void worker_loop(std::size_t index) {
+        sync::pin_current_thread<Sync>(options_.cpus.for_thread(index), "ThreadPool");
         detail::ThreadState& state = detail::thread_state<Sync>();
         state.pool = this;
         state.worker = index;

@@ -41,6 +41,7 @@
 
 #include "fibers/fail/fail_fast.hpp"
 #include "fibers/poller/poller.hpp"
+#include "fibers/sync/affinity.hpp"
 #include "fibers/sync/sync.hpp"
 
 namespace fibers::poller {
@@ -48,6 +49,8 @@ namespace fibers::poller {
 struct PollerPoolOptions {
     std::size_t num_pollers = 1;
     PollerOptions poller{};  // options of every poller
+    // Pin poller i to cpus[i % cpus.size()] (empty: poller.cpu for all).
+    sync::CpuList cpus{};
 };
 
 namespace detail {
@@ -90,7 +93,11 @@ public:
             fail::fail_fast("PollerPool: out of memory");
         }
         for (std::size_t i = 0; i < size_; ++i) {
-            pollers_[i].emplace(sink, options.poller, backend_args...);
+            PollerOptions poller_options = options.poller;
+            if (!options.cpus.empty()) {
+                poller_options.cpu = options.cpus.for_thread(i);
+            }
+            pollers_[i].emplace(sink, poller_options, backend_args...);
         }
     }
 

@@ -75,6 +75,7 @@
 #include "fibers/poller/backend.hpp"
 #include "fibers/poller/epoll_backend.hpp"
 #include "fibers/poller/sources.hpp"
+#include "fibers/sync/affinity.hpp"
 #include "fibers/sync/sync.hpp"
 #include "fibers/poller/task_batch.hpp"
 #include "fibers/poller/timer.hpp"
@@ -94,6 +95,9 @@ struct PollerOptions {
     // Sleep backoff when some Checkable cannot arm.
     Duration min_backoff = std::chrono::microseconds(50);
     Duration max_backoff = std::chrono::milliseconds(1);
+    // Pin the reactor thread to this CPU at its start (-1: no pinning).
+    // PollerPool fills it from PollerPoolOptions::cpus.
+    int cpu = -1;
 };
 
 // Counters for tests / monitoring (relaxed, approximate while running).
@@ -261,6 +265,7 @@ private:
     // ---- reactor loop -----------------------------------------------------
 
     void run() noexcept {
+        sync::pin_current_thread<Sync>(options_.cpu, "Poller");
         backend_.on_reactor_start();
         std::size_t idle_rounds = 0;
         std::size_t rounds = 0;

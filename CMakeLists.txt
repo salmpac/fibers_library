@@ -66,8 +66,9 @@ function(fibers_add_component name)
     install(TARGETS fibers_${name} EXPORT fibersTargets)
 endfunction()
 
-# Sync policy (StdSync / TwistSync, policy concepts), cpu_relax, SpinLock.
-fibers_add_component(sync Threads::Threads)
+# Sync policy (StdSync / TwistSync, policy concepts), cpu_relax, SpinLock,
+# CpuList / thread pinning.
+fibers_add_component(sync Threads::Threads fibers::fail)
 # fail_fast(): the library never throws.
 fibers_add_component(fail)
 # SPSC / SPMC / sharded / slow queues. (LockFreeSPMCQueue's Task slot uses

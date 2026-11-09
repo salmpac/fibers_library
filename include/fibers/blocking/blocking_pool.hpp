@@ -137,12 +137,15 @@
 
 #include "fibers/blocking/op_queue.hpp"
 #include "fibers/blocking/ops.hpp"
+#include "fibers/sync/affinity.hpp"
 #include "fibers/sync/sync.hpp"
 
 namespace fibers::blocking {
 
 struct BlockingPoolOptions {
     std::size_t num_threads = 2;  // minimum 1
+    // Pin thread i to cpus[i % cpus.size()] (empty: no pinning).
+    sync::CpuList cpus{};
 };
 
 template <sync::ParkingSyncPolicy Sync = sync::StdSync>
@@ -155,7 +158,10 @@ public:
           slots_(std::make_unique<Slot[]>(num_threads_)) {
         threads_.reserve(num_threads_);
         for (std::size_t i = 0; i < num_threads_; ++i) {
-            threads_.emplace_back([this, i] { thread_loop(i); });
+            threads_.emplace_back([this, i, cpu = options.cpus.for_thread(i)] {
+                sync::pin_current_thread<Sync>(cpu, "BlockingPool");
+                thread_loop(i);
+            });
         }
     }
 
