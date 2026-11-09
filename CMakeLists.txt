@@ -12,6 +12,7 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 option(FIBERS_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
 option(FIBERS_BUILD_BENCHMARKS "Build benchmarks (needs google benchmark)" OFF)
+option(FIBERS_BUILD_EXAMPLES "Build examples (echo server / client / epoll baseline)" OFF)
 option(FIBERS_TWIST "Fetch Twist and build concurrency tests with TwistSync" OFF)
 option(FIBERS_LINK_COMPILE_COMMANDS
     "Symlink compile_commands.json from the build dir into the source dir (for clangd)" OFF)
@@ -120,6 +121,10 @@ endif()
 
 if(FIBERS_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
+endif()
+
+if(FIBERS_BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()
 
 if(FIBERS_LINK_COMPILE_COMMANDS AND PROJECT_IS_TOP_LEVEL

@@ -1,0 +1,175 @@
+# Examples: echo over fibers
+
+| binary | what |
+|---|---|
+| `echo_server` | echo server on fibers: `net::Listener`, an accept loop in a fiber, one fiber per connection (`read_some` -> `write_all`) |
+| `echo_client` | load generator on fibers: N connections, closed loop with D requests in flight per connection, or open loop at a fixed rate with latency from the intended send time (wrk2 style, no coordinated omission); fixed-bucket log-linear histogram |
+| `echo_epoll_baseline` | the reference: plain edge-triggered epoll, one thread per core, an `SO_REUSEPORT` listener per thread, no fibers |
+
+## Build
+
+Examples are off by default (`FIBERS_BUILD_EXAMPLES`); the `clang-release` and
+`gcc-release` presets turn them on:
+
+```sh
+cmake --preset clang-release && cmake --build --preset clang-release -j 6 \
+    --target echo_server echo_client echo_epoll_baseline
+# binaries: build/clang-release/examples/
+```
+
+or with any configuration: `-DFIBERS_BUILD_EXAMPLES=ON`.
+
+## Run
+
+```sh
+# server: 1 worker on CPU 0, its poller on CPU 2, the (idle) blocking thread on 1
+echo_server --port=7000 --workers=1 --worker-cpus=0 --pollers=1 --poller-cpus=2 \
+            --blocking=1 --blocking-cpus=1 [--max-connections=20000 --stack-kb=64]
+
+# reference server on the same core(s)
+echo_epoll_baseline --port=7000 --threads=1 --cpus=0
+
+# closed loop: 100 connections x 16 requests in flight, 64-byte messages
+echo_client --port=7000 --connections=100 --pipeline=16 --size=64 --duration=6 --warmup=2 \
+            --workers=9 --worker-cpus=4-7,9,12-15 --pollers=1 --poller-cpus=8 --idle-spins=64
+
+# open loop: 100k requests/s in total over 1000 connections
+echo_client --port=7000 --connections=1000 --rate=100000 --duration=6 --warmup=2 ...
+```
+
+CPU lists use the Linux cpulist syntax (`0,2,4-6`); thread i of a pool goes to
+`cpus[i % n]` (`sync::CpuList`, `ThreadPoolOptions::cpus`,
+`PollerPoolOptions::cpus`, `BlockingPoolOptions::cpus`). The client retries
+`ECONNREFUSED` (20 ms apart, `--connect-retries`), so it can be started right
+after the server. It prints a `RESULT ...` line (rps, p50/p90/p99/p99.9/max in
+microseconds, its own CPU time in cores). The servers stop on SIGINT / SIGTERM
+(the fiber server closes the listener and every connection, waits for the
+fibers, stops the scheduler).
+
+`--idle-spins=N` sets `ThreadPoolOptions::idle_spins_before_park`. An idle
+worker spins (searching for work) for that many pauses before it parks; the
+default (8192) keeps idle workers busy for tens of microseconds, so a
+lightly loaded process shows ~100% CPU on every worker. The client in the
+measurements below uses 64, so its CPU usage is work, not spinning.
+
+## Measurements
+
+i5-14400F (6 P-cores with HT, CPUs 0-11, of which 10-11 are isolated and
+unused; 4 E-cores, CPUs 12-15), Linux 7.2, clang-release, loopback TCP,
+64-byte messages, 2 s warm-up + 6 s measured per point, an otherwise idle
+machine (other processes used median 0.2, at most 0.8 cores during the
+windows). The server runs on distinct physical P-cores within 0-9, and the
+HT siblings of the server's cores stay idle. The client gets the rest of
+0-9 plus the E-cores: one client worker per CPU, its poller on CPU 8,
+`--idle-spins=64`. Placement was checked by sampling `/proc/<pid>/task/*`
+(the last CPU each thread ran on, plus its affinity) during every run.
+
+Loopback TCP runs the receive path on the SENDER's CPU: the client's sends
+cost server-side work on client CPUs and vice versa. Absolute numbers are
+therefore kernel-dominated. What matters is fiber vs epoll on the same cores.
+
+Cells: **requests/s**, then p50 / p99 / p99.9 latency in µs (ms where noted).
+Saturation marks:
+
+- ᶜ: some client CPU was ≥ 95 % busy. The point is client-bound, or bound by
+  both sides, so its rps is a lower bound for the server.
+- ˢ: some server CPU was ≥ 95 % busy. On the fiber server this mark is
+  mostly *not* a bottleneck. An idle `ThreadPool` worker spins for
+  `idle_spins_before_park` (8192 pauses by default) before it parks, so a
+  fiber worker shows ~100 % even at 1 connection. The epoll threads block in
+  `epoll_wait`, so for them ˢ means really busy.
+
+The last column is the client's CPU: busy cores summed over its CPUs, and
+the busiest CPU in %, for each of the three servers.
+
+#### Group A
+
+fiber: worker 0, poller 2; epoll 1t: 0; epoll 2t: 0,2; client: workers 4-7,9,12-15, poller 8 (the fiber server's idle blocking thread: CPU 1).
+
+| conns x depth | fiber 1w+1p | epoll 1t | epoll 2t | client CPU (cores busy / max CPU %) |
+|---|---|---|---|---|
+| 1 x 1 | **55k**ˢ 14.2 / 26.9 / 283 | **84k** 10.6 / 17.2 / 154 | **87k** 10.6 / 16.6 / 110 | 0.9 / 11% ; 1.5 / 23% ; 1.5 / 23% |
+| 1 x 16 | **314k**ˢ 43.5 / 80.9 / 87.0 | **332k** 48.6 / 59.9 / 72.7 | **271k** 47.6 / 85.0 / 91.1 | 1.3 / 23% ; 1.4 / 90% ; 1.3 / 32% |
+| 100 x 1 | **335k**ˢ 291 / 373 / 778 | **368k**ˢ 266 / 356 / 406 | **713k**ˢ 141 / 203 / 324 | 4.8 / 50% ; 4.9 / 51% ; 6.5 / 68% |
+| 100 x 16 | **2457k**ᶜˢ 614 / 2.0ms / 4.7ms | **2716k**ᶜˢ 582 / 942 / 2.5ms | **2678k**ᶜˢ 63.0 / 8.2ms / 21ms | 9.0 / 98% ; 9.1 / 99% ; 9.3 / 100% |
+| 1000 x 1 | **305k**ˢ 3.3ms / 4.1ms / 4.9ms | **339k**ˢ 2.9ms / 4.1ms / 6.0ms | **685k**ˢ 1.4ms / 2.0ms / 2.6ms | 4.7 / 49% ; 4.8 / 51% ; 6.6 / 68% |
+| 1000 x 16 | **2010k**ᶜˢ 7.9ms / 10ms / 12ms | **1887k**ˢ 8.5ms / 9.8ms / 11ms | **2620k**ᶜˢ 60.9 / 141ms / 323ms | 8.7 / 95% ; 7.6 / 83% ; 9.3 / 100% |
+| 10000 x 1 | **228k** 12ms / 81ms / 83ms | **250k** 40ms / 58ms / 64ms | **480k** 21ms / 25ms / 27ms | 4.2 / 45% ; 4.0 / 42% ; 5.5 / 57% |
+| 10000 x 16 | **2005k**ˢ 121ms / 161ms / 224ms | **2242k** 61ms / 182ms / 203ms | **2855k** 10ms / 432ms / 499ms | 8.6 / 92% ; 8.7 / 94% ; 8.8 / 95% |
+
+#### Group B
+
+fiber: workers 0,4, poller 2; epoll 2t: 0,4; epoll 3t: 0,2,4; client: workers 6,7,9,12-15, poller 8 (the fiber server's idle blocking thread: CPU 1).
+
+| conns x depth | fiber 2w+1p | epoll 2t | epoll 3t | client CPU (cores busy / max CPU %) |
+|---|---|---|---|---|
+| 1 x 1 | **55k**ˢ 17.2 / 25.3 / 170 | **85k** 10.9 / 15.7 / 95.2 | **81k** 11.1 / 18.7 / 154 | 0.8 / 13% ; 1.4 / 23% ; 1.3 / 21% |
+| 1 x 16 | **279k**ˢ 48.6 / 80.9 / 99.3 | **297k** 49.7 / 85.0 / 93.2 | **309k** 45.6 / 82.9 / 93.2 | 1.3 / 24% ; 1.3 / 35% ; 1.3 / 34% |
+| 100 x 1 | **636k**ˢ 154 / 315 / 446 | **739k**ˢ 137 / 195 / 219 | **1032k**ᶜˢ 97.3 / 145 / 223 | 5.8 / 78% ; 6.3 / 85% ; 7.4 / 97% |
+| 100 x 16 | **1831k**ᶜˢ 65.0 / 7.1ms / 191ms | **1914k**ᶜˢ 60.9 / 16ms / 149ms | **1810k**ᶜˢ 63.0 / 82.9 / 281ms | 7.3 / 100% ; 7.4 / 100% ; 7.4 / 100% |
+| 1000 x 1 | **604k**ˢ 1.3ms / 4.5ms / 5.6ms | **698k**ˢ 1.4ms / 2.0ms / 2.3ms | **1036k**ᶜˢ 926 / 1.5ms / 2.6ms | 5.9 / 80% ; 6.3 / 84% ; 7.6 / 99% |
+| 1000 x 16 | **1831k**ᶜˢ 66.6 / 306ms / 914ms | **1927k**ᶜˢ 60.9 / 237ms / 1091ms | **1805k**ᶜˢ 63.0 / 82.9 / 2919ms | 7.3 / 100% ; 7.4 / 100% ; 7.4 / 100% |
+| 10000 x 1 | **477k** 13ms / 41ms / 42ms | **494k** 20ms / 23ms / 24ms | **733k** 14ms / 16ms / 18ms | 5.1 / 70% ; 5.1 / 66% ; 6.4 / 82% |
+| 10000 x 16 | **1875k** 66.6 / 1393ms / 2131ms | **1984k** 62.0 / 2315ms / 2651ms | **1789k** 64.0 / 3389ms / 5973ms | 6.9 / 94% ; 6.9 / 93% ; 6.9 / 93% |
+
+#### Group C
+
+fiber: workers 0,4,6, poller 2; epoll 3t: 0,4,6; epoll 4t: 0,2,4,6; client: workers 9,12-15, poller 8 (the fiber server's idle blocking thread: CPU 1).
+
+| conns x depth | fiber 3w+1p | epoll 3t | epoll 4t | client CPU (cores busy / max CPU %) |
+|---|---|---|---|---|
+| 1 x 1 | **55k**ˢ 16.0 / 28.4 / 203 | **81k** 12.2 / 17.2 / 70.7 | **82k** 11.6 / 15.7 / 63.0 | 0.9 / 18% ; 1.2 / 23% ; 1.2 / 24% |
+| 1 x 16 | **222k**ˢ 72.7 / 82.9 / 145 | **226k** 78.8 / 87.0 / 95.2 | **220k** 78.8 / 85.0 / 91.1 | 1.3 / 32% ; 1.3 / 36% ; 1.2 / 32% |
+| 100 x 1 | **944k**ᶜˢ 103 / 215 / 299 | **1032k**ᶜˢ 91.1 / 227 / 274 | **1034k**ᶜ 89.1 / 240 / 291 | 5.5 / 100% ; 5.6 / 100% ; 5.6 / 100% |
+| 100 x 16 | **1195k**ᶜˢ 70.7 / 80.9 / 348ms | **1181k**ᶜ 68.6 / 85.0 / 91.1 | **1121k**ᶜ 72.7 / 89.1 / 93.2 | 5.3 / 100% ; 5.4 / 100% ; 5.4 / 100% |
+| 1000 x 1 | **935k**ᶜˢ 199 / 3.6ms / 4.4ms | **1036k**ᶜˢ 178 / 5.6ms / 5.8ms | **1009k**ᶜ 158 / 5.7ms / 6.0ms | 5.6 / 100% ; 5.6 / 100% ; 5.6 / 100% |
+| 1000 x 16 | **1193k**ᶜˢ 70.7 / 78.8 / 82.9 | **1149k**ᶜ 70.7 / 89.1 / 91.1 | **1108k**ᶜ 76.8 / 91.1 / 93.2 | 5.3 / 100% ; 5.4 / 100% ; 5.4 / 100% |
+| 10000 x 1 | **747k** 8.8ms / 72ms / 81ms | **759k** 13ms / 18ms / 19ms | **932k** 120 / 127ms / 127ms | 5.3 / 94% ; 5.3 / 93% ; 5.2 / 94% |
+| 10000 x 16 | **1194k**ᶜˢ 70.7 / 78.8 / 82.9 | **1142k**ᶜ 72.7 / 87.0 / 89.1 | **1122k**ᶜ 74.8 / 87.0 / 91.1 | 5.1 / 96% ; 5.2 / 97% ; 5.2 / 96% |
+
+#### Open loop (group A placement): latency from the intended send time
+
+| conns | target | fiber 1w+1p | epoll 1t | epoll 2t | client CPU (cores busy / max %) |
+|---|---|---|---|---|---|
+| 100 | 50k/s | 50kˢ 23.3 / 795 / 2.8ms / 4.8ms | 50k 16.6 / 133 / 2.0ms / 2.9ms | 50k 16.6 / 166 / 2.4ms / 4.8ms | 1.0 / 16% ; 1.2 / 27% ; 1.4 / 24% |
+| 100 | 100k/s | 100kˢ 20.7 / 876 / 4.3ms / 8.9ms | 100k 16.6 / 42.5 / 2.5ms / 4.1ms | 100k 16.6 / 219 / 2.3ms / 3.1ms | 2.9 / 82% ; 1.8 / 24% ; 2.5 / 34% |
+| 100 | 200k/s | 200kˢ 21.2 / 647 / 2.7ms / 4.1ms | 200k 15.7 / 25.9 / 680 / 1.8ms | 200k 16.0 / 195 / 2.5ms / 4.6ms | 4.4 / 72% ; 4.0 / 43% ; 4.0 / 44% |
+| 1000 | 50k/s | 50kˢ 24.3 / 909 / 2.7ms / 3.6ms | 50k 17.7 / 348 / 2.3ms / 3.7ms | 50k 17.7 / 332 / 2.1ms / 4.2ms | 0.8 / 20% ; 1.2 / 16% ; 1.1 / 15% |
+| 1000 | 100k/s | 100kˢ 22.3 / 141 / 2.3ms / 3.5ms | 100k 17.2 / 26.9 / 2.5ms / 3.7ms | 100k 17.2 / 28.9 / 1.8ms / 3.0ms | 2.8 / 32% ; 2.1 / 52% ; 2.7 / 34% |
+| 1000 | 200k/s | 200kˢ 22.3 / 128 / 2.7ms / 5.6ms | 200k 16.3 / 25.3 / 2.4ms / 3.7ms | 200k 16.6 / 68.6 / 2.3ms / 3.5ms | 4.2 / 45% ; 4.1 / 45% ; 4.4 / 73% |
+
+
+### Reading the numbers
+
+- **Per-request cost, unsaturated (1 connection, and N x 1 in group A).**
+  The fiber server needs one worker core *plus* a poller core to match one
+  epoll thread. 100 x 1 gives 335k vs 368k rps, 1000 x 1 gives 305k vs
+  339k, and epoll on both cores (2t) does about twice that. Every request
+  costs the fiber server two thread hand-offs: the poller's `epoll_wait`
+  reports readiness, the fiber's Task goes through the `ThreadPool`
+  mail_box to the worker, and the worker resumes the fiber. The epoll loop
+  reads and writes in place. With one connection that hand-off shows as
+  latency: p50 14 µs vs 10.6 µs, and 55k vs 84k rps.
+- **Scaling with workers (groups B, C).** Two fiber workers + poller reach
+  636k at 100 x 1 against 739k for epoll on the two worker cores (1032k on
+  all three). With three workers (group C) most points are client-bound
+  (ᶜ). There the fiber server matches epoll at 3 threads: 944k vs 1032k at
+  100 x 1, and 1.19M vs 1.18M at 100 x 16.
+- **Pipelined points (x 16)** are client-bound or both-bound everywhere
+  (ᶜ). They show that the fiber server keeps up with what this client can
+  generate (2.0-2.5M rps on 2 cores) but do not rank the servers.
+- **Many connections (10000 x 1).** Throughput is close (228k vs 250k
+  single core, 747k vs 759k three cores) but the fiber server's tail is
+  much longer: p99 81 ms vs 58 ms, and 72 ms vs 18 ms in group C, while
+  its p50 is lower. Readiness for 10k connections arrives in bursts and
+  is handed to the worker in poller batches. Order then depends on the
+  ThreadPool queues (mail_box shards, overflow_box), not on arrival order,
+  so some connections wait several rounds. The epoll loop serves them in
+  `epoll_wait` order.
+- **Open loop (latency at a fixed rate, no coordinated omission).** At
+  50k-200k rps the fiber server's p50 is 20-24 µs vs 16-17 µs for epoll,
+  and its p99 is 0.13-0.9 ms vs 0.03-0.35 ms. The extra p99 comes from
+  waking a parked worker (futex) and a sleeping poller (eventfd) when
+  requests arrive spread out, which a busy-polling epoll thread does not
+  pay. p99.9 and max are similar (2-5 ms; scheduler noise of the loopback
+  path on both).

@@ -47,7 +47,8 @@
       "displayName": "Clang Release",
       "inherits": "clang",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "FIBERS_BUILD_EXAMPLES": "ON"
       }
     },
     {
@@ -112,7 +113,8 @@
       "displayName": "GCC Release",
       "inherits": "gcc",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "FIBERS_BUILD_EXAMPLES": "ON"
       }
     }
   ],
