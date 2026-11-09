@@ -929,6 +929,57 @@ TEST(Tls, FullDuplexWithKeyUpdates) {
     EXPECT_EQ(BIO_wpending(SSL_get_wbio(client.native_handle())), 0);
 }
 
+// The peer requests a KeyUpdate while this side only reads (tlsfuzzer's
+// "app data split, conversation with KeyUpdate msg"): the reader must send
+// the answering KeyUpdate itself, without any write by the application.
+TEST(Tls, ReaderAnswersKeyUpdateRequest) {
+    Scheduler scheduler(options(2));
+    TlsContext sctx;
+    TlsContext cctx;
+    ASSERT_EQ(make_server(sctx), 0);
+    ASSERT_EQ(make_client(cctx), 0);
+    TlsStream server;
+    TlsStream client;
+    Duo duo;
+    ASSERT_EQ(duo.setup(scheduler, server, sctx, client, cctx), 0);
+    ASSERT_EQ(handshake_both(scheduler, server, client).client, 0);
+    Latch done(2);
+    std::atomic<int> server_result{-100};
+    std::atomic<int> client_result{-100};
+    fiber::go(scheduler, [&]() noexcept {
+        char buf[16];
+        const IoResult r = server.read_exact(buf, 6);  // "GET", then the KeyUpdate, then "abc"
+        server_result.store(r.error != 0 ? r.error : (r.bytes == 6 ? 0 : -1));
+        done.count_down();
+    });
+    fiber::go(scheduler, [&]() noexcept {
+        int e = client.write_all("GET", 3).error;
+        if (e == 0) {
+            e = client.key_update(true);
+        }
+        // The server's answer arrives while nobody on the server writes; it
+        // carries no data, so this read ends with the deadline once the
+        // answer (if any) has been consumed.
+        if (e == 0) {
+            static_cast<void>(client.set_read_deadline(scheduler.now() + 200ms));
+            char c;
+            const IoResult r = client.read_some(&c, 1);
+            e = r.error == ETIMEDOUT ? 0 : (r.error != 0 ? r.error : -1);
+        }
+        if (e == 0) {
+            e = client.write_all("abc", 3).error;
+        }
+        client_result.store(e);
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(server_result.load(), 0);
+    EXPECT_EQ(client_result.load(), 0);
+    // Answered: nothing pending on the server, nothing left in its ring.
+    EXPECT_EQ(SSL_get_key_update_type(server.native_handle()), SSL_KEY_UPDATE_NONE);
+    EXPECT_EQ(BIO_wpending(SSL_get_wbio(server.native_handle())), 0);
+}
+
 // Many connections over loopback TCP on two workers: a fiber per
 // connection on both sides, handshakes interleaved with echo traffic.
 TEST(Tls, ManyConnectionsFewWorkers) {

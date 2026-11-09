@@ -80,7 +80,9 @@
 //              OpenSSL calls (never across a park).
 //   Order: read_mu_ -> write_mu_ -> ssl_mu_. handshake() holds both roles.
 //
-// A reader can produce output too (TLS 1.3 KeyUpdate responses, alerts).
+// A reader can produce output too (TLS 1.3 KeyUpdate responses, which
+// OpenSSL would otherwise defer to the next SSL_write -- never, for a
+// read-only connection -- so the reader writes them at once; alerts).
 // It never waits for the write role for that: it try_lock()s it and
 // flushes only if nobody holds it; otherwise the holder flushes it. The
 // holder releases the role with "unlock, re-check the ring under ssl_mu_,
@@ -580,6 +582,27 @@ private:
         return Step::kFatal;
     }
 
+    // The peer asked for a KeyUpdate (TLS 1.3, update_requested): OpenSSL
+    // only notes it in SSL_read and writes our answer with the next
+    // SSL_write. A connection whose application only reads would never
+    // answer (tlsfuzzer's test-tls13-keyupdate waits for it and times out),
+    // so the reader writes it now; the caller flushes it like any reader
+    // output. ssl_mu_ held.
+    void answer_key_update() noexcept {
+        if (SSL_get_key_update_type(ssl_) == SSL_KEY_UPDATE_NONE) {
+            return;
+        }
+        // What ssl3_write_bytes does before the next record: enter the state
+        // machine with the pending update (not_requested: an answer), which
+        // SSL_do_handshake then writes. SSL_key_update refuses while a write
+        // is half done (BAD_WRITE_RETRY): the writer's retry sends it then.
+        ERR_clear_error();
+        if (SSL_key_update(ssl_, SSL_KEY_UPDATE_NOT_REQUESTED) == 1) {
+            static_cast<void>(SSL_do_handshake(ssl_));  // 1, or WANT_WRITE: flushed and retried later
+        }
+        ERR_clear_error();
+    }
+
     // At handshake completion: what the accessors return.
     void capture_session() noexcept {
         const unsigned char* proto = nullptr;
@@ -754,6 +777,9 @@ private:
                 if (SSL_read_ex(ssl_, buffer, size, &got) != 1) {
                     step = classify(0);
                     error = fatal_;
+                }
+                if (step != Step::kFatal) {
+                    answer_key_update();
                 }
                 output = BIO_ctrl_pending(net_bio_) > 0;
             }
