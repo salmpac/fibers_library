@@ -684,17 +684,22 @@ private:
     }
 
     // Round-robin, but skip up to kTargetScan - 1 workers that are not
-    // RUNNING; if all candidates are parked, the first one is used (and woken).
+    // RUNNING; if all candidates are parked, the first one is used (and woken)
+    // and the cursor moves on by one only: advancing it past every scanned
+    // candidate would, with count <= kTargetScan workers all parked, move it
+    // by exactly `count` and send every external submit to the same worker.
     Worker& pick_target(detail::ThreadState& state) noexcept {
         const std::size_t count = workers_.size();
-        Worker& first = *workers_[state.next_worker++ % count];
+        const std::size_t start = state.next_worker++;
+        Worker& first = *workers_[start % count];
         if (first.state.load(std::memory_order_relaxed) == kRunning) [[likely]] {
             return first;
         }
         const std::size_t scan = std::min(count, kTargetScan);
         for (std::size_t i = 1; i < scan; ++i) {
-            Worker& candidate = *workers_[state.next_worker++ % count];
+            Worker& candidate = *workers_[(start + i) % count];
             if (candidate.state.load(std::memory_order_relaxed) == kRunning) {
+                state.next_worker = start + i + 1;
                 return candidate;
             }
         }
