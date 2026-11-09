@@ -11,6 +11,11 @@
 #   expired.pem / .key              SAN localhost, validity in 2020
 #   other_ca.pem / .key             a CA nobody trusts
 #   untrusted.pem / .key            SAN localhost, issued by other_ca
+#   int_ca.pem / .key               intermediate CA under ca
+#   chained.pem / .key              SAN localhost, issued by int_ca (leaf only:
+#                                   an incomplete chain); chained_full.pem =
+#                                   leaf + int_ca (the chain a server must send)
+#   self_signed.pem / .key          SAN localhost, self-signed
 set -eu
 out=$1
 openssl=$2
@@ -45,6 +50,17 @@ leaf server_rsa ca "/CN=localhost" "DNS:localhost,IP:127.0.0.1,IP:::1" serverAut
 leaf client ca "/CN=fibers test client" "" clientAuth "$ec" -days 3650
 leaf wronghost ca "/CN=wrong.example" "DNS:wrong.example" serverAuth "$ec" -days 3650
 leaf untrusted other_ca "/CN=localhost" "DNS:localhost,IP:127.0.0.1" serverAuth "$ec" -days 3650
+# Intermediate CA and a leaf under it (badssl.com-style chain scenarios).
+"$openssl" req $ec -nodes -keyout int_ca.key -out int_ca.csr -subj "/CN=fibers test intermediate CA" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+"$openssl" x509 -req -in int_ca.csr -CA ca.pem -CAkey ca.key -set_serial "0x$("$openssl" rand -hex 8)" \
+    -copy_extensions copyall -out int_ca.pem -days 3650 2>/dev/null
+rm -f int_ca.csr
+leaf chained int_ca "/CN=localhost" "DNS:localhost,IP:127.0.0.1" serverAuth "$ec" -days 3650
+cat chained.pem int_ca.pem > chained_full.pem
+"$openssl" req -x509 $ec -nodes -keyout self_signed.key -out self_signed.pem -days 3650 -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
 # Expired: -not_before / -not_after need OpenSSL >= 3.4; on older CLIs the
 # certificate is missing and the test skips.
 leaf expired ca "/CN=localhost" "DNS:localhost,IP:127.0.0.1" serverAuth "$ec" \

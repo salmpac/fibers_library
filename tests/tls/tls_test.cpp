@@ -727,6 +727,76 @@ TEST(Tls, Alpn) {
     EXPECT_EQ(o.client_alpn, "");
 }
 
+// ---- badssl.com-style scenarios (all certificates generated locally) --------------
+//
+// The client must fail with an error, never hang: every case runs under the
+// bounded Latch of connect_once / the test body. (Expired, wrong host and
+// untrusted root are covered above.)
+
+TEST(TlsBadSsl, SelfSigned) {
+    ServerSpec s;
+    s.cert = "self_signed.pem";
+    s.key = "self_signed.key";
+    const Outcome o = connect_once(s, {});
+    EXPECT_EQ(o.client, EPROTO);
+    EXPECT_EQ(o.client_verify, X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT) << o.client_error;
+    EXPECT_NE(o.server, 0);
+}
+
+// The server sends only its leaf, not the intermediate: the client cannot
+// build the chain (no AIA fetching).
+TEST(TlsBadSsl, IncompleteChain) {
+    ServerSpec s;
+    s.cert = "chained.pem";
+    s.key = "chained.key";
+    const Outcome o = connect_once(s, {});
+    EXPECT_EQ(o.client, EPROTO);
+    EXPECT_EQ(o.client_verify, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY) << o.client_error;
+    // With the intermediate in the chain file it verifies.
+    s.cert = "chained_full.pem";
+    const Outcome full = connect_once(s, {});
+    EXPECT_EQ(full.client, 0) << full.client_error;
+    EXPECT_EQ(full.server, 0);
+    EXPECT_EQ(full.client_read, 0);
+}
+
+// A peer that is not speaking TLS at all ("http on the https port"), and
+// one that closes in the middle of the handshake.
+TEST(TlsBadSsl, PlaintextOrClosingPeer) {
+    for (const bool plaintext : {true, false}) {
+        SCOPED_TRACE(plaintext ? "plaintext reply" : "close mid-handshake");
+        Scheduler scheduler(options(2));
+        TlsContext cctx;
+        ASSERT_EQ(make_client(cctx), 0);
+        TlsStream client;
+        Pair pair;
+        ASSERT_EQ(client.transport().adopt(scheduler, pair.fd[1]), 0);
+        ASSERT_EQ(client.upgrade_client(cctx, "localhost"), 0);
+        Latch done(1);
+        std::atomic<int> result{-100};
+        fiber::go(scheduler, [&]() noexcept {
+            result.store(client.handshake());
+            done.count_down();
+        });
+        // Read the ClientHello, then answer with garbage or just close.
+        char hello[4096];
+        ASSERT_GT(::read(pair.fd[0], hello, sizeof hello), 0);
+        if (plaintext) {
+            const char reply[] = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+            ASSERT_EQ(::write(pair.fd[0], reply, sizeof reply - 1), static_cast<ssize_t>(sizeof reply - 1));
+        }
+        ::close(pair.fd[0]);
+        ASSERT_TRUE(done.wait());
+        EXPECT_EQ(result.load(), plaintext ? EPROTO : ECONNABORTED);
+        char buf[256];
+        if (plaintext) {
+            EXPECT_TRUE(contains(client.error_string(buf, sizeof buf), "wrong version number") ||
+                        contains(client.error_string(buf, sizeof buf), "packet length too long"))
+                << client.error_string(buf, sizeof buf);
+        }
+    }
+}
+
 // ---- bulk data, full duplex, many connections -------------------------------------
 
 // Sends `total` pattern bytes in chunks of varying size.
