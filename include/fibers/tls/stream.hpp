@@ -611,7 +611,12 @@ private:
             fail::fail_fast("tls: inbound ring full while OpenSSL wants more input");
         }
         // Outside ssl_mu_: only the read role writes the inbound ring's free
-        // space, and nobody else commits to it (see the top comment).
+        // space, and nobody else commits to it (see the top comment). The
+        // ring is empty here (OpenSSL reports WANT_READ only when a read of
+        // its half found nothing, and only we add data), so its offset is 0
+        // and stays 0 until our BIO_nwrite: bss_bio resets the offset when a
+        // read empties the ring, which cannot happen to an empty ring. So
+        // the commit lands exactly where the bytes were written.
         const IoResult r = transport_.read_some(space, static_cast<std::size_t>(avail));
         std::lock_guard ssl_guard(ssl_mu_);
         if (r.bytes > 0) {
