@@ -323,6 +323,138 @@ TEST(NetTwist, OpenPublishesToEnterAndClose) {
     });
 }
 
+// ---- deadlines ---------------------------------------------------------------
+
+// Data arrives (producer thread + fake-fd edge) while the reader's deadline
+// (1 ms of simulated time) fires: the readiness callback and the deadline
+// timer race for the waiter in the word, first CAS wins. The reader gets
+// either the message or ETIMEDOUT -- never hangs -- and after a timeout,
+// clearing the deadline lets it read the message. Then close() with the
+// deadline machinery used (timers withdrawn), the descriptor is destroyed,
+// and the poller goes on (one more edge for the unwatched fd).
+TEST(NetTwist, DataRacesDeadline) {
+    map_test_stacks();
+    check(
+        [] {
+            Counter done{0};
+            twist::ed::std::atomic<int> available{0};
+            twist::assist::Shared<int> payload{0};
+            twist::ed::std::atomic<int> outcome{0};
+            NetScheduler scheduler(2);
+            const int fd = scheduler.backend().create_event();
+            {
+                PollDesc desc;
+                TWIST_ASSERT_M(desc.open(scheduler, fd) == 0, "open");
+                fiber::go(scheduler, [&]() noexcept {
+                    PollDesc::Guard guard(desc);
+                    auto op = [&]() noexcept -> ssize_t {
+                        return available.load(std::memory_order_acquire) > 0 ? 1 : -EAGAIN;
+                    };
+                    TWIST_ASSERT_M(desc.set_deadline(Direction::kRead, desc.poller()->now() +
+                                                                           std::chrono::milliseconds(1)) == 0,
+                                   "set deadline");
+                    ssize_t r = desc.io(Direction::kRead, op);
+                    if (r == -ETIMEDOUT) {
+                        outcome.store(2);
+                        TWIST_ASSERT_M(desc.set_deadline(Direction::kRead, fibers::poller::TimePoint{}) == 0,
+                                       "clear deadline");
+                        r = desc.io(Direction::kRead, op);
+                    } else {
+                        outcome.store(1);
+                    }
+                    TWIST_ASSERT_M(r == 1, "the message, at the latest after the deadline is cleared");
+                    TWIST_ASSERT_M(payload.Read() == 1, "the message's data");
+                    done.fetch_add(1);
+                });
+                twist::ed::std::thread producer([&] {
+                    payload.Write(1);
+                    available.store(1, std::memory_order_release);
+                    scheduler.backend().signal(fd);
+                });
+                producer.join();
+                FIBERS_WAIT_BOUNDED(done.load() == 1, "reader never woken (lost edge or lost timeout)");
+                {
+                    // Leave a deadline timer pending, then close.
+                    PollDesc::Guard guard(desc);
+                    TWIST_ASSERT_M(desc.set_deadline(Direction::kWrite,
+                                                     desc.poller()->now() + std::chrono::hours(1)) == 0,
+                                   "arm a far deadline");
+                }
+                TWIST_ASSERT_M(desc.close() == 0, "close");
+            }  // ~PollDesc: no timer of it may be left in the poller
+            scheduler.backend().signal(fd);
+            scheduler.stop();
+            TWIST_ASSERT_M(outcome.load() != 0, "an outcome");
+        },
+        500);
+}
+
+// A deadline in the past, set from another thread, expires a reader that
+// is parking right now: the setter's expired = 1 + load of the word against
+// the reader's arm + load of expired (the Dekker in io()). A lost timeout
+// hangs the reader.
+TEST(NetTwist, PastDeadlineRacesArm) {
+    map_test_stacks();
+    check([] {
+        Counter done{0};
+        twist::ed::std::atomic<bool> entered{false};
+        NetScheduler scheduler(2);
+        const int fd = scheduler.backend().create_event();
+        PollDesc desc;
+        TWIST_ASSERT_M(desc.open(scheduler, fd) == 0, "open");
+        fiber::go(scheduler, [&]() noexcept {
+            PollDesc::Guard guard(desc);
+            entered.store(true);
+            const ssize_t r = desc.io(Direction::kRead, []() noexcept -> ssize_t { return -EAGAIN; });
+            TWIST_ASSERT_M(r == -ETIMEDOUT, "timed out");
+            done.fetch_add(1);
+        });
+        twist::ed::std::thread setter([&] {
+            FIBERS_WAIT_BOUNDED(entered.load(), "reader never started");
+            PollDesc::Guard guard(desc);
+            TWIST_ASSERT_M(desc.set_deadline(Direction::kRead, desc.poller()->now() -
+                                                                   std::chrono::milliseconds(1)) == 0,
+                           "set deadline");
+        });
+        setter.join();
+        FIBERS_WAIT_BOUNDED(done.load() == 1, "reader never woken (lost timeout)");
+        TWIST_ASSERT_M(desc.close() == 0, "close");
+        scheduler.stop();
+    });
+}
+
+// The deadline TIMER (poller thread) fires while the reader keeps re-arming:
+// a producer sends edges without data, so the reader wakes, finds nothing
+// and arms again, around the expiry. A lost timeout hangs it.
+TEST(NetTwist, DeadlineTimerRacesRearm) {
+    map_test_stacks();
+    check([] {
+        Counter done{0};
+        NetScheduler scheduler(2);
+        const int fd = scheduler.backend().create_event();
+        PollDesc desc;
+        TWIST_ASSERT_M(desc.open(scheduler, fd) == 0, "open");
+        fiber::go(scheduler, [&]() noexcept {
+            PollDesc::Guard guard(desc);
+            TWIST_ASSERT_M(desc.set_deadline(Direction::kRead, desc.poller()->now() +
+                                                                   std::chrono::microseconds(1)) == 0,
+                           "set deadline");
+            const ssize_t r = desc.io(Direction::kRead, []() noexcept -> ssize_t { return -EAGAIN; });
+            TWIST_ASSERT_M(r == -ETIMEDOUT, "timed out");
+            done.fetch_add(1);
+        });
+        twist::ed::std::thread producer([&] {
+            for (int i = 0; i < 3; ++i) {
+                scheduler.backend().signal(fd);  // an edge, no data
+            }
+        });
+        producer.join();
+        FIBERS_WAIT_BOUNDED(done.load() == 1, "reader never woken (lost timeout)");
+        TWIST_ASSERT_M(desc.close() == 0, "close");
+        scheduler.stop();
+    });
+}
+
 // Edges and close at once: the reader consumes what arrives until close()
 // cancels it; the producer keeps signalling. No lost edge before the close,
 // no wake after it, and the poller never sees the descriptor after its

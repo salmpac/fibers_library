@@ -703,6 +703,251 @@ TEST(Net, PeerResetWakesReaderAndWriter) {
     EXPECT_EQ(listener.close(), 0);
 }
 
+// ---- deadlines ------------------------------------------------------------------
+
+using Clock = std::chrono::steady_clock;
+
+// A parked reader times out at its deadline; the direction stays expired
+// (even with data available) until the deadline is moved.
+TEST(NetDeadline, ReadDeadlineWakesParkedReader) {
+    Latch done(1);
+    std::atomic<int> first{-1};
+    std::atomic<std::int64_t> waited_ms{-1};
+    Scheduler scheduler(options(2));
+    Pair pair;
+    Stream a;
+    ASSERT_EQ(a.adopt(scheduler, pair.fd[0]), 0);
+    fiber::go(scheduler, [&]() noexcept {
+        const auto start = Clock::now();
+        static_cast<void>(a.set_read_deadline(scheduler.now() + 50ms));
+        char c;
+        first.store(a.read_some(&c, 1).error);
+        waited_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(first.load(), ETIMEDOUT);
+    EXPECT_GE(waited_ms.load(), 49);
+    EXPECT_LT(waited_ms.load(), 2000);
+    EXPECT_TRUE(a.poll_desc().expired_approx(Direction::kRead));
+    ASSERT_EQ(::write(pair.fd[1], "d", 1), 1);
+    char c = 0;
+    EXPECT_EQ(a.read_some(&c, 1).error, ETIMEDOUT) << "expired until moved, data or not";
+    EXPECT_TRUE(a.write_all("w", 1)) << "the write direction is unaffected";
+    ASSERT_EQ(a.set_read_deadline(fibers::poller::TimePoint{}), 0);  // cleared
+    const IoResult r = a.read_some(&c, 1);
+    EXPECT_TRUE(r);
+    EXPECT_EQ(c, 'd');
+    EXPECT_EQ(a.close(), 0);
+    ::close(pair.fd[1]);
+}
+
+TEST(NetDeadline, PastDeadlineExpiresAtOnce) {
+    Scheduler scheduler(options(1));
+    Pair pair;
+    Stream a;
+    ASSERT_EQ(a.adopt(scheduler, pair.fd[0]), 0);
+    ASSERT_EQ(::write(pair.fd[1], "p", 1), 1);
+    ASSERT_EQ(a.set_read_deadline(scheduler.now() - 1ms), 0);
+    char c;
+    EXPECT_EQ(a.read_some(&c, 1).error, ETIMEDOUT);
+    ASSERT_EQ(a.set_read_deadline(fibers::poller::TimePoint::max()), 0);
+    EXPECT_EQ(a.read_some(&c, 1).bytes, 1u);
+    EXPECT_EQ(a.close(), 0);
+    EXPECT_EQ(a.set_read_deadline(scheduler.now()), EBADF);
+    ::close(pair.fd[1]);
+}
+
+// Moving the deadline of a parked reader later keeps it waiting; moving it
+// earlier than the pending timer (the control-timer path) fires on time.
+TEST(NetDeadline, MovingTheDeadline) {
+    Scheduler scheduler(options(2));
+    for (const bool earlier : {false, true}) {
+        Latch done(1);
+        std::atomic<int> result{-1};
+        std::atomic<std::int64_t> waited_ms{-1};
+        Pair pair;
+        Stream a;
+        ASSERT_EQ(a.adopt(scheduler, pair.fd[0]), 0);
+        const auto start = Clock::now();
+        ASSERT_EQ(a.set_read_deadline(scheduler.now() + (earlier ? 10s : 60ms)), 0);
+        fiber::go(scheduler, [&]() noexcept {
+            char c;
+            result.store(a.read_some(&c, 1).error);
+            waited_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
+            done.count_down();
+        });
+        ASSERT_TRUE(eventually([&] { return parked(a, Direction::kRead); }));
+        ASSERT_EQ(a.set_read_deadline(scheduler.now() + (earlier ? 80ms : 400ms)), 0);
+        ASSERT_TRUE(done.wait());
+        EXPECT_EQ(result.load(), ETIMEDOUT);
+        if (earlier) {
+            EXPECT_GE(waited_ms.load(), 79);
+            EXPECT_LT(waited_ms.load(), 3000) << "the earlier deadline, not the first one";
+        } else {
+            EXPECT_GE(waited_ms.load(), 399) << "the old deadline must not fire";
+        }
+        EXPECT_EQ(a.close(), 0);
+        ::close(pair.fd[1]);
+    }
+}
+
+// Data that arrives before the deadline is read; the deadline then still
+// applies to later reads.
+TEST(NetDeadline, DataBeforeDeadline) {
+    Latch done(1);
+    std::atomic<int> first{-1};
+    std::atomic<int> second{-1};
+    Scheduler scheduler(options(2));
+    Pair pair;
+    Stream a;
+    ASSERT_EQ(a.adopt(scheduler, pair.fd[0]), 0);
+    ASSERT_EQ(a.set_read_deadline(scheduler.now() + 300ms), 0);
+    fiber::go(scheduler, [&]() noexcept {
+        char c;
+        const IoResult r = a.read_some(&c, 1);
+        first.store(r ? static_cast<int>(r.bytes) : -r.error);
+        second.store(a.read_some(&c, 1).error);
+        done.count_down();
+    });
+    std::this_thread::sleep_for(20ms);
+    ASSERT_EQ(::write(pair.fd[1], "x", 1), 1);
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(first.load(), 1);
+    EXPECT_EQ(second.load(), ETIMEDOUT);
+    EXPECT_EQ(a.close(), 0);
+    ::close(pair.fd[1]);
+}
+
+// write_all against a full send buffer: ETIMEDOUT with the bytes written.
+TEST(NetDeadline, WriteDeadline) {
+    Latch done(1);
+    std::atomic<int> error{-1};
+    std::atomic<std::size_t> bytes{0};
+    Scheduler scheduler(options(2));
+    Pair pair;
+    Stream a;
+    ASSERT_EQ(a.adopt(scheduler, pair.fd[0]), 0);
+    std::vector<char> big(16 << 20, 'b');
+    fiber::go(scheduler, [&]() noexcept {
+        static_cast<void>(a.set_write_deadline(scheduler.now() + 50ms));
+        const IoResult r = a.write_all(big.data(), big.size());
+        error.store(r.error);
+        bytes.store(r.bytes);
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(error.load(), ETIMEDOUT);
+    EXPECT_GT(bytes.load(), 0u);
+    EXPECT_LT(bytes.load(), big.size());
+    EXPECT_EQ(a.close(), 0);
+    ::close(pair.fd[1]);
+}
+
+TEST(NetDeadline, AcceptDeadline) {
+    Latch done(1);
+    std::atomic<int> result{-1};
+    Scheduler scheduler(options(2));
+    Listener listener;
+    ASSERT_EQ(listener.listen(scheduler, Endpoint::loopback_v4(0)), 0);
+    Stream s;
+    fiber::go(scheduler, [&]() noexcept {
+        static_cast<void>(listener.set_accept_deadline(scheduler.now() + 30ms));
+        result.store(listener.accept(s));
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(result.load(), ETIMEDOUT);
+    EXPECT_FALSE(s.is_open_approx());
+    EXPECT_EQ(listener.close(), 0);
+}
+
+// close() with armed deadline timers (one pending far in the future, one
+// moved earlier through the control timer) takes them back from the
+// poller: the Stream's memory is freed right after, and the pollers keep
+// working (ASan would catch a timer node left behind). Reopening a closed
+// stream starts without deadlines.
+TEST(NetDeadline, CloseLeavesNoTimerBehind) {
+    Scheduler scheduler(options(2, 1));
+    for (int round = 0; round < 50; ++round) {
+        Pair pair;
+        auto s = std::make_unique<Stream>();
+        ASSERT_EQ(s->adopt(scheduler, pair.fd[0]), 0);
+        ASSERT_EQ(s->set_read_deadline(scheduler.now() + 1h), 0);
+        ASSERT_EQ(s->set_write_deadline(scheduler.now() + 2h), 0);
+        if (round % 2 == 0) {
+            ASSERT_EQ(s->set_write_deadline(scheduler.now() + 30min), 0);  // control timer
+        }
+        ASSERT_EQ(s->close(), 0);
+        s.reset();  // the timer nodes' memory goes away here
+        ::close(pair.fd[1]);
+    }
+    Stream reused;
+    for (int round = 0; round < 2; ++round) {
+        Pair pair;
+        ASSERT_EQ(reused.adopt(scheduler, pair.fd[0]), 0);
+        ASSERT_FALSE(reused.poll_desc().expired_approx(Direction::kRead));
+        ASSERT_EQ(reused.set_read_deadline(scheduler.now() - 1ms), 0);  // expired
+        ASSERT_EQ(reused.close(), 0);
+        ::close(pair.fd[1]);
+    }
+    // The pollers still run timers.
+    Latch slept(1);
+    fiber::go(scheduler, [&]() noexcept {
+        this_fiber::sleep_for(5ms);
+        slept.count_down();
+    });
+    ASSERT_TRUE(slept.wait());
+}
+
+// The per-request pattern: a later deadline before every read of an echo
+// exchange (no timer per call: the pending one re-arms itself).
+TEST(NetDeadline, DeadlinePerRequest) {
+    Latch done(2);
+    std::atomic<int> errors{0};
+    Scheduler scheduler(options(2));
+    Pair pair;
+    Stream a;
+    Stream b;
+    ASSERT_EQ(a.adopt(scheduler, pair.fd[0]), 0);
+    ASSERT_EQ(b.adopt(scheduler, pair.fd[1]), 0);
+    fiber::go(scheduler, [&]() noexcept {
+        char buf[64];
+        for (;;) {
+            static_cast<void>(b.set_read_deadline(scheduler.now() + 2s));
+            const IoResult r = b.read_some(buf, sizeof buf);
+            if (!r || r.bytes == 0) {
+                if (!r) {
+                    errors.fetch_add(1);
+                }
+                break;
+            }
+            if (!b.write_all(buf, r.bytes)) {
+                errors.fetch_add(1);
+                break;
+            }
+        }
+        done.count_down();
+    });
+    fiber::go(scheduler, [&]() noexcept {
+        char out[16] = "0123456789abcde";
+        char in[16];
+        for (int i = 0; i < 5000; ++i) {
+            static_cast<void>(a.set_deadline(scheduler.now() + 2s));
+            if (!a.write_all(out, sizeof out) || a.read_exact(in, sizeof in).bytes != sizeof in) {
+                errors.fetch_add(1);
+                break;
+            }
+        }
+        static_cast<void>(a.shutdown(SHUT_WR));
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(errors.load(), 0);
+    EXPECT_EQ(a.close(), 0);
+    EXPECT_EQ(b.close(), 0);
+}
+
 using NetDeathTest = ::testing::Test;
 
 TEST(NetDeathTest, WaitOutsideFiberFailsFast) {

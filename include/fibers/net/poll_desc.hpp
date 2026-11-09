@@ -147,10 +147,72 @@
 // timer is delivered with kCancelled on the destroying thread while the
 // poller is stopped, where unwatch is allowed too: same code.
 //
-// Timeouts / cancellation (open): a deadline would be one more party that
-// may take the waiter out of the word (CAS waiter -> EMPTY with result
-// ETIMEDOUT) — the word already makes "first CAS wins" exact, so a timer
-// callback on the owning poller fits without changing the states above.
+// Deadlines (Go's SetReadDeadline / SetWriteDeadline)
+// ---------------------------------------------------
+// Per direction: `desired` (the deadline set by the user), one Timer node
+// IN the descriptor (not on a fiber's stack: it lives as long as the
+// socket and needs no cancellation), `armed_at` (when that node fires, or
+// none), and an atomic `expired` flag. desired / armed_at and the node's
+// scheduling are guarded by a small spin lock (set_deadline() on any
+// thread, the timer callbacks on the poller thread; Go's pd.lock); the
+// operations never take it.
+//
+//   set_deadline(t):  desired = t, expired = 0 (moving a deadline revives
+//                     the direction), then
+//                       none          -> nothing (a pending node finds no
+//                                        deadline when it fires);
+//                       t <= now      -> expire now (below);
+//                       node idle     -> schedule it at t;
+//                       node at <= t  -> nothing: it fires first and
+//                                        re-arms for t (later deadlines,
+//                                        the common per-request pattern,
+//                                        cost no poller round trip);
+//                       node at > t   -> post the control timer (once): on
+//                                        the poller thread it withdraw()s
+//                                        the node (Poller::withdraw: eager
+//                                        removal from the heap) and re-arms
+//                                        it at t.
+//   node fires:       armed_at = none; re-evaluate the CURRENT desired:
+//                     none -> idle; in the future -> re-arm; due -> expire.
+//                     So a timer armed for an older deadline is harmless
+//                     (no generation counter needed: the callback never acts
+//                     on the deadline it was armed for, only on the current
+//                     one, under the lock).
+//   expire:           expired = 1 (seq_cst), then take the waiter out of the
+//                     word (CAS waiter -> EMPTY, seq_cst) and wake it with
+//                     result 0; the readiness callback and the expiry race
+//                     on that one word, first CAS wins. The woken waiter
+//                     re-checks `expired` at the top of its loop: still set
+//                     -> ETIMEDOUT; cleared (the deadline moved meanwhile)
+//                     -> it simply goes on waiting.
+//   io():             every attempt starts with `expired` -> ETIMEDOUT.
+//                     After a successful arm it re-reads `expired`
+//                     (seq_cst): if set, it takes itself back out (CAS
+//                     &waiter -> EMPTY) and returns ETIMEDOUT, or, if a
+//                     waker took it first, parks to consume that wake.
+//
+// The arm / re-read pair against the expirer's store / take is a Dekker
+// handshake on two words (the waiter's word and `expired`), so all four are
+// seq_cst: in the single total order either the waiter's re-read sees the
+// expiry or the expirer's load sees the waiter. (Two RMWs would not need
+// it; the expirer's flag store is a plain store.) Under Twist's x86-TSO
+// store buffering, a release-only expiry store loses a timeout
+// (NetTwist.PastDeadlineRacesArm hangs); the waiter's side (an RMW, then a
+// load) is ordered on x86 whatever the C++ order, so weakening it is not
+// observable there -- it is needed by the C++ model (ARM, POWER).
+//
+// Why one node + a control node instead of one node per deadline: a Timer
+// can only be rescheduled once its callback has run, and Poller::cancel()
+// keeps referencing the node until its lazy removal. Later deadlines need
+// no new node (re-arm at fire), earlier ones are handled by withdraw() on
+// the poller thread, so two nodes per direction would not cover a third
+// earlier move anyway, and the control node does, exactly.
+//
+// close() and timers: the close callback (poller thread) takes the lock,
+// sets closing_ (set_deadline() then fails with ECANCELED and arms
+// nothing) and withdraw()s every pending node (deadline timers and the
+// control timer). After it no timer of this descriptor is in the poller:
+// the PollDesc may be destroyed or reopened.
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -160,6 +222,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <utility>
 
 #include "fibers/fail/fail_fast.hpp"
@@ -168,6 +231,7 @@
 #include "fibers/poller/sources.hpp"
 #include "fibers/poller/task_batch.hpp"
 #include "fibers/queue/lock_free_spmc_queue.hpp"
+#include "fibers/sync/spin_lock.hpp"
 #include "fibers/sync/sync.hpp"
 #include "fibers/thread_pool/task.hpp"
 
@@ -244,6 +308,21 @@ public:
         rd_.store(kEmpty, std::memory_order_relaxed);
         wr_.store(kEmpty, std::memory_order_relaxed);
         error_.store(0, std::memory_order_relaxed);
+        for (int i = 0; i < 2; ++i) {
+            Deadline& d = deadlines_[i];
+            d.desc = this;
+            d.dir = static_cast<Direction>(i);
+            d.timer.memo = &d;
+            d.timer.callback = &on_deadline_timer;
+            d.desired = kNoDeadline;
+            d.armed_at = kNoDeadline;
+            d.expired.store(0, std::memory_order_relaxed);
+        }
+        control_.memo = this;
+        control_.callback = &on_control_timer;
+        control_pending_ = false;
+        closing_ = false;
+        deadlines_used_ = false;
         epollable_ = poller::Epollable{fd, this, &on_events};
         // Events can arrive from here on (the callback only touches rd_ /
         // wr_, initialised above; epoll_ctl orders them before the report).
@@ -325,8 +404,13 @@ public:
     template <class Op>
     ssize_t io(Direction dir, Op&& op) noexcept {
         Word& word = word_of(dir);
+        Deadline& deadline = deadline_of(dir);
         Waiter waiter;
         for (;;) {
+            // An expired deadline fails at once, until it is moved.
+            if (deadline.expired.load(std::memory_order_acquire) != 0) {
+                return -ETIMEDOUT;
+            }
             const ssize_t r = op();
             if (r != -EAGAIN) {
                 return r;
@@ -347,11 +431,81 @@ public:
                 case Arm::kArmed:
                     break;
             }
+            // Dekker with expire(): arm (seq_cst RMW) then this load, against
+            // expired = 1 (seq_cst) then its load of the word. Either we see
+            // the expiry, or the expirer sees us in the word and wakes us.
+            if (deadline.expired.load(std::memory_order_seq_cst) != 0) {
+                std::uintptr_t mine = reinterpret_cast<std::uintptr_t>(&waiter);
+                if (word.compare_exchange_strong(mine, kEmpty, std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+                    return -ETIMEDOUT;  // nobody took us: nobody will wake us
+                }
+                // Taken by a waker meanwhile: its wake is on the way; park to
+                // consume it (the loop then sees the expiry).
+            }
             static_cast<Fiber*>(waiter.self)->park();
             if (waiter.result != 0) {
                 return -waiter.result;
             }
         }
+    }
+
+    // ---- deadlines --------------------------------------------------------------
+
+    // Sets the deadline of `dir` (see "Deadlines" in the top comment):
+    // operations on that direction fail with ETIMEDOUT once it has passed
+    // (a parked one is woken), until the deadline is moved. A deadline in the
+    // past expires at once; TimePoint{} or TimePoint::max() means none.
+    // Between enter() and leave(); any thread. 0, or ECANCELED if the
+    // descriptor is being closed.
+    int set_deadline(Direction dir, poller::TimePoint deadline) noexcept {
+        Deadline& d = deadline_of(dir);
+        if (deadline == poller::TimePoint{}) {
+            deadline = kNoDeadline;
+        }
+        bool expire_now = false;
+        {
+            std::lock_guard guard(deadline_lock_);
+            if (closing_) {
+                return ECANCELED;
+            }
+            deadlines_used_ = true;
+            d.desired = deadline;
+            d.expired.store(0, std::memory_order_seq_cst);  // a moved deadline is not expired
+            if (deadline == kNoDeadline) {
+                // nothing: a pending timer finds no deadline when it fires
+            } else if (deadline <= poller_->now()) {
+                mark_expired(d);
+                expire_now = true;
+            } else if (d.armed_at == kNoDeadline) {
+                arm_timer(d, deadline);
+            } else if (d.armed_at > deadline) {
+                // Earlier than the pending timer: only the poller thread can
+                // take that one back; the control timer does it.
+                if (!control_pending_) {
+                    control_pending_ = true;
+                    poller_->post(control_);
+                }
+            }
+            // else: the pending timer fires first and re-arms for `deadline`.
+        }
+        if (expire_now) {
+            if (Waiter* w = take_waiter(word_of(dir))) {
+                Sched& scheduler = *scheduler_;
+                w->probe.read();
+                w->result = 0;  // it re-checks the expiry itself
+                Task task = w->take(w->self);
+                if (task) {
+                    scheduler.pool().submit(std::move(task));
+                }
+            }
+        }
+        return 0;
+    }
+
+    // Racy snapshot (tests): whether `dir`'s deadline has expired.
+    bool expired_approx(Direction dir) const noexcept {
+        return deadlines_[static_cast<int>(dir)].expired.load(std::memory_order_relaxed) != 0;
     }
 
     // ---- close ----------------------------------------------------------------
@@ -464,9 +618,10 @@ private:
             if (cur != kEmpty) [[unlikely]] {
                 fail::fail_fast("net: two fibers wait on the same direction of one socket");
             }
-            // release: the waiter's fields (and probe) to the waker.
+            // release: the waiter's fields (and probe) to the waker;
+            // seq_cst: the deadline Dekker in io().
             if (word.compare_exchange_weak(cur, reinterpret_cast<std::uintptr_t>(&waiter),
-                                           std::memory_order_release, std::memory_order_relaxed)) {
+                                           std::memory_order_seq_cst, std::memory_order_relaxed)) {
                 return Arm::kArmed;
             }
         }
@@ -551,13 +706,144 @@ private:
         Waiter* closer;
     };
 
+    static constexpr poller::TimePoint kNoDeadline = poller::TimePoint::max();
+
+    // One direction's deadline. desired / armed_at are guarded by
+    // deadline_lock_; expired is read without it by the operations.
+    struct Deadline {
+        BasicPollDesc* desc = nullptr;
+        Direction dir = Direction::kRead;
+        Timer timer;                               // pending iff armed_at != kNoDeadline
+        poller::TimePoint desired = kNoDeadline;  // the deadline set by the user
+        poller::TimePoint armed_at = kNoDeadline;  // when `timer` fires
+        typename SyncPolicy::template Atomic<std::uint32_t> expired{0};
+    };
+
+    Deadline& deadline_of(Direction dir) noexcept { return deadlines_[static_cast<int>(dir)]; }
+
+    // Under deadline_lock_: schedules the direction's timer (idle) at `at`.
+    void arm_timer(Deadline& d, poller::TimePoint at) noexcept {
+        d.armed_at = at;
+        d.timer.deadline = at;
+        poller_->schedule(d.timer);
+    }
+
+    // The expirer's store; seq_cst: its half of the Dekker in io() (with the
+    // load of the word in take_waiter()). One site for both expiry paths
+    // (set_deadline() in the past, the timer), so the Twist test of one
+    // checks the order of both.
+    static void mark_expired(Deadline& d) noexcept { d.expired.store(1, std::memory_order_seq_cst); }
+
+    // Takes the waiter out of `word` (nullptr if none). The load is seq_cst:
+    // the expirer's half of the Dekker in io(); it also acquires the
+    // waiter's fields (it reads the arm CAS's value), so the CAS needs no
+    // order of its own beyond that (kept seq_cst: it is rare).
+    // Twist: weakening the load and the CAS to relaxed races on the probe.
+    static Waiter* take_waiter(Word& word) noexcept {
+        std::uintptr_t cur = word.load(std::memory_order_seq_cst);
+        while (is_waiter(cur)) {
+            if (word.compare_exchange_weak(cur, kEmpty, std::memory_order_seq_cst, std::memory_order_seq_cst)) {
+                return reinterpret_cast<Waiter*>(cur);
+            }
+        }
+        return nullptr;
+    }
+
+    // Under deadline_lock_, poller thread: d's timer is idle (it has fired
+    // or was withdrawn); act on the current deadline. true: expired now
+    // (the caller takes and wakes the waiter after unlocking).
+    bool reevaluate(Deadline& d) noexcept {
+        if (d.desired == kNoDeadline) {
+            return false;
+        }
+        if (d.desired > poller_->now()) {
+            arm_timer(d, d.desired);
+            return false;
+        }
+        if (d.expired.load(std::memory_order_relaxed) != 0) {
+            return false;
+        }
+        mark_expired(d);
+        return true;
+    }
+
+    void expire_into(Direction dir, poller::TaskBatch& out) noexcept {
+        if (Waiter* w = take_waiter(word_of(dir))) {
+            wake(w, 0, out);  // the waiter re-checks the expiry itself
+        }
+    }
+
+    // A direction's deadline timer (poller thread; kCancelled only from
+    // the poller's destructor).
+    static void on_deadline_timer(void* memo, poller::TimerEvent event, poller::TaskBatch& out) noexcept {
+        auto* d = static_cast<Deadline*>(memo);
+        BasicPollDesc* desc = d->desc;
+        bool fire = false;
+        {
+            std::lock_guard guard(desc->deadline_lock_);
+            d->armed_at = kNoDeadline;
+            if (desc->closing_ || event != poller::TimerEvent::kFired) {
+                return;
+            }
+            fire = desc->reevaluate(*d);
+        }
+        if (fire) {
+            desc->expire_into(d->dir, out);
+        }
+    }
+
+    // The control timer (posted by set_deadline() when a deadline moved
+    // EARLIER than its pending timer): withdraws that timer and re-arms it.
+    static void on_control_timer(void* memo, poller::TimerEvent event, poller::TaskBatch& out) noexcept {
+        auto* desc = static_cast<BasicPollDesc*>(memo);
+        bool fire[2] = {false, false};
+        {
+            std::lock_guard guard(desc->deadline_lock_);
+            desc->control_pending_ = false;
+            if (desc->closing_ || event != poller::TimerEvent::kFired) {
+                return;
+            }
+            for (int i = 0; i < 2; ++i) {
+                Deadline& d = desc->deadlines_[i];
+                if (d.armed_at != kNoDeadline && d.desired != kNoDeadline && d.armed_at > d.desired) {
+                    static_cast<void>(desc->poller_->withdraw(d.timer));
+                    d.armed_at = kNoDeadline;
+                    fire[i] = desc->reevaluate(d);
+                }
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (fire[i]) {
+                desc->expire_into(static_cast<Direction>(i), out);
+            }
+        }
+    }
+
     // The close timer, on the owning poller (kFired), or on the thread that
     // destroys a stopped poller (kCancelled): unwatch is allowed in both.
-    static void on_close_timer(void* memo, poller::TimerEvent, poller::TaskBatch& out) noexcept {
+    static void on_close_timer(void* memo, poller::TimerEvent event, poller::TaskBatch& out) noexcept {
         auto* op = static_cast<CloseOp*>(memo);
         BasicPollDesc* desc = op->desc;
         Waiter* closer = op->closer;
         static_cast<void>(desc->poller_->unwatch(desc->epollable_));
+        {
+            // No deadline timer may outlive the descriptor: take back the
+            // pending ones (under the lock, so set_deadline() cannot arm a
+            // new one after this; it sees closing_ instead).
+            std::lock_guard guard(desc->deadline_lock_);
+            desc->closing_ = true;
+            if (desc->deadlines_used_ && event == poller::TimerEvent::kFired) {
+                for (Deadline& d : desc->deadlines_) {
+                    static_cast<void>(desc->poller_->withdraw(d.timer));
+                    d.armed_at = kNoDeadline;
+                }
+                static_cast<void>(desc->poller_->withdraw(desc->control_));
+                desc->control_pending_ = false;
+            }
+            // kCancelled: the poller is being destroyed and delivers every
+            // pending timer itself (closing during the scheduler's
+            // destruction is not supported for descriptors with deadlines).
+        }
         cancel(desc->rd_, out);
         cancel(desc->wr_, out);
         // The closer was published to us by post() (the timer queue's
@@ -635,6 +921,14 @@ private:
     poller::Epollable epollable_{};
     // Checker only: open()'s fields -> enter() / close() (see IoWaiter).
     [[no_unique_address]] typename Waiter::Probe open_probe_{};
+
+    // Deadlines (see the top comment). All timers go to poller_.
+    Deadline deadlines_[2];
+    Timer control_;
+    sync::SpinLock<SyncPolicy> deadline_lock_;
+    bool control_pending_ = false;  // under deadline_lock_
+    bool closing_ = false;          // under deadline_lock_
+    bool deadlines_used_ = false;   // under deadline_lock_
 };
 
 }  // namespace fibers::net

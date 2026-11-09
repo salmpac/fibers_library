@@ -349,6 +349,36 @@ public:
         return ::shutdown(desc_.fd(), how) == 0 ? 0 : errno;
     }
 
+    // ---- deadlines (Go's SetReadDeadline / SetWriteDeadline) ----------------
+    //
+    // Absolute times on the scheduler's clock (Scheduler::now(),
+    // steady_clock). Once a direction's deadline has passed, its operations
+    // fail with ETIMEDOUT (a fiber parked in one is woken) until the
+    // deadline is moved; read_exact / write_all report what they moved
+    // before it. A deadline in the past expires at once; TimePoint{} or
+    // TimePoint::max() clears it. Any thread. 0, EBADF (not open) or
+    // ECANCELED (closing). Costs: a later deadline than the pending one is
+    // a few atomics; an earlier one or the first one schedules a timer on
+    // the socket's poller (see "Deadlines" in poll_desc.hpp).
+    int set_read_deadline(poller::TimePoint deadline) noexcept { return set_deadline(Direction::kRead, deadline); }
+    int set_write_deadline(poller::TimePoint deadline) noexcept { return set_deadline(Direction::kWrite, deadline); }
+
+    // Both directions.
+    int set_deadline(poller::TimePoint deadline) noexcept {
+        if (const int e = set_deadline(Direction::kRead, deadline); e != 0) {
+            return e;
+        }
+        return set_deadline(Direction::kWrite, deadline);
+    }
+
+    int set_deadline(Direction dir, poller::TimePoint deadline) noexcept {
+        typename PollDesc::Guard guard(desc_);
+        if (!guard) {
+            return EBADF;
+        }
+        return desc_.set_deadline(dir, deadline);
+    }
+
     // ---- TCP options (0 or errno) ------------------------------------------
 
     // TCP_NODELAY: send small segments at once (no Nagle).
@@ -465,8 +495,9 @@ public:
     // Accepts one connection into `out` (which must be closed), registered
     // with the next poller of the calling thread's round robin. Waits while
     // there is none. `peer` (optional) receives the peer's address.
-    // 0 or errno (ECANCELED: the listener was closed meanwhile; EMFILE /
-    // ENFILE: out of fds, the connection stays queued).
+    // 0 or errno (ECANCELED: the listener was closed meanwhile; ETIMEDOUT:
+    // the accept deadline passed; EMFILE / ENFILE: out of fds, the
+    // connection stays queued).
     int accept(Stream& out, Endpoint* peer = nullptr) noexcept {
         typename PollDesc::Guard guard(desc_);
         if (!guard) {
@@ -520,6 +551,16 @@ public:
             return Endpoint{};
         }
         return e;
+    }
+
+    // Deadline for accept() (see Stream::set_read_deadline): ETIMEDOUT once
+    // it has passed, until moved. 0, EBADF or ECANCELED.
+    int set_accept_deadline(poller::TimePoint deadline) noexcept {
+        typename PollDesc::Guard guard(desc_);
+        if (!guard) {
+            return EBADF;
+        }
+        return desc_.set_deadline(Direction::kRead, deadline);
     }
 
     // Wakes a fiber parked in accept() (ECANCELED), then closes. 0 or EBADF.
