@@ -10,27 +10,42 @@
 //
 // State
 // -----
-//   state_   = [ Treiber stack of waiters (WaitNode*) | LOCKED (bit 0) ]
+//   state_   = [ Treiber stack of waiters (WaitNode*) | WOKEN (bit 1) | LOCKED (bit 0) ]
 //   private_ = plain singly linked FIFO of waiters, touched only by the
 //              current lock holder (handed from holder to holder through the
 //              release in unlock() / acquire in lock()).
 //
-//   lock_or_enqueue(node):
-//     fast path: fetch_or(LOCKED, acquire) found LOCKED clear -> acquired
-//     loop: s = state
-//           !LOCKED: CAS(s -> s | LOCKED, acquire)                -> acquired
-//           LOCKED:  node.next = head(s); CAS(s -> &node | LOCKED, release)
+//   WOKEN: a waiter has been woken and has not yet made its next attempt.
+//   While it is set, unlock() wakes nobody (Go's mutexWoken): under heavy
+//   contention most woken waiters lose to running fibers and park again, and
+//   waking a new one on every unlock turned the mutex into a wake/park churn
+//   (BM_MutexContention, 512 fibers on 8 workers: 166 ns per critical
+//   section without WOKEN, 17 ns with it).
+//   Only an unlock() by the holder sets WOKEN; only the woken waiter's next
+//   attempt clears it (in the same CAS that takes the lock or re-enqueues).
+//   So while a holder runs, WOKEN can go 1 -> 0 but never 0 -> 1.
+//
+//   lock_or_enqueue(node, woken):
+//     fast path (woken == false): fetch_or(LOCKED, acquire) found LOCKED clear
+//     loop: s = state; clear = woken ? WOKEN : 0
+//           !LOCKED: CAS(s -> (s | LOCKED) & ~clear, acquire)      -> acquired
+//           LOCKED:  node.next = head(s);
+//                    CAS(s -> &node | LOCKED | (s & WOKEN & ~clear), release)
 //                    -> enqueued: the caller waits for node's wake, then
-//                       calls lock_or_enqueue again (it may be overtaken
-//                       and enqueue again)
+//                       calls lock_or_enqueue(node, true) (it may be
+//                       overtaken and enqueue again)
 //
 //   unlock():
-//     w = private_.pop_front()                    (we still hold the lock)
+//     w = null
 //     loop: s = state
-//           w == null && head(s) != null: CAS(s -> LOCKED, acquire): take the
-//               whole stack, private_ = reverse(it) (oldest first), w = pop
-//           else CAS(s -> head(s), release): unlocked
-//     if w: w->notify()
+//           WOKEN set, or no waiters at all:  CAS(s -> s & ~LOCKED, release): done
+//           w == null && private_ empty: CAS(s -> LOCKED, acquire): take the
+//               whole stack, private_ = reverse(it) (oldest first)
+//           w == null: w = private_.pop_front()        (we still hold the lock)
+//           CAS(s -> (s & ~LOCKED) | WOKEN, release): unlocked; w->notify()
+//     Once w is popped the "wake" branch stays taken: WOKEN was seen clear
+//     and cannot be set by anyone else while we hold the lock, and waiters
+//     only accumulate.
 //
 // Why CAS and not fetch_and(~LOCKED) to unlock: with w == null, a waiter
 // that pushes between our look at the head and the release would be left in
@@ -38,8 +53,10 @@
 // takes the newcomer into private_.
 //
 // Progress invariant: while there are waiters (in the stack or in private_),
-// every unlock() wakes exactly one. The woken one either gets the lock or
-// finds it held, re-enqueues, and that holder's unlock() wakes the next.
+// either a woken waiter is on its way (WOKEN) or the next unlock() wakes one.
+// The woken one either gets the lock or re-enqueues, clearing WOKEN in that
+// same RMW of state_; a concurrent unlock() that saw WOKEN set then fails its
+// CAS (state_ changed), sees WOKEN clear and wakes the next.
 //
 // ABA is harmless: a push only links node.next = head and CASes the head, so
 // if the head is the same pointer the link is right whatever happened to it
@@ -59,6 +76,10 @@
 //   * Wake: the waiter's later lock attempt reads state_ again with acquire;
 //     the wake itself (front-end) provides the release / acquire that makes
 //     the unlocker's writes visible to the woken waiter.
+//   * WOKEN carries no data, only the progress hand-off: it is set by the
+//     release CAS that unlocks and cleared by the woken waiter's acquire CAS
+//     (takes the lock) or release CAS (pushes the node), i.e. by the RMWs
+//     that need those orders anyway.
 //
 // Alternatives not taken: a Vyukov MPSC queue (as in blocking/op_queue.hpp)
 // has a window "tail exchanged, prev->next not linked yet" where unlock()
@@ -92,24 +113,28 @@ public:
 
     // true: acquired. false: `node` (next is overwritten, self / wake must
     // be set) was pushed onto the waiters' stack; the caller must not touch
-    // it until its wake, then call lock_or_enqueue again. After a false the
-    // node may be woken (and its owner resumed) before this returns.
-    bool lock_or_enqueue(WaitNode& node) noexcept {
-        if (try_lock()) [[likely]] {
+    // it until its wake, then call lock_or_enqueue(node, true) (woken: the
+    // attempt that follows a wake clears WOKEN). After a false the node may
+    // be woken (and its owner resumed) before this returns.
+    bool lock_or_enqueue(WaitNode& node, bool woken = false) noexcept {
+        if (!woken && try_lock()) [[likely]] {
             return true;
         }
+        const std::uintptr_t clear = woken ? kWoken : 0;
         std::uintptr_t s = state_.load(std::memory_order_relaxed);
         for (;;) {
             if ((s & kLocked) == 0) {
-                if (state_.compare_exchange_weak(s, s | kLocked, std::memory_order_acquire,
+                if (state_.compare_exchange_weak(s, (s | kLocked) & ~clear, std::memory_order_acquire,
                                                  std::memory_order_relaxed)) {
                     return true;
                 }
                 continue;
             }
             node.next = head_of(s);
-            if (state_.compare_exchange_weak(s, reinterpret_cast<std::uintptr_t>(&node) | kLocked,
-                                             std::memory_order_release, std::memory_order_relaxed)) {
+            const std::uintptr_t desired =
+                reinterpret_cast<std::uintptr_t>(&node) | kLocked | (s & kWoken & ~clear);
+            if (state_.compare_exchange_weak(s, desired, std::memory_order_release,
+                                             std::memory_order_relaxed)) {
                 return false;
             }
         }
@@ -117,30 +142,38 @@ public:
 
     // Precondition: the caller holds the lock.
     void unlock() noexcept {
-        WaitNode* w = pop_private();
+        WaitNode* w = nullptr;
         std::uintptr_t s = state_.load(std::memory_order_relaxed);
         for (;;) {
             if ((s & kLocked) == 0) [[unlikely]] {
                 fail::fail_fast("wait: unlock() of a mutex that is not locked");
             }
-            if (w == nullptr && head_of(s) != nullptr) {
-                // Take every waiter at once; we keep the lock.
+            if (w == nullptr && ((s & kWoken) != 0 || (private_ == nullptr && head_of(s) == nullptr))) {
+                // Someone is already on the way, or nobody waits: just release.
+                if (state_.compare_exchange_weak(s, s & ~kLocked, std::memory_order_release,
+                                                 std::memory_order_relaxed)) {
+                    return;
+                }
+                continue;
+            }
+            if (w == nullptr && private_ == nullptr) {
+                // Take every waiter at once; we keep the lock (WOKEN is clear).
                 if (state_.compare_exchange_weak(s, kLocked, std::memory_order_acquire,
                                                  std::memory_order_relaxed)) {
                     private_ = reverse(head_of(s));
-                    w = pop_private();
                     s = kLocked;
                 }
                 continue;
             }
-            if (state_.compare_exchange_weak(s, s & ~kLocked, std::memory_order_release,
+            if (w == nullptr) {
+                w = pop_private();
+            }
+            if (state_.compare_exchange_weak(s, (s & ~kLocked) | kWoken, std::memory_order_release,
                                              std::memory_order_relaxed)) {
                 break;
             }
         }
-        if (w != nullptr) {
-            w->notify();
-        }
+        w->notify();
     }
 
     // Racy snapshot (tests, diagnostics).
@@ -150,9 +183,12 @@ public:
 
 private:
     static constexpr std::uintptr_t kLocked = 1;
+    static constexpr std::uintptr_t kWoken = 2;
+    static constexpr std::uintptr_t kBits = kLocked | kWoken;
+    static_assert(alignof(WaitNode) > kBits, "WaitNode pointers need two free low bits");
 
     static WaitNode* head_of(std::uintptr_t s) noexcept {
-        return reinterpret_cast<WaitNode*>(s & ~kLocked);
+        return reinterpret_cast<WaitNode*>(s & ~kBits);
     }
 
     static WaitNode* reverse(WaitNode* head) noexcept {

@@ -1,5 +1,5 @@
 // Fibers over TwistSync under Twist: the fiber state machine (park / wake,
-// NOTIFIED, migration through the ThreadPool) and fiber::Mutex.
+// NOTIFIED, migration through the ThreadPool), fiber::Mutex and its MutexCore.
 //
 // TWIST_SIM:    each scenario is explored with the Random and PCT schedulers
 //               of the deterministic simulator.
@@ -42,6 +42,8 @@
 #include "fibers/stack/stack_pool.hpp"
 #include "fibers/sync/twist_sync.hpp"
 #include "fibers/thread_pool/thread_pool.hpp"
+#include "fibers/wait/mutex_core.hpp"
+#include "fibers/wait/wait_node.hpp"
 
 namespace fiber = fibers::fiber;
 namespace tp = fibers::thread_pool;
@@ -351,6 +353,55 @@ TEST(FiberTwist, MutexBargingTryLock) {
         FIBERS_WAIT_BOUNDED(done.load() == kFibers, "lost wakeup in Mutex");
         scheduler.pool().stop();
         TWIST_ASSERT_M(counter.Read() == 2 * kFibers, "no lost update");
+    });
+}
+
+// MutexCore alone, on threads, for WOKEN: a barging thread (try_lock only)
+// overtakes woken waiters, which then re-enqueue. While a woken waiter has
+// not made its next attempt unlock() wakes nobody, so at most one wake is
+// in flight; the attempt (lock or re-enqueue) must re-enable waking, or a
+// waiter hangs (lost wakeup).
+TEST(FiberTwist, MutexCoreWokenWhileBarging) {
+    check([] {
+        using Core = fibers::wait::MutexCore<TwistSync>;
+        constexpr int kRounds = 2;
+        struct Waiter {
+            twist::ed::std::atomic<bool> woken{false};
+            Counter* in_flight = nullptr;
+
+            static void wake(void* self) noexcept {
+                auto* waiter = static_cast<Waiter*>(self);
+                TWIST_ASSERT_M(waiter->in_flight->fetch_add(1) == 0, "two woken waiters in flight");
+                waiter->woken.store(true, std::memory_order_release);
+            }
+        };
+        Core core;
+        Counter in_flight{0};
+        twist::assist::Shared<int> counter{0};
+        auto waiter_thread = [&] {
+            Waiter waiter;
+            waiter.in_flight = &in_flight;
+            fibers::wait::WaitNode node{nullptr, &waiter, &Waiter::wake};
+            for (int k = 0; k < kRounds; ++k) {
+                for (bool woken = false; !core.lock_or_enqueue(node, woken); woken = true) {
+                    FIBERS_WAIT_BOUNDED(waiter.woken.load(std::memory_order_acquire), "lost wakeup in MutexCore");
+                    waiter.woken.store(false, std::memory_order_relaxed);
+                    in_flight.fetch_sub(1);
+                }
+                counter.Write(counter.Read() + 1);
+                core.unlock();
+            }
+        };
+        twist::ed::std::thread first(waiter_thread);
+        twist::ed::std::thread second(waiter_thread);
+        for (int k = 0; k < kRounds; ++k) {
+            FIBERS_WAIT_BOUNDED(core.try_lock(), "barger never got the lock");
+            counter.Write(counter.Read() + 1);
+            core.unlock();
+        }
+        first.join();
+        second.join();
+        TWIST_ASSERT_M(counter.Read() == 3 * kRounds, "no lost update");
     });
 }
 

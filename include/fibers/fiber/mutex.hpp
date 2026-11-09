@@ -49,7 +49,8 @@ private:
     [[gnu::noinline]] void lock_slow() noexcept {
         BasicFiber<Sched>& self = BasicFiber<Sched>::current_or_die("fiber: Mutex::lock() outside a fiber");
         wait::WaitNode node = self.wait_node();
-        while (!core_.lock_or_enqueue(node)) {
+        // After a wake the attempt is a woken one: it clears WOKEN.
+        for (bool woken = false; !core_.lock_or_enqueue(node, woken); woken = true) {
             self.park();
         }
     }

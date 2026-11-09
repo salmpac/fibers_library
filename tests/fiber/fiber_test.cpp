@@ -580,17 +580,54 @@ TEST(MutexCore, NodesWokenOnePerUnlockInFifoOrder) {
     core.unlock();  // takes the batch, wakes 0, unlocked
     EXPECT_EQ(woken, std::vector<int>({0}));
     EXPECT_FALSE(core.locked_approx());
-    EXPECT_TRUE(core.lock_or_enqueue(nodes[0]));  // woken one gets the lock
+    EXPECT_TRUE(core.lock_or_enqueue(nodes[0], true));  // woken one gets the lock
     core.unlock();                               // wakes 1 from private
     EXPECT_EQ(woken, std::vector<int>({0, 1}));
     EXPECT_TRUE(core.try_lock());  // barging: someone else got there first
-    EXPECT_FALSE(core.lock_or_enqueue(nodes[1]));  // 1 re-queues (stack)
+    EXPECT_FALSE(core.lock_or_enqueue(nodes[1], true));  // 1 re-queues (stack), clears WOKEN
     core.unlock();                                 // private: 2 first
     EXPECT_EQ(woken, std::vector<int>({0, 1, 2}));
-    EXPECT_TRUE(core.lock_or_enqueue(nodes[2]));
+    EXPECT_TRUE(core.lock_or_enqueue(nodes[2], true));
     core.unlock();  // private empty: takes the stack (1)
     EXPECT_EQ(woken, std::vector<int>({0, 1, 2, 1}));
-    EXPECT_TRUE(core.lock_or_enqueue(nodes[1]));
+    EXPECT_TRUE(core.lock_or_enqueue(nodes[1], true));
+    core.unlock();
+    EXPECT_FALSE(core.locked_approx());
+}
+
+// WOKEN: while a woken waiter has not made its next attempt, unlock() wakes
+// nobody else; the attempt (lock or re-enqueue) re-enables waking.
+TEST(MutexCore, WokenWaiterSuppressesFurtherWakes) {
+    fibers::wait::MutexCore<> core;
+    std::vector<int> woken;
+    struct Waiter {
+        std::vector<int>* log;
+        int id;
+        static void wake(void* self) noexcept {
+            auto* w = static_cast<Waiter*>(self);
+            w->log->push_back(w->id);
+        }
+    };
+    ASSERT_TRUE(core.try_lock());
+    Waiter waiters[2] = {{&woken, 0}, {&woken, 1}};
+    fibers::wait::WaitNode nodes[2];
+    for (int i = 0; i < 2; ++i) {
+        nodes[i] = {nullptr, &waiters[i], &Waiter::wake};
+        EXPECT_FALSE(core.lock_or_enqueue(nodes[i]));
+    }
+    core.unlock();  // wakes 0, sets WOKEN
+    EXPECT_EQ(woken, std::vector<int>({0}));
+    EXPECT_TRUE(core.try_lock());  // a running fiber barges in
+    core.unlock();                 // 0 is still on its way: no wake
+    EXPECT_EQ(woken, std::vector<int>({0}));
+    EXPECT_TRUE(core.try_lock());
+    EXPECT_FALSE(core.lock_or_enqueue(nodes[0], true));  // 0 lost: re-queues, clears WOKEN
+    core.unlock();  // wakes 1 (private_ first)
+    EXPECT_EQ(woken, std::vector<int>({0, 1}));
+    EXPECT_TRUE(core.lock_or_enqueue(nodes[1], true));
+    core.unlock();  // takes the stack (0), wakes it
+    EXPECT_EQ(woken, std::vector<int>({0, 1, 0}));
+    EXPECT_TRUE(core.lock_or_enqueue(nodes[0], true));
     core.unlock();
     EXPECT_FALSE(core.locked_approx());
 }

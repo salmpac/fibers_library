@@ -29,8 +29,9 @@
 //   * The waker's writes before the wake must be visible to the waiter once
 //     it runs: wake implementations provide that release / acquire (the
 //     fiber's state word, a thread pool queue).
-//   * Nodes are aligned to at least 2 (they hold pointers): primitives may
-//     use the low bit of a node pointer as a flag.
+//   * Nodes are aligned to at least 4 (they hold pointers): primitives may
+//     use the two low bits of a node pointer as flags (MutexCore: LOCKED,
+//     WOKEN).
 //
 // No virtual functions: `self` + a plain function pointer, like Task.
 //
@@ -59,6 +60,6 @@ struct WaitNode {
     }
 };
 
-static_assert(alignof(WaitNode) >= 2, "the low bit of a WaitNode* is used as a flag");
+static_assert(alignof(WaitNode) >= 4, "the two low bits of a WaitNode* are used as flags");
 
 }  // namespace fibers::wait
