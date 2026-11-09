@@ -25,8 +25,9 @@
 // a latency-sensitive fiber).
 //
 // Defaults (secure unless told otherwise):
-//   * TLS 1.2 minimum (min_version), TLS 1.3 preferred, OpenSSL's default
-//     cipher suites, no compression, no renegotiation (SSL_OP_NO_RENEGOTIATION:
+//   * TLS 1.2 minimum (min_version), TLS 1.3 preferred; TLS 1.2 limited to
+//     forward-secret AEAD suites in the server's order (tls12_ciphers,
+//     prefer_server_ciphers); no compression, no renegotiation (SSL_OP_NO_RENEGOTIATION:
 //     a renegotiation would make SSL_write read from the network, which the
 //     full-duplex design of TlsStream relies on never happening).
 //   * client: verify-full. The peer's chain must verify against the CA
@@ -86,6 +87,15 @@ struct CommonOptions {
     int min_version = TLS1_2_VERSION;
     int max_version = 0;
 
+    // TLS 1.2 cipher list (OpenSSL syntax; TLS 1.3 suites are OpenSSL's
+    // defaults, all AEAD). The default keeps forward-secret AEAD suites
+    // only (no CBC: LUCKY13-style padding oracles; no static RSA key
+    // exchange), like Mozilla's "intermediate" profile. nullptr: OpenSSL's
+    // own default list. Testing old peers: e.g. "DEFAULT:@SECLEVEL=0".
+    const char* tls12_ciphers = kDefaultTls12Ciphers;
+    static constexpr const char* kDefaultTls12Ciphers =
+        "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!PSK";
+
     // Per-connection ciphertext buffers (the BIO pair between OpenSSL and the
     // socket, allocated by OpenSSL per stream). read: how much ciphertext one
     // socket read can take (bigger = fewer syscalls for bulk reads). write:
@@ -128,6 +138,9 @@ struct ServerOptions : CommonOptions {
 
     bool session_tickets = true;
     std::size_t num_tickets = 2;            // TLS 1.3 tickets sent after each full handshake
+
+    // TLS 1.2: pick the cipher by our order of tls12_ciphers, not the client's.
+    bool prefer_server_ciphers = true;
 };
 
 class TlsContext {
@@ -226,6 +239,9 @@ public:
         } else {
             SSL_CTX_set_num_tickets(ctx_, o.num_tickets);
         }
+        if (o.prefer_server_ciphers) {
+            SSL_CTX_set_options(ctx_, SSL_OP_CIPHER_SERVER_PREFERENCE);
+        }
         if (alpn_len_ != 0) {
             SSL_CTX_set_alpn_select_cb(ctx_, &select_alpn, this);
         }
@@ -289,7 +305,8 @@ private:
         }
         server_ = server;
         options_ = o;
-        options_.alpn = {};  // not retained; the wire form is in alpn_
+        options_.alpn = {};                // not retained; the wire form is in alpn_
+        options_.tls12_ciphers = nullptr;  // not retained; applied to ctx_ below
         if (SSL_CTX_set_min_proto_version(ctx_, o.min_version) != 1 ||
             SSL_CTX_set_max_proto_version(ctx_, o.max_version) != 1) {
             return fail();
@@ -299,6 +316,9 @@ private:
             opts |= SSL_OP_IGNORE_UNEXPECTED_EOF;
         }
         SSL_CTX_set_options(ctx_, opts);
+        if (o.tls12_ciphers != nullptr && SSL_CTX_set_cipher_list(ctx_, o.tls12_ciphers) != 1) {
+            return fail();
+        }
         // SSL_write may return after one record (TlsStream writes in records
         // and flushes between them), and a retried write may pass the same
         // bytes from another address (a caller's buffer is not pinned).
