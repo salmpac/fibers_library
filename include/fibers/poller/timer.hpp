@@ -161,9 +161,13 @@ private:
 
     typename Sync::template Atomic<std::uint32_t> state_{kIdle};
     void* poller_ = nullptr;  // see poller()
-    // Pairing heap links (poller thread only).
+    // Pairing heap links (poller thread only). prev_: the parent for a first
+    // child, else the left sibling (stale for the root); it makes erase()
+    // possible (Poller::withdraw).
     BasicTimer* child_ = nullptr;
     BasicTimer* sibling_ = nullptr;
+    BasicTimer* prev_ = nullptr;
+    bool in_heap_ = false;
 };
 
 using Timer = BasicTimer<sync::StdSync>;
@@ -180,6 +184,7 @@ public:
     void push(Timer* timer) noexcept {
         timer->child_ = nullptr;
         timer->sibling_ = nullptr;
+        timer->in_heap_ = true;
         root_ = meld(root_, timer);
         ++size_;
     }
@@ -188,8 +193,36 @@ public:
         Timer* top = root_;
         root_ = merge_pairs(top->child_);
         top->child_ = nullptr;
+        top->in_heap_ = false;
         --size_;
         return top;
+    }
+
+    // Whether `timer` is in this heap (poller thread).
+    static bool contains(const Timer* timer) noexcept { return timer->in_heap_; }
+
+    // Removes `timer` (which is in this heap) wherever it is: O(log n)
+    // amortised, like pop(). Its subtree is merged and melded back.
+    void erase(Timer* timer) noexcept {
+        if (timer == root_) {
+            static_cast<void>(pop());
+            return;
+        }
+        Timer* prev = timer->prev_;
+        if (prev->child_ == timer) {
+            prev->child_ = timer->sibling_;
+        } else {
+            prev->sibling_ = timer->sibling_;
+        }
+        if (timer->sibling_ != nullptr) {
+            timer->sibling_->prev_ = prev;
+        }
+        timer->sibling_ = nullptr;
+        Timer* subtree = merge_pairs(timer->child_);
+        timer->child_ = nullptr;
+        timer->in_heap_ = false;
+        root_ = meld(root_, subtree);
+        --size_;
     }
 
     // Removes every node for which pred(node) holds and hands it to
@@ -215,6 +248,7 @@ public:
             node->child_ = nullptr;
             node->sibling_ = nullptr;
             if (pred(node)) {
+                node->in_heap_ = false;
                 removed(node);
             } else {
                 root_ = meld(root_, node);
@@ -236,6 +270,10 @@ private:
             std::swap(a, b);
         }
         b->sibling_ = a->child_;
+        if (a->child_ != nullptr) {
+            a->child_->prev_ = b;
+        }
+        b->prev_ = a;
         a->child_ = b;
         a->sibling_ = nullptr;
         return a;

@@ -53,7 +53,7 @@
 // Thread rules
 //   any thread:    schedule, post, cancel, watch, stop/start (not from callbacks)
 //   poller thread (inside callbacks) or while stopped:
-//                  unwatch, add, remove
+//                  unwatch, add, remove, withdraw (a timer of this poller)
 //   To unwatch / add / remove from another thread while running, post() a
 //   timer whose callback does it (and signals completion as needed).
 //
@@ -211,6 +211,41 @@ public:
     int unwatch(Epollable& e) noexcept {
         scrub(&e);
         return backend_.unwatch(e.fd);
+    }
+
+    // Takes a pending timer of THIS poller back at once, without running
+    // its callback: afterwards the node is idle and the poller holds no
+    // reference to it (unlike cancel(), whose node stays referenced until
+    // the lazy removal delivers kCancelled). true: withdrawn; false: it was
+    // idle already (never scheduled, or its callback has been entered).
+    // The node must not be cancel()ed. A schedule() of the node must have
+    // returned before. The node may still be unreachable in the MPSC queue,
+    // behind another producer's push that is "in transit" (exchange done,
+    // link store not yet): then this SPINS on the poller thread until that
+    // producer links it -- normally nanoseconds, but as long as the
+    // producer stays preempted between its two instructions. O(log n)
+    // amortised otherwise (pairing-heap erase). Not while the poller is
+    // being destroyed (fails fast).
+    bool withdraw(Timer& timer) noexcept {
+        if (destroying_) [[unlikely]] {
+            fail::fail_fast("poller: withdraw() while the poller is being destroyed");
+        }
+        // relaxed: on idle we touch nothing; a pending node reaches the heap
+        // through the queue (drain_queue's acquire).
+        if (timer.state_.load(std::memory_order_relaxed) == Timer::kIdle) {
+            return false;
+        }
+        drain_queue();
+        while (!TimerHeap<Timer>::contains(&timer)) {
+            Sync::spin_hint();  // a push ahead of it is in transit
+            drain_queue();
+        }
+        heap_.erase(&timer);
+        // release: the poller's last touches of the node (heap links, the
+        // deadline it compared) before the owner's idle() (acquire).
+        timer.state_.store(Timer::kIdle, std::memory_order_release);
+        next_deadline_ = heap_.empty() ? kNever : heap_.top()->deadline;
+        return true;
     }
 
     void add(Checkable& c) noexcept {

@@ -254,6 +254,72 @@ TEST(PollerTwist, CancelRace) {
     });
 }
 
+namespace {
+
+struct Remover {
+    Poller* poller = nullptr;
+    Timer* target = nullptr;
+    twist::ed::std::atomic<int> result{-1};
+    Timer timer;
+
+    static void callback(void* memo, TimerEvent, TaskBatch&) noexcept {
+        auto* self = static_cast<Remover*>(memo);
+        self->result.store(self->poller->withdraw(*self->target) ? 1 : 0);
+    }
+};
+
+}  // namespace
+
+// withdraw() on the poller thread of a timer scheduled just before, while
+// two other threads push into the same MPSC queue (the target may sit
+// behind a push in transit: withdraw spins until it is linked). The target
+// is withdrawn exactly once and never called back; its owner then reuses
+// the node (idle(): acquire of withdraw's release store) and it fires
+// normally; the others are handed back by the destructor.
+TEST(PollerTwist, WithdrawRacesSchedulers) {
+    check([] {
+        Counter fired{0}, cancelled{0}, other_fired{0}, other_cancelled{0};
+        InlineSink sink;
+        CheckedTimer target, a, b;
+        Remover remover;
+        {
+            Poller p(TaskSink::of(sink), tiny());
+            p.start();
+            twist::ed::std::thread t1([&] {
+                a.prepare(other_fired, other_cancelled, p.now() + 1h);
+                p.schedule(a.timer);
+            });
+            twist::ed::std::thread t2([&] {
+                b.prepare(other_fired, other_cancelled, p.now() + 1h);
+                p.schedule(b.timer);
+            });
+            target.prepare(fired, cancelled, p.now() + 1h);
+            p.schedule(target.timer);
+            remover.poller = &p;
+            remover.target = &target.timer;
+            remover.timer.memo = &remover;
+            remover.timer.callback = &Remover::callback;
+            p.post(remover.timer);
+            // The owner learns that the node is free from idle() alone (its
+            // acquire pairs with withdraw's release store), then reuses it:
+            // it must be fully out of the poller's heap.
+            for (std::size_t step = 0; !target.timer.idle(); ++step) {
+                TWIST_ASSERT_M(step < 5'000, "target never withdrawn");
+                twist::ed::std::this_thread::yield();
+            }
+            target.prepare(fired, cancelled, p.now());
+            p.schedule(target.timer);
+            wait_until(fired, 1, "reused timer never fired");
+            TWIST_ASSERT_M(remover.result.load() == 1, "withdrawn");
+            t1.join();
+            t2.join();
+            p.stop();
+        }
+        TWIST_ASSERT_M(fired.load() == 1 && cancelled.load() == 0, "target: one callback, after its reuse");
+        TWIST_ASSERT_M(other_cancelled.load() == 2 && other_fired.load() == 0, "others handed back");
+    });
+}
+
 // stop() racing with producers and with the poller falling asleep. A lost
 // stop wakeup deadlocks (the poller sleeps forever, we join it).
 TEST(PollerTwist, StopRaces) {

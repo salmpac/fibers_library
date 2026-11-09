@@ -370,6 +370,212 @@ TEST(Poller, Cancellation) {
     EXPECT_GE(p.stats().compactions, 1u);
 }
 
+// TimerHeap::erase (behind Poller::withdraw) keeps the heap consistent:
+// random pushes, pops and erases against a sorted reference.
+TEST(TimerHeap, EraseAnywhere) {
+    std::mt19937_64 rng(7);
+    constexpr std::size_t kNodes = 2000;
+    std::vector<Timer> nodes(kNodes);
+    poller::TimerHeap<Timer> heap;
+    std::vector<std::size_t> in;  // indices in the heap
+    auto deadline_of = [&](std::size_t i) { return nodes[i].deadline; };
+    for (int step = 0; step < 20000; ++step) {
+        const int op = static_cast<int>(rng() % 7);
+        if (op == 6 && !in.empty()) {
+            // The compaction path: remove_if re-melds the survivors.
+            const std::uint64_t mod = 5 + rng() % 7;
+            const std::uint64_t rem = rng() % mod;
+            auto doomed = [&](const Timer* t) {
+                return static_cast<std::uint64_t>(t->deadline.time_since_epoch().count()) % mod == rem;
+            };
+            std::size_t removed = 0;
+            heap.remove_if([&](Timer* t) { return doomed(t); }, [&](Timer*) { ++removed; });
+            const std::size_t before = in.size();
+            std::erase_if(in, [&](std::size_t i) { return doomed(&nodes[i]); });
+            ASSERT_EQ(before - in.size(), removed);
+            for (std::size_t i : in) {
+                ASSERT_TRUE(poller::TimerHeap<Timer>::contains(&nodes[i]));
+            }
+            ASSERT_EQ(heap.size(), in.size());
+            continue;
+        }
+        if (op <= 1 || in.empty()) {
+            std::size_t i = rng() % kNodes;
+            if (poller::TimerHeap<Timer>::contains(&nodes[i])) {
+                continue;
+            }
+            nodes[i].deadline = TimePoint(std::chrono::nanoseconds(rng() % 1000));
+            heap.push(&nodes[i]);
+            in.push_back(i);
+        } else if (op <= 3) {
+            Timer* top = heap.pop();
+            const auto it = std::min_element(in.begin(), in.end(),
+                                              [&](std::size_t a, std::size_t b) { return deadline_of(a) < deadline_of(b); });
+            ASSERT_EQ(top->deadline, deadline_of(*it));
+            in.erase(std::find(in.begin(), in.end(), static_cast<std::size_t>(top - nodes.data())));
+        } else {
+            const std::size_t k = rng() % in.size();
+            heap.erase(&nodes[in[k]]);
+            ASSERT_FALSE(poller::TimerHeap<Timer>::contains(&nodes[in[k]]));
+            in.erase(in.begin() + static_cast<std::ptrdiff_t>(k));
+        }
+        ASSERT_EQ(heap.size(), in.size());
+    }
+    TimePoint last = TimePoint::min();
+    while (!heap.empty()) {
+        Timer* top = heap.pop();
+        ASSERT_GE(top->deadline, last);
+        last = top->deadline;
+    }
+}
+
+namespace {
+
+struct WithdrawProbe {
+    Poller* poller = nullptr;
+    Timer* target = nullptr;
+    std::atomic<int> result{-1};
+};
+
+void count_event(void* memo, TimerEvent, TaskBatch&) noexcept { as_counter(memo).fetch_add(1); }
+
+}  // namespace
+
+// withdraw() from a callback takes a pending timer back: it never fires and
+// the destructor does not hand it back either.
+TEST(Poller, WithdrawFromCallback) {
+    InlineSink sink;
+    std::atomic<std::size_t> far_events{0};
+    Timer far;
+    Timer remover;
+    WithdrawProbe probe;
+    {
+        Poller p(TaskSink::of(sink));
+        probe.poller = &p;
+        probe.target = &far;
+        far.memo = &far_events;
+        far.callback = &count_event;
+        far.deadline = p.now() + 1h;
+        p.start();
+        p.schedule(far);
+        remover.memo = &probe;
+        remover.callback = [](void* memo, TimerEvent, TaskBatch&) noexcept {
+            auto* pr = static_cast<WithdrawProbe*>(memo);
+            const bool first = pr->poller->withdraw(*pr->target);
+            const bool second = pr->poller->withdraw(*pr->target);
+            pr->result.store((first ? 1 : 0) | (second ? 2 : 0));
+        };
+        p.post(remover);
+        ASSERT_TRUE(wait_until([&] { return probe.result.load() != -1; }));
+        EXPECT_EQ(probe.result.load(), 1) << "withdrawn once, then idle";
+        EXPECT_TRUE(far.idle());
+        p.stop();
+    }
+    EXPECT_EQ(far_events.load(), 0u) << "a withdrawn timer gets no callback, not even kCancelled";
+}
+
+// withdraw() of a timer that has already fired, and of one that was never
+// scheduled: false, and no second callback.
+TEST(Poller, WithdrawFiredOrNeverScheduled) {
+    InlineSink sink;
+    std::atomic<std::size_t> events{0};
+    Timer fired;
+    Timer never;
+    Timer remover;
+    WithdrawProbe probe[2];
+    Poller p(TaskSink::of(sink));
+    p.start();
+    fired.memo = &events;
+    fired.callback = &count_event;
+    p.post(fired);
+    ASSERT_TRUE(wait_until([&] { return events.load() == 1; }));
+    for (int i = 0; i < 2; ++i) {
+        probe[i].poller = &p;
+        probe[i].target = i == 0 ? &fired : &never;
+        remover.memo = &probe[i];
+        remover.callback = [](void* memo, TimerEvent, TaskBatch&) noexcept {
+            auto* pr = static_cast<WithdrawProbe*>(memo);
+            pr->result.store(pr->poller->withdraw(*pr->target) ? 1 : 0);
+        };
+        ASSERT_TRUE(wait_until([&] { return remover.idle(); }));
+        p.post(remover);
+        ASSERT_TRUE(wait_until([&] { return probe[i].result.load() != -1; }));
+        EXPECT_EQ(probe[i].result.load(), 0);
+    }
+    p.stop();
+    EXPECT_EQ(events.load(), 1u);
+}
+
+namespace {
+
+struct InTransitProbe {
+    Poller* poller = nullptr;
+    Timer* target = nullptr;
+    std::atomic<int> withdrawn{0};
+    std::atomic<int> failed{0};
+    std::atomic<int> runs{0};
+};
+
+}  // namespace
+
+// withdraw() of a timer scheduled just before (still in the MPSC queue,
+// maybe behind other threads' pushes that are in transit) while producers
+// keep scheduling far timers: it must find the node (spinning until the
+// queue links it) every time.
+TEST(Poller, WithdrawWhileOthersSchedule) {
+    InlineSink sink;
+    std::atomic<std::size_t> far_events{0};
+    constexpr int kProducers = 3;
+    constexpr int kPerProducer = 3000;
+    constexpr int kRounds = 2000;
+    std::vector<Timer> far(kProducers * kPerProducer);
+    Timer target;
+    Timer remover;
+    std::atomic<std::size_t> target_events{0};
+    InTransitProbe probe;
+    {
+        Poller p(TaskSink::of(sink));
+        p.start();
+        probe.poller = &p;
+        probe.target = &target;
+        target.memo = &target_events;
+        target.callback = &count_event;
+        remover.memo = &probe;
+        remover.callback = [](void* memo, TimerEvent, TaskBatch&) noexcept {
+            auto* pr = static_cast<InTransitProbe*>(memo);
+            (pr->poller->withdraw(*pr->target) ? pr->withdrawn : pr->failed).fetch_add(1);
+            pr->runs.fetch_add(1);
+        };
+        std::vector<std::thread> producers;
+        for (int t = 0; t < kProducers; ++t) {
+            producers.emplace_back([&, t] {
+                for (int i = 0; i < kPerProducer; ++i) {
+                    Timer& node = far[static_cast<std::size_t>(t * kPerProducer + i)];
+                    node.memo = &far_events;
+                    node.callback = &count_event;
+                    node.deadline = p.now() + 1h;
+                    p.schedule(node);
+                }
+            });
+        }
+        for (int round = 0; round < kRounds; ++round) {
+            target.deadline = p.now() + 1h;
+            p.schedule(target);
+            p.post(remover);  // its callback withdraws `target`
+            ASSERT_TRUE(wait_until([&] { return probe.runs.load() == round + 1 && remover.idle(); }));
+            ASSERT_TRUE(target.idle());
+        }
+        for (auto& t : producers) {
+            t.join();
+        }
+        p.stop();
+    }  // ~Poller hands the far timers back (kCancelled), not `target`
+    EXPECT_EQ(probe.withdrawn.load(), kRounds);
+    EXPECT_EQ(probe.failed.load(), 0);
+    EXPECT_EQ(target_events.load(), 0u);
+    EXPECT_EQ(far_events.load(), static_cast<std::size_t>(kProducers * kPerProducer));
+}
+
 namespace {
 
 // Timer nodes from an object pool, returned to it by their callback.
