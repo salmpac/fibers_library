@@ -1,5 +1,7 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
+# fibers::http (when built with FIBERS_HTTP) links llhttp::llhttp.
+find_package(llhttp 9 CONFIG QUIET)
 include("${CMAKE_CURRENT_LIST_DIR}/fibersTargets.cmake")
 # fibers::tls, when the package was built with FIBERS_TLS.
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/fibersTlsTargets.cmake")

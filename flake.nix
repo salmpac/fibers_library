@@ -97,10 +97,12 @@
           };
 
           nativeBuildInputs = [ pkgs.cmake pkgs.ninja ];
+          buildInputs = [ pkgs.llhttp ];
           checkInputs = [ pkgs.gtest ];
 
           cmakeFlags = [
             "-DFIBERS_BUILD_TESTS=ON"
+            "-DFIBERS_HTTP=ON"
           ] ++ lib.optional (sanitize != "") "-DFIBERS_SANITIZE=${sanitize}"
             ++ lib.optionals (twist != null) ([
               "-DFIBERS_TWIST=ON"
@@ -162,6 +164,9 @@
                   meta = old.meta // { knownVulnerabilities = [ ]; };
                 }))
               ]))
+              pkgs.llhttp # fibers::http's parser
+              pkgs.wrk # HTTP load generators (examples/README.md)
+              pkgs.wrk2
             ];
             hardeningDisable = [ "fortify" ];
             FIBERS_TLSFUZZER = "${inputs.tlsfuzzer}";

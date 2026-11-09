@@ -14,6 +14,7 @@ option(FIBERS_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
 option(FIBERS_BUILD_BENCHMARKS "Build benchmarks (needs google benchmark)" OFF)
 option(FIBERS_BUILD_EXAMPLES "Build examples (echo server / client / epoll baseline)" OFF)
 option(FIBERS_TWIST "Fetch Twist and build concurrency tests with TwistSync" OFF)
+option(FIBERS_HTTP "Build the HTTP/1.1 component fibers::http (needs llhttp, see cmake/Llhttp.cmake)" OFF)
 option(FIBERS_LINK_COMPILE_COMMANDS
     "Symlink compile_commands.json from the build dir into the source dir (for clangd)" OFF)
 set(FIBERS_SANITIZE "" CACHE STRING
@@ -133,6 +134,24 @@ if(FIBERS_TLS)
     install(EXPORT fibersTlsTargets
         NAMESPACE fibers::
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fibers)
+endif()
+
+# HTTP/1.1 server and client over any byte stream (net::Stream, TLS), parsed
+# by llhttp. Optional (FIBERS_HTTP).
+if(FIBERS_HTTP)
+    include(cmake/Llhttp.cmake)
+    if(FIBERS_LLHTTP_INSTALLABLE)
+        fibers_add_component(http fibers::net fibers::fiber fibers::object_pool ${FIBERS_LLHTTP_TARGET})
+    else()
+        # A fetched llhttp is not part of our export set: usable from this
+        # build tree only.
+        add_library(fibers_http INTERFACE)
+        add_library(fibers::http ALIAS fibers_http)
+        target_include_directories(fibers_http INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_features(fibers_http INTERFACE cxx_std_20)
+        target_link_libraries(fibers_http INTERFACE fibers::net fibers::fiber fibers::object_pool
+            ${FIBERS_LLHTTP_TARGET})
+    endif()
 endif()
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
