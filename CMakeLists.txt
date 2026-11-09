@@ -102,6 +102,9 @@ fibers_add_component(sched fibers::sync fibers::fail fibers::thread_pool fibers:
 fibers_add_component(fiber fibers::sched fibers::coro fibers::wait fibers::context fibers::blocking)
 # File I/O for fibers: RWF_NOWAIT inline, the rest through this_fiber::blocking.
 fibers_add_component(fs fibers::fiber fibers::blocking fibers::sched fibers::fail)
+# Sockets for fibers: PollDesc (per-fd readiness words, Go-netpoller style),
+# Stream, Listener, Endpoint.
+fibers_add_component(net fibers::fiber fibers::sched fibers::poller)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets
