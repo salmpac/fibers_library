@@ -57,6 +57,19 @@
 // RST_STREAM(CANCEL), so the server learns of the cancellation and nothing
 // references the caller's frame afterwards (session.hpp).
 //
+// Contexts (fibers/fiber/context.hpp, docs/cancellation.md): a request
+// made by a fiber under a context fails at once with ECANCELED / ETIMEDOUT
+// if the context has ended, and is interrupted when it ends: the caller
+// enlists a hook in the context that claims the request through the same
+// flag as the deadline timer (a DeadlineNode is made for that even without
+// a deadline) and completes the caller with the context's error; the
+// caller then resets the stream as after its own deadline. The connect,
+// TLS handshake and socket I/O of a fresh connection run in the caller's
+// fiber, so they are under its context too (the connect mutex that other
+// callers wait on meanwhile is not cancellable: bounded by connect_timeout).
+// The reader and writer fibers run under no context: one request's end
+// never tears down the shared connection.
+//
 // SETTINGS_MAX_CONCURRENT_STREAMS: requests beyond the peer's limit wait
 // inside nghttp2 for a stream (StreamLimit::kQueue; at most
 // max_queued_requests of them, beyond: EBUSY) or fail with EBUSY at once
@@ -119,6 +132,7 @@
 #include <utility>
 
 #include "fibers/fail/fail_fast.hpp"
+#include "fibers/fiber/context.hpp"
 #include "fibers/fiber/event.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/fiber/mutex.hpp"
@@ -245,6 +259,9 @@ public:
         const poller::TimePoint deadline = deadline_of(req);
         if (has_deadline(deadline) && deadline <= scheduler_.now()) {
             return ETIMEDOUT;
+        }
+        if (const int e = fiber::this_fiber::context_error<Sched>(); e != 0) {
+            return e;
         }
         std::array<nghttp2_nv, kMaxRequestHeaders + 6> nv;
         char length[24];
@@ -546,11 +563,15 @@ private:
         int exchange(const nghttp2_nv* nv, std::size_t n, std::string_view body, Response& res,
                      poller::TimePoint deadline, bool& retry) noexcept {
             Sched& sched = client_.scheduler_;
+            fiber::BasicContext<Sched>* ctx = fiber::this_fiber::context<Sched>();
             typename CallT::Oneshot done;
             CallT call;
             call.promise = done.promise();
             call.response = &res;
-            if (has_deadline(deadline)) {
+            const bool timed = has_deadline(deadline);
+            if (timed || ctx != nullptr) {
+                // Also without a deadline under a context: its claim flag
+                // decides between the stream's completion and the context.
                 call.deadline = DeadlineNode::create(sched, &call);
             }
             int e;
@@ -573,18 +594,20 @@ private:
                 retry = e == EAGAIN;
                 return e;
             }
-            if (call.deadline != nullptr) {
+            if (timed) {
                 call.deadline->timer.deadline = deadline;
                 sched.pollers().schedule(call.deadline->timer);
             }
             if (want) {
                 bell_.ring();
             }
-            const wait::Result<int> r = done.get();
+            wait::Result<int> r = wait_call(done, call, ctx);
             const int result = r ? *r : ECONNRESET;
-            if (result == ETIMEDOUT) {
-                // The timer completed us: the stream may still be live and
-                // the session may still point at `call`. Detach + reset.
+            if (result == ETIMEDOUT || result == ECANCELED) {
+                // The timer or the context completed us: the stream may
+                // still be live and the session may still point at `call`.
+                // Detach + reset. (An ECANCELED from the connection itself
+                // has detached it already: cancel() is a no-op then.)
                 {
                     std::lock_guard guard(mu_);
                     session_.cancel(call);
@@ -596,12 +619,39 @@ private:
                 res.clear();
             }
             if (call.deadline != nullptr) {
-                // Not fired yet: take it back (the callback then only drops
-                // its reference, later).
-                static_cast<void>(sched.pollers().cancel(call.deadline->timer));
+                if (timed) {
+                    // Not fired yet: take it back (the callback then only
+                    // drops its reference, later).
+                    static_cast<void>(sched.pollers().cancel(call.deadline->timer));
+                } else {
+                    call.deadline->unref();  // never scheduled: the timer's reference
+                }
                 call.deadline->unref();
             }
             return result;
+        }
+
+        // Waits for the call's completion; under a context, also for the
+        // context's end (which then completes it, see the top comment).
+        static wait::Result<int> wait_call(typename CallT::Oneshot& done, CallT& call,
+                                           fiber::BasicContext<Sched>* ctx) noexcept {
+            if (ctx == nullptr) {
+                return done.get();
+            }
+            // After submit: the claim flag is shared with the session now.
+            fiber::InterruptScope<Sched> scope(*ctx, &call, &on_context_end);
+            return done.get();
+        }  // ~scope: delist (waits for a canceller still inside on_context_end)
+
+        // The context's hook (any thread, or inline in wait_call): claims
+        // the call like the deadline timer does, and completes it.
+        static void on_context_end(void* self, wait::Error reason) noexcept {
+            auto* call = static_cast<CallT*>(self);
+            if (call->deadline->claim()) {
+                // The caller waits on its Oneshot: its frame is alive until
+                // this set() completes it (our last touch of it).
+                call->promise.set(fiber::errno_of(reason));
+            }
         }
 
         // close(): GOAWAY, then down; in-flight requests get ECANCELED.
