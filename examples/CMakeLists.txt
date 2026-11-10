@@ -22,13 +22,17 @@ if(FIBERS_TLS)
 endif()
 
 # HTTP examples (need FIBERS_HTTP): a hello-world server (the wrk benchmark
-# target) and a small REST service.
+# target), a small REST service, and one with Prometheus metrics.
 if(FIBERS_HTTP)
     foreach(example http_hello http_rest)
         add_executable(${example} ${example}.cpp)
         target_link_libraries(${example} PRIVATE fibers::http fibers::sync)
         target_compile_options(${example} PRIVATE -Wall -Wextra)
     endforeach()
+    # A REST service with Prometheus metrics (fibers::metrics) on /metrics.
+    add_executable(metrics_server metrics_server.cpp)
+    target_link_libraries(metrics_server PRIVATE fibers::http fibers::metrics fibers::sync)
+    target_compile_options(metrics_server PRIVATE -Wall -Wextra)
 endif()
 
 # Synchronization primitives (examples/sync/): short tutorial programs for

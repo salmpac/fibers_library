@@ -23,7 +23,13 @@
 
 namespace examples {
 
-inline int run_http_server(const Args& args, fibers::http::Handler handler, const char* name) {
+// `setup(scheduler, setup_context)`, if given, runs once the scheduler
+// exists, before the server starts (e.g. to register metrics collectors on
+// it; the scheduler is stopped and destroyed before this function returns).
+using ServerSetup = void (*)(fibers::sched::Scheduler& scheduler, void* context) noexcept;
+
+inline int run_http_server(const Args& args, fibers::http::Handler handler, const char* name,
+                           ServerSetup setup = nullptr, void* setup_context = nullptr) {
     namespace http = fibers::http;
     namespace net = fibers::net;
     raise_fd_limit();
@@ -54,6 +60,9 @@ inline int run_http_server(const Args& args, fibers::http::Handler handler, cons
     pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
     fibers::sched::Scheduler scheduler(options);
+    if (setup != nullptr) {
+        setup(scheduler, setup_context);
+    }
     int status = 0;
     {
         http::Server server(scheduler, handler, server_options);

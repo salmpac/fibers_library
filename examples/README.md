@@ -1,4 +1,4 @@
-# Examples: echo and HTTP over fibers
+# Examples: echo, HTTP and metrics over fibers
 
 | binary | what |
 |---|---|
@@ -303,6 +303,102 @@ checked against outside test material and tools:
 - **REDbot** (MIT) on `http_hello` and `http_rest` responses (200, 404):
   no protocol findings (Date correct, Content-Length correct; the only
   notes are about caching, as the examples send no Cache-Control).
+
+# Metrics (`fibers::metrics`, Prometheus)
+
+| binary | what |
+|---|---|
+| `metrics_server` | `GET /hello`, `GET / POST / DELETE /items/{id}` (in-memory map) instrumented per route, plus `GET /metrics` |
+
+Same flags as the other HTTP servers. Each route's handler is wrapped once
+at startup: the wrapper holds the route's instruments (one counter per
+status class, one latency histogram), so a request costs a few relaxed
+atomics and no lookup. The scheduler's own collectors
+(`metrics::register_scheduler`) are registered through
+`run_http_server`'s setup hook, once the scheduler exists.
+
+```sh
+cmake --preset clang-release && cmake --build --preset clang-release -j 6 --target metrics_server
+build/clang-release/examples/metrics_server --port=8080 --workers=2
+curl -X POST --data hello localhost:8080/items/a; curl localhost:8080/items/b
+curl -s localhost:8080/metrics | promtool check metrics   # promtool is in the dev shell
+```
+
+```
+# (excerpt, after POST + GET + DELETE /items/a and GET /items/zzz)
+app_http_requests_total{route="/items/{id}",code="2xx"} 3
+app_http_requests_total{route="/items/{id}",code="4xx"} 1
+app_http_request_duration_seconds_bucket{route="/items/{id}",le="0.0001"} 4
+...
+app_http_requests_in_flight 0
+fibers_spawned_total 7
+fibers_workers_parked 1
+fibers_poller_sleeps_total{poller="0"} 29
+fibers_stacks_mapped 7
+...
+```
+
+The API in short (`include/fibers/metrics/`):
+
+```cpp
+metrics::Registry registry;                     // RegistryOptions{.shards}: rows per counter
+auto sent = registry.counter_family("sms_sent_total", "SMS sent.", {"channel", "status"});
+metrics::Counter sms_ok = sent.with({"sms", "ok"});    // once; keep the handle
+metrics::Gauge queue = registry.gauge("sms_queue_depth", "Queued SMS.");
+metrics::Histogram latency = registry.histogram(
+    "sms_send_duration_seconds", "Send latency.", metrics::kLatencyBucketsUs, 1e6);  // observe() in µs
+
+sms_ok.inc();  queue.set(n);  latency.observe(elapsed_us);  // any thread or fiber
+
+registry.add_collector(fn, context);            // values that live elsewhere, read at scrape time
+metrics::register_scheduler(registry, scheduler);
+router.get("/metrics", metrics::http_handler(registry));
+```
+
+- **Hot path.** `Counter::inc` / `add`: one call of a `[[gnu::noinline]]`
+  thread-local accessor (fibers migrate, so the shard is looked up per
+  update, never cached across a park) and one relaxed `fetch_add` on the
+  calling thread's row; rows of different shards never share a cache line.
+  `Histogram::observe`: bucket search (linear up to 8 bounds, binary
+  beyond) and two relaxed `fetch_add`s on the thread's row (bucket, sum).
+  `Gauge`: one cell (`set` = store, `add` = shared `fetch_add`). No
+  allocation, lock, hashing or label lookup on any update.
+- **Scrapes** sum the rows (relaxed loads) and take no lock: they run
+  concurrently with updates, other scrapes and registration (append-only
+  lists published with release / acquire). Totals are exact once the
+  updaters happen-before the scrape; a running scrape is a snapshot in
+  which counters never go down and a histogram's `_count` equals its
+  `+Inf` bucket.
+- **The endpoint** renders into 4 KiB on the handler's fiber stack: a small
+  exposition goes out with `Content-Length`, a larger one as HTTP chunks.
+- **Format**: text exposition 0.0.4 (HELP / TYPE, escaping of help text
+  and label values, `_bucket{le}` / `_sum` / `_count`, `+Inf`), checked
+  by golden tests and by `promtool check metrics` (ctest
+  `metrics_promtool_check`, when promtool is on PATH).
+- **Built-in collectors** (opt-in): `fibers_workers`, `_workers_parked`,
+  `_worker_parks_total`, `_worker_queued_tasks{worker}`, `_pollers`,
+  `_poller_{sleeps,timer_wakeups,timers_fired,timers_cancelled,timer_heap_compactions}_total{poller}`,
+  `_blocking_threads`, `_blocking_threads_sleeping`,
+  `_blocking_sleeps_total`, `_stacks_mapped`, `_stacks_max`,
+  `_stack_size_bytes`, `_spawned_total`, `_finished_total`, `_alive`
+  (prefix configurable). The fiber counts are kept by the Scheduler: a
+  per-worker cache line written only by its worker (a relaxed load + store,
+  no RMW) plus one shared slot (`fetch_add`) for spawns from other threads.
+
+Micro-benchmark (`benchmarks/metrics_bench.cpp`, clang-release, ns per
+operation per thread, threads on distinct physical cores; indicative, the
+machine was busy):
+
+| | 1 thread | 4 threads |
+|---|---|---|
+| shared `std::atomic` `fetch_add` | 4.5 | 35 |
+| per-thread padded atomic (the floor) | 4.3 | 4.0 |
+| `Counter::inc` (16 shards) | 5.9 | 6.0 |
+| `Counter::inc` (1 shard) | 4.4 | 39 |
+| `Gauge::add` | 4.1 | 37 |
+| `Histogram::observe` (16 buckets) | 10.4 | 12.9 |
+
+A scrape of 100 counters and 10 histograms (16 shards) takes about 17 µs.
 
 # Synchronization primitives (`examples/sync/`)
 
