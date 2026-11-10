@@ -208,6 +208,28 @@
 // the poller thread, so two nodes per direction would not cover a third
 // earlier move anyway, and the control node does, exactly.
 //
+// Contexts (fibers/fiber/context.hpp, docs/cancellation.md)
+// -----------------------------------------------------------
+// A fiber that runs under a context waits interruptibly: once its arm
+// succeeded (and the deadline re-check passed) it enlists an Interrupt in
+// the context (fiber::InterruptScope) and parks. The context's end (cancel,
+// its deadline timer, a parent) runs the hook, which takes the waiter out
+// of the word with the same CAS the deadline expiry uses (&waiter -> EMPTY)
+// and wakes it with result ECANCELED / ETIMEDOUT; a readiness callback,
+// close() or an expiry that took the waiter first wins instead (one RMW on
+// the word decides), and the hook does nothing. A context that has already
+// ended fails the wait before arming (and the InterruptScope runs the hook
+// inline if it ends between the arm and the enlist). The effective deadline
+// is thus min(socket deadline, context deadline): two independent timers,
+// either ends the wait. Without a context the park path is the same as
+// before after one null check; the context is looked up once per io()
+// call, and only when the operation would block.
+//   Memory orders: the claim CAS is relaxed. The waiter's fields were
+// published by the arm CAS (release) and, more to the point, the arm is
+// sequenced before the enlist's unlock, which the canceller's lock acquires
+// before it runs the hook (or the hook runs on the waiter itself). The
+// result goes to the woken fiber through its wake, as for every waker.
+//
 // close() and timers: the close callback (poller thread) takes the lock,
 // sets closing_ (set_deadline() then fails with ECANCELED and arms
 // nothing) and withdraw()s every pending node (deadline timers and the
@@ -226,6 +248,7 @@
 #include <utility>
 
 #include "fibers/fail/fail_fast.hpp"
+#include "fibers/fiber/context.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/poller/poller.hpp"
 #include "fibers/poller/sources.hpp"
@@ -282,6 +305,7 @@ public:
     using Timer = typename Sched::Timer;
     using Fiber = fiber::BasicFiber<Sched>;
     using Waiter = IoWaiter<SyncPolicy>;
+    using Context = fiber::BasicContext<Sched>;
 
     static constexpr std::uintptr_t kEmpty = 0;
     static constexpr std::uintptr_t kReady = 1;
@@ -398,7 +422,10 @@ public:
     // Runs `op` (a non-blocking syscall: returns >= 0, or -errno) until it
     // returns something other than -EAGAIN, parking the calling fiber on
     // `dir` between attempts. Returns op's result, or -ECANCELED if the
-    // descriptor is closed meanwhile. Between enter() and leave(). Must be
+    // descriptor is closed meanwhile, or -ETIMEDOUT past the direction's
+    // deadline, or -ECANCELED / -ETIMEDOUT when the fiber's context ends
+    // (an attempt that does not have to wait still runs: see "Contexts" in
+    // the top comment). Between enter() and leave(). Must be
     // called from a fiber of Sched when it has to wait (fail fast otherwise).
     // At most one waiter per direction (fail fast on a second one).
     template <class Op>
@@ -406,6 +433,7 @@ public:
         Word& word = word_of(dir);
         Deadline& deadline = deadline_of(dir);
         Waiter waiter;
+        Context* ctx = nullptr;
         for (;;) {
             // An expired deadline fails at once, until it is moved.
             if (deadline.expired.load(std::memory_order_acquire) != 0) {
@@ -422,6 +450,12 @@ public:
                 }
                 waiter.self = self;
                 waiter.take = &take_fiber;
+                ctx = self->context();
+            }
+            if (ctx != nullptr) {
+                if (const int e = ctx->error_code(); e != 0) {
+                    return -e;  // would wait under an ended context
+                }
             }
             switch (arm(word, waiter)) {
                 case Arm::kRetry:
@@ -443,7 +477,11 @@ public:
                 // Taken by a waker meanwhile: its wake is on the way; park to
                 // consume it (the loop then sees the expiry).
             }
-            static_cast<Fiber*>(waiter.self)->park();
+            if (ctx == nullptr) [[likely]] {
+                static_cast<Fiber*>(waiter.self)->park();
+            } else {
+                park_interruptible(word, waiter, *ctx);
+            }
             if (waiter.result != 0) {
                 return -waiter.result;
             }
@@ -624,6 +662,42 @@ private:
                                            std::memory_order_seq_cst, std::memory_order_relaxed)) {
                 return Arm::kArmed;
             }
+        }
+    }
+
+    // What the context's hook needs to claim a parked waiter (on its stack).
+    struct ContextClaim {
+        Word* word;
+        Waiter* waiter;
+        Sched* scheduler;
+    };
+
+    // io(): park (armed already) until a waker or the context's end takes
+    // the waiter out of the word. See "Contexts" in the top comment.
+    [[gnu::noinline]] void park_interruptible(Word& word, Waiter& waiter, Context& ctx) noexcept {
+        ContextClaim claim{&word, &waiter, scheduler_};
+        fiber::InterruptScope<Sched> scope(ctx, &claim, &on_context_end);
+        static_cast<Fiber*>(waiter.self)->park();  // one wake: whoever took the waiter
+    }  // ~scope: delist (waits for a canceller still inside on_context_end)
+
+    // The context's hook (any thread, or inline on the waiter): first CAS on
+    // the word wins.
+    static void on_context_end(void* self, wait::Error reason) noexcept {
+        auto* claim = static_cast<ContextClaim*>(self);
+        Waiter* const w = claim->waiter;
+        Sched& scheduler = *claim->scheduler;
+        std::uintptr_t mine = reinterpret_cast<std::uintptr_t>(w);
+        // relaxed: see "Contexts" in the top comment (the context's lock
+        // orders the arm before this).
+        if (!claim->word->compare_exchange_strong(mine, kEmpty, std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;  // a waker took it: its wake is on the way
+        }
+        w->probe.read();
+        w->result = fiber::errno_of(reason);
+        Task task = w->take(w->self);  // last touch of the waiter
+        if (task) {
+            scheduler.pool().submit(std::move(task));
         }
     }
 

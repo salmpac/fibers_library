@@ -88,6 +88,15 @@
 // left to do, both run on that one thread) and wakes the fiber. post()
 // wakes a sleeping poller, so this costs one poller round trip, only for
 // waits that were resolved before their deadline.
+//
+// Contexts (fibers/fiber/context.hpp, docs/cancellation.md): an acquire()
+// in a fiber whose context has ended fails with ECANCELED / ETIMEDOUT
+// instead of waiting (one that does not have to wait still succeeds), and a
+// waiting one is interrupted by the context's end: its hook takes the lock
+// and, if the node is still linked, unlinks it with that result and wakes
+// the fiber (the same test as the timer callback: whoever unlinks the node
+// resolves it). The fiber then retires its timer as above. Factory::open()
+// runs in the acquiring fiber, so its I/O is under the context too.
 
 #include <cerrno>
 #include <concepts>
@@ -98,6 +107,7 @@
 #include <utility>
 
 #include "fibers/fail/fail_fast.hpp"
+#include "fibers/fiber/context.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/net/poll_desc.hpp"
 #include "fibers/object_pool/sharded_pool.hpp"
@@ -180,6 +190,7 @@ public:
     using SyncPolicy = typename Sched::SyncPolicy;
     using Fiber = fiber::BasicFiber<Sched>;
     using Timer = typename Sched::Timer;
+    using Context = fiber::BasicContext<Sched>;
 
     // A leased connection: returns it to the pool when destroyed (or
     // reset()), or closes it if mark_broken() was called. Move-only; may be
@@ -308,6 +319,13 @@ public:
             return ETIMEDOUT;
         } else {
             Fiber& self = Fiber::current_or_die("net: ConnectionPool::acquire() has to wait outside a fiber");
+            Context* ctx = self.context();
+            if (ctx != nullptr) {
+                if (const int e = ctx->error_code(); e != 0) {
+                    lock_.unlock();
+                    return e;  // would wait under an ended context
+                }
+            }
             Waiter w(this, &self, timed, false);
             if (timed) {
                 w.timer.deadline = deadline;
@@ -315,7 +333,7 @@ public:
             }
             push_waiter_locked(w);
             lock_.unlock();
-            park_waiter(self, w);
+            park_waiter(self, w, ctx);
             if (w.result != 0) {
                 if (w.result == ETIMEDOUT) {
                     counters_.timeouts.fetch_add(1, std::memory_order_relaxed);
@@ -694,7 +712,7 @@ private:
                 w.linked = true;
                 reaper_waiter_ = &w;
             }
-            park_waiter(self, w);  // the timer fired, or close() resolved it
+            park_waiter(self, w, nullptr);  // the timer fired, or close() resolved it
             if (w.result == ECANCELED) {
                 break;
             }
@@ -744,10 +762,16 @@ private:
         return w.fiber;
     }
 
-    // Parks until the waiter is resolved; then makes sure its timer is no
-    // longer referenced by the poller (see the top comment).
-    static void park_waiter(Fiber& self, Waiter& w) noexcept {
-        self.park();  // one wake: from whoever unlinked the node
+    // Parks until the waiter is resolved (also by the end of `ctx`, if
+    // any); then makes sure its timer is no longer referenced by the
+    // poller (see the top comment).
+    static void park_waiter(Fiber& self, Waiter& w, Context* ctx) noexcept {
+        if (ctx == nullptr) {
+            self.park();  // one wake: from whoever unlinked the node
+        } else {
+            fiber::InterruptScope<Sched> scope(*ctx, &w, &on_context_end);
+            self.park();  // one wake: from whoever unlinked the node
+        }  // ~scope: delist (waits for a canceller still inside on_context_end)
         if (w.timed && !w.fired) {
             auto* poller = static_cast<typename Sched::Poller*>(w.timer.poller());
             poller->post(w.retire);
@@ -775,6 +799,24 @@ private:
         // Not a single access to *w or *pool from here on.
         if (fiber != nullptr && fiber->prepare_wake()) {
             out.push(fiber->task());
+        }
+    }
+
+    // The context's hook (any thread, or inline on the waiter): resolves
+    // the waiter with the context's error if nobody has yet.
+    static void on_context_end(void* memo, wait::Error reason) noexcept {
+        auto* w = static_cast<Waiter*>(memo);
+        BasicConnectionPool* pool = w->pool;
+        Fiber* fiber = nullptr;
+        {
+            std::lock_guard guard(pool->lock_);
+            if (w->linked) {
+                fiber = pool->resolve_locked(*w, fiber::errno_of(reason), nullptr, false);
+            }
+        }
+        // Not a single access to *w or *pool from here on.
+        if (fiber != nullptr) {
+            fiber->wake();
         }
     }
 
