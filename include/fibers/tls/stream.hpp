@@ -103,12 +103,82 @@
 // to read alpn() / peer_subject() before any I/O.
 //
 // Lifetime: like net::Stream, neither copyable nor movable; reusable
-// (close(), then connect / accept / upgrade_* again). close() only closes
-// the transport (waking parked fibers with ECANCELED); the SSL object is
-// freed by the next upgrade_* or the destructor, so a fiber still finishing
-// an operation never touches freed memory. Operations wait (park) only
-// inside fibers of Sched; the accessors may be called from anywhere once
-// handshake() returned 0 (they read state captured at that point).
+// (close(), then connect / accept / upgrade_* again). Operations wait
+// (park) only inside fibers of Sched; the accessors may be called from
+// anywhere once handshake() returned 0 (they read state captured at that
+// point).
+//
+// close(), destruction and re-upgrade while operations are in flight
+// -------------------------------------------------------------------
+// close() is the one call that may run concurrently with operations (any
+// fiber, or a plain thread; see below). A woken operation does not end
+// when the transport returns ECANCELED: it still commits to the ring under
+// ssl_mu_, releases its role (the write role's release may flush the ring
+// again) and unlocks its mutex. So close() waits for that, not only for the
+// transport (whose own close() waits only for the syscalls):
+//
+//   ops_ = [ CLOSING bit 31 | operations inside ]. Every operation
+//   (handshake, read_some, write_some / write_all, shutdown, key_update;
+//   read_exact = several read_some) holds one reference for its whole run,
+//   from before its first touch of the TLS state to after its last (Op).
+//     enter:  CAS count + 1 unless CLOSING (else EBADF at once, nothing
+//             touched; like the transport's EBADF while it closes).
+//     leave:  fetch_sub(1); the one that brings CLOSING | 1 to CLOSING | 0
+//             wakes the closer (closer_; its last touch of the stream).
+//   close():  1. CAS: set CLOSING and take a reference of its own (another
+//                close() in progress: EBADF at once, without waiting).
+//             2. transport_.close(): parked operations wake with ECANCELED,
+//                running ones get EBADF from their next transport call, so
+//                every operation runs to its end without parking on the
+//                peer again (role mutexes are only held by such ones; one
+//                that gets its role only now sees CLOSING and gives up
+//                with ECANCELED, and the write role's release does not
+//                flush any more).
+//             3. closer_ = its WaitNode (a fiber parks; a plain thread
+//                sleeps on wait::ThreadWaiter), drop its own reference; if
+//                operations are still inside, wait for the last one.
+//             4. ops_ = 0 (later operations run, and fail on the closed
+//                transport with EBADF until it is reopened).
+//   After close() returns no operation that entered before it touches the
+//   stream again: it may be destroyed, or reopened (transport().connect /
+//   adopt / accept) and upgrade_*d.
+//
+//   Memory orders. leave: acq_rel -- release: the operation's work (plain
+//   fields, OpenSSL state, the rings) happens before the closer's teardown;
+//   acquire: closer_ (published by the closer's fetch_sub). The closer's
+//   fetch_sub: acq_rel -- release publishes closer_ to the last leaver;
+//   acquire: if the closer is last, every operation's work (all leaves are
+//   RMWs on ops_, so they and the closer's RMWs form one release sequence).
+//   If an operation is last, the wake (fiber state word / ThreadWaiter's
+//   release) carries it. enter, the CLOSING CAS and the final store are
+//   relaxed: they publish nothing (the fields an operation reads come from
+//   upgrade_*, which the caller orders before its operations). Checked with
+//   TSan (the Twist presets have no TLS) by weakening one half at a time:
+//   leave without release, or the closer's fetch_sub without acquire ->
+//   TlsLifetime.*Destroy* report the operation's tail racing with the
+//   teardown; leave without acquire, or the closer's fetch_sub without
+//   release -> TlsLifetime.CloseWithSecondReaderWaitingForTheRole (an
+//   operation is last) reports a race on closer_ / the closer's node.
+//
+// The destructor is close() + freeing the TLS state; upgrade_* (and
+// connect / accept) free the old state. Both require that no operation is
+// in flight and no other close() is in progress, i.e. that a close() (or
+// the destructor's own) has returned and nothing started an operation
+// since: they fail fast if they see otherwise (a best-effort check: an
+// operation that starts concurrently with them is a race in the caller
+// that cannot always be seen). A close() that finds another one in
+// progress returns EBADF at once, without waiting: only the close() that
+// did the work orders a later destroy / reopen (the destructor's own
+// close() finding one in progress fails fast, see above).
+//
+// Waiting in close() parks a fiber; outside fibers it blocks the thread,
+// so it must not run on a worker thread of the scheduler (outside a fiber)
+// nor on a poller thread (inside a timer or fd callback: the transport's
+// close() needs that thread's poller, so it would deadlock). close()
+// outside a fiber checks for a poller thread (one thread-local read, and
+// only when it would block: an open transport, or operations to wait for)
+// and fails fast there; the destructor closes, so the same holds for
+// destroying an open stream in a callback.
 //
 // Stack
 // -----
@@ -159,6 +229,8 @@
 #include "fibers/net/socket.hpp"
 #include "fibers/sched/scheduler.hpp"
 #include "fibers/tls/context.hpp"
+#include "fibers/wait/thread_waiter.hpp"
+#include "fibers/wait/wait_node.hpp"
 
 namespace fibers::tls {
 
@@ -171,6 +243,8 @@ public:
     using Listener = net::BasicListener<Sched>;
     using Mutex = fiber::BasicMutex<Sched>;
     using Fiber = fiber::BasicFiber<Sched>;
+    using SyncPolicy = typename Sched::SyncPolicy;
+    using Poller = typename Sched::Poller;
 
     // Plaintext bytes per SSL_write (one record).
     static constexpr std::size_t kRecordPlaintext = 16384;
@@ -179,8 +253,12 @@ public:
     BasicTlsStream(const BasicTlsStream&) = delete;
     BasicTlsStream& operator=(const BasicTlsStream&) = delete;
 
+    // close() (waits for operations still inside, see "Lifetime"), then
+    // frees the TLS state. Fails fast if another close() is in progress or
+    // an operation started meanwhile.
     ~BasicTlsStream() {
-        static_cast<void>(transport_.close());
+        static_cast<void>(close());
+        expect_idle("tls: TlsStream destroyed while another close() or an operation is in progress");
         reset();
     }
 
@@ -256,7 +334,9 @@ public:
     // (a buffered reader that overshot); at most read_buffer_size bytes.
     // 0, EINVAL (bad arguments / context), ENOTCONN (transport not open),
     // EMSGSIZE (already_received too big), ENOMEM.
-    // Not concurrently with any other operation on this stream.
+    // Not concurrently with any other call on this stream; after a close()
+    // that interrupted operations, only once that close() has returned (it
+    // waits for them). Fails fast if it sees an operation in flight.
     int upgrade_client(TlsContext& ctx, const char* server_name,
                        std::span<const std::byte> already_received = {}) noexcept {
         if (!ctx.initialized() || ctx.is_server()) {
@@ -297,13 +377,11 @@ public:
         if (established_.load(std::memory_order_acquire)) {
             return 0;
         }
-        check_stack();
-        read_mu_.lock();
-        write_mu_.lock();
-        const int e = handshake_held();
-        release_write_role();
-        read_mu_.unlock();
-        return e;
+        const Op op(*this);
+        if (!op) {
+            return EBADF;
+        }
+        return handshake_entered();
     }
 
     // ---- I/O (net::Stream's surface) ------------------------------------------
@@ -314,14 +392,18 @@ public:
         if (size == 0) {
             return IoResult{0, 0};
         }
+        const Op op(*this);
+        if (!op) {
+            return IoResult{0, EBADF};
+        }
         if (!established_.load(std::memory_order_acquire)) {
-            if (const int e = handshake(); e != 0) {
+            if (const int e = handshake_entered(); e != 0) {
                 return IoResult{0, e};
             }
         }
         check_stack();
         read_mu_.lock();
-        const IoResult r = read_held(buffer, size);
+        const IoResult r = closing() ? IoResult{0, ECANCELED} : read_held(buffer, size);
         read_mu_.unlock();
         return r;
     }
@@ -355,11 +437,15 @@ public:
     // the same way (the peer reads end of stream). SHUT_RD: transport only.
     // Reading goes on working after SHUT_WR (TLS 1.3 half-close). 0 or errno.
     int shutdown(int how = SHUT_WR) noexcept {
+        const Op op(*this);
+        if (!op) {
+            return EBADF;
+        }
         int error = 0;
         if (how != SHUT_RD && ssl_ != nullptr) {
             check_stack();
             write_mu_.lock();
-            for (int attempt = 0; attempt < 2; ++attempt) {
+            for (int attempt = 0; attempt < 2 && !closing(); ++attempt) {
                 bool again = false;
                 {
                     std::lock_guard ssl_guard(ssl_mu_);
@@ -383,11 +469,48 @@ public:
         return error != 0 ? error : e;
     }
 
-    // Closes the transport (fibers parked in an operation wake with
-    // ECANCELED). Abrupt: no close_notify (call shutdown() first for a clean
-    // close). The TLS state stays until the next upgrade_* / destruction.
-    // 0 or EBADF. Any thread.
-    int close() noexcept { return transport_.close(); }
+    // Closes the transport and waits until every operation in progress has
+    // left the stream (fibers parked in one wake with ECANCELED; operations
+    // started meanwhile fail with EBADF). Abrupt: no close_notify (call
+    // shutdown() first for a clean close). The TLS state stays until the
+    // next upgrade_* / destruction, which may follow as soon as this
+    // returned. 0, or EBADF (not open, or another close() is in progress:
+    // then it returns at once, without waiting). Any fiber, or a plain
+    // thread that is neither a worker nor a poller thread (see "Lifetime").
+    int close() noexcept {
+        std::uint32_t s = ops_.load(std::memory_order_relaxed);
+        for (;;) {
+            if ((s & kClosing) != 0) {
+                return EBADF;
+            }
+            // relaxed: publishes nothing (see "Lifetime"); the reference
+            // keeps any leave() from being last before closer_ is set.
+            if (ops_.compare_exchange_weak(s, (s + 1) | kClosing, std::memory_order_relaxed,
+                                           std::memory_order_relaxed)) {
+                break;
+            }
+        }
+        Fiber* const self = Fiber::current();
+        if (self == nullptr && ((s & kOpMask) != 0 || transport_.is_open_approx()) && Poller::on_poller_thread())
+            [[unlikely]] {
+            fail::fail_fast("tls: TlsStream::close() / destruction on a poller thread (in a callback) would deadlock");
+        }
+        const int e = transport_.close();
+        if (self != nullptr) {
+            wait::WaitNode node = self->wait_node();
+            if (drop_closer_reference(node)) {
+                self->park();  // the last leave() wakes us
+            }
+        } else {
+            wait::ThreadWaiter<SyncPolicy> waiter;
+            if (drop_closer_reference(waiter.node)) {
+                waiter.wait();
+            }
+        }
+        // No operation inside, none can enter: reopen for later ones.
+        ops_.store(0, std::memory_order_relaxed);
+        return e;
+    }
 
     // TLS 1.3 KeyUpdate: new traffic keys for our direction; request_peer
     // asks the peer to update its own too (its reader answers through its
@@ -396,13 +519,19 @@ public:
         if (!established_.load(std::memory_order_acquire)) {
             return ENOTCONN;
         }
+        const Op op(*this);
+        if (!op) {
+            return EBADF;
+        }
         check_stack();
         write_mu_.lock();
         int error = 0;
         {
             std::lock_guard ssl_guard(ssl_mu_);
             ERR_clear_error();
-            if (fatal_ != 0) {
+            if (closing()) {
+                error = ECANCELED;
+            } else if (fatal_ != 0) {
                 error = fatal_;
             } else if (SSL_key_update(ssl_, request_peer ? SSL_KEY_UPDATE_REQUESTED
                                                          : SSL_KEY_UPDATE_NOT_REQUESTED) != 1) {
@@ -498,6 +627,7 @@ private:
         if (!transport_.is_open_approx()) {
             return ENOTCONN;
         }
+        expect_idle("tls: upgrade_* while an operation or a close() is in progress on the stream");
         reset();
         const CommonOptions& o = ctx.options();
         if (already_received.size() > o.read_buffer_size) {
@@ -576,6 +706,77 @@ private:
         alpn_len_ = 0;
         version_ = nullptr;
         cipher_ = nullptr;
+    }
+
+    // ---- operation references (see "Lifetime" in the top comment) --------------------
+
+    static constexpr std::uint32_t kClosing = std::uint32_t{1} << 31;
+    static constexpr std::uint32_t kOpMask = kClosing - 1;
+
+    // One operation's reference, for its whole run (declare it before the
+    // first touch of the stream: it is destroyed after the last one).
+    class Op {
+    public:
+        explicit Op(BasicTlsStream& s) noexcept : s_(s), entered_(s.enter()) {}
+        ~Op() {
+            if (entered_) {
+                s_.leave();
+            }
+        }
+        Op(const Op&) = delete;
+        Op& operator=(const Op&) = delete;
+        explicit operator bool() const noexcept { return entered_; }
+
+    private:
+        BasicTlsStream& s_;
+        bool entered_;
+    };
+
+    // false: a close() is in progress (the operation fails with EBADF
+    // without touching anything).
+    bool enter() noexcept {
+        std::uint32_t s = ops_.load(std::memory_order_relaxed);
+        for (;;) {
+            if ((s & kClosing) != 0) {
+                return false;
+            }
+            // relaxed: nothing to acquire (see "Lifetime").
+            if (ops_.compare_exchange_weak(s, s + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+    }
+
+    void leave() noexcept {
+        // release: this operation's work before the closer's teardown;
+        // acquire: closer_, published by the closer's fetch_sub.
+        const std::uint32_t s = ops_.fetch_sub(1, std::memory_order_acq_rel);
+        if (s == (kClosing | 1)) {
+            closer_->notify();  // reads closer_ first; *this may be gone after the wake
+        }
+    }
+
+    // close(), after closing the transport: publishes `node` and drops the
+    // closer's own reference. true: operations are still inside, and the
+    // last one wakes `node`.
+    bool drop_closer_reference(wait::WaitNode& node) noexcept {
+        closer_ = &node;
+        // release: closer_ to the last leave(); acquire: if we are last,
+        // every operation's work (the leaves are in this RMW's release
+        // sequence).
+        const std::uint32_t s = ops_.fetch_sub(1, std::memory_order_acq_rel);
+        return (s & kOpMask) != 1;
+    }
+
+    // A close() is in progress: an operation that got its role only now
+    // (it waited behind one that close() interrupted) gives up at once.
+    bool closing() const noexcept { return (ops_.load(std::memory_order_relaxed) & kClosing) != 0; }
+
+    // Teardown / re-setup: no operation inside, no close() running.
+    void expect_idle(const char* message) const noexcept {
+        if (ops_.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            fail::fail_fast(message);
+        }
     }
 
     // ---- OpenSSL calls (ssl_mu_ held, same thread throughout) ------------------
@@ -703,17 +904,22 @@ private:
         }
     }
 
+    // net_bio_ is null without a session (handshake() before upgrade_*).
+    // It only changes in setup() / reset(), never while an operation is in
+    // (expect_idle); reading it under ssl_mu_ anyway keeps every read of
+    // the session fields in one place.
     bool output_pending() noexcept {
         std::lock_guard ssl_guard(ssl_mu_);
-        return BIO_ctrl_pending(net_bio_) > 0;
+        return net_bio_ != nullptr && BIO_ctrl_pending(net_bio_) > 0;
     }
 
     // Unlocks the write role without stranding output that someone (a
-    // reader) appended while we held it.
+    // reader) appended while we held it. While closing, what is left is
+    // dropped (the transport is gone).
     void release_write_role() noexcept {
         for (;;) {
             write_mu_.unlock();
-            if (net_bio_ == nullptr || !output_pending() || !write_mu_.try_lock()) {
+            if (closing() || !output_pending() || !write_mu_.try_lock()) {
                 return;  // nothing queued, or the new holder flushes it
             }
             if (flush_held() != 0) {
@@ -732,6 +938,17 @@ private:
     }
 
     // ---- operations -------------------------------------------------------------------
+
+    // Inside an operation (Op): takes both roles.
+    int handshake_entered() noexcept {
+        check_stack();
+        read_mu_.lock();
+        write_mu_.lock();
+        const int e = closing() ? ECANCELED : handshake_held();
+        release_write_role();
+        read_mu_.unlock();
+        return e;
+    }
 
     // Both roles held.
     int handshake_held() noexcept {
@@ -848,8 +1065,12 @@ private:
         if (size == 0) {
             return IoResult{0, 0};
         }
+        const Op op(*this);
+        if (!op) {
+            return IoResult{0, EBADF};
+        }
         if (!established_.load(std::memory_order_acquire)) {
-            if (const int e = handshake(); e != 0) {
+            if (const int e = handshake_entered(); e != 0) {
                 return IoResult{0, e};
             }
         }
@@ -857,9 +1078,9 @@ private:
         const auto* p = static_cast<const char*>(buffer);
         write_mu_.lock();
         std::size_t done = 0;
-        int error = 0;
+        int error = closing() ? ECANCELED : 0;  // waited for the role behind an interrupted writer
         bool fatal = false;
-        while (done < size) {
+        while (done < size && error == 0) {
             Step step = Step::kDone;
             {
                 std::lock_guard ssl_guard(ssl_mu_);
@@ -950,7 +1171,12 @@ private:
     Mutex write_mu_;
     Mutex ssl_mu_;
 
-    // Set by upgrade_* (no operation running); read by the operations.
+    // Operation references and the waiting close() (see "Lifetime").
+    typename SyncPolicy::template Atomic<std::uint32_t> ops_{0};
+    wait::WaitNode* closer_ = nullptr;  // written by close() before its fetch_sub
+
+    // Set by upgrade_* (no operation running, expect_idle); read by the
+    // operations.
     SSL* ssl_ = nullptr;
     BIO* ssl_bio_ = nullptr;  // OpenSSL's half (owned by ssl_)
     BIO* net_bio_ = nullptr;  // ours

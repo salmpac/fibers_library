@@ -69,11 +69,13 @@
 // Concurrency: as the underlying stream (one reader fiber + one writer
 // fiber at a time; full duplex with TLS too). set_io_timeout, connect,
 // adopt, accept and start_tls_* must not run concurrently with any other
-// operation. Deadline setters: any thread, like Stream's.
+// operation. close() may (a watchdog): it waits until the operations in
+// progress have left. Deadline setters: any thread, like Stream's.
 //
 // Lifetime: like net::Stream, neither copyable nor movable, reusable after
 // close() (connect / adopt / accept again: plaintext again until
-// start_tls_*). The destructor closes. No allocation in this code.
+// start_tls_*), also when close() interrupted operations of other fibers,
+// once it has returned. The destructor closes. No allocation in this code.
 
 #include <sys/socket.h>
 
@@ -266,9 +268,19 @@ public:
     }
 
     // Closes the socket (abrupt for TLS: shutdown() first for close_notify);
-    // fibers parked in an operation wake with ECANCELED. 0 or EBADF. Any
-    // thread.
-    int close() noexcept { return transport().close(); }
+    // fibers parked in an operation wake with ECANCELED. Returns once every
+    // operation in progress has left the connection (with TLS: the TLS
+    // stream's close(), which also waits for the operations' tails, see
+    // "Lifetime" in fibers/tls/stream.hpp), so it may then be destroyed or
+    // opened again. 0 or EBADF. Any fiber, or a plain thread that is
+    // neither a worker nor a poller thread.
+    int close() noexcept {
+        if constexpr (kHasTls) {
+            return layer_.close();
+        } else {
+            return transport().close();
+        }
+    }
 
     // ---- timeouts and deadlines -----------------------------------------------------
 

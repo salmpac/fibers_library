@@ -100,6 +100,22 @@ struct PollerOptions {
     int cpu = -1;
 };
 
+namespace detail {
+
+// Set once at the start of a reactor thread (Poller::run). Read only on
+// slow paths that would block the calling thread (on_poller_thread()).
+struct PollerThreadMark {
+    bool reactor = false;
+};
+
+template <class Sync>
+[[gnu::noinline]] PollerThreadMark& poller_thread_mark() noexcept {
+    asm volatile("" ::: "memory");  // see thread_pool::detail::thread_state()
+    return Sync::template thread_local_instance<PollerThreadMark>();
+}
+
+}  // namespace detail
+
 // Counters for tests / monitoring (relaxed, approximate while running).
 struct PollerStats {
     std::uint64_t sleeps = 0;         // blocking waits entered
@@ -160,6 +176,12 @@ public:
     TimePoint now() noexcept { return backend_.now(); }
 
     B& backend() noexcept { return backend_; }
+
+    // Whether the calling thread is the reactor thread of a running Poller
+    // (with this Sync), i.e. we are in a callback: code that would block the
+    // thread (e.g. a close() that waits for this poller) can fail fast
+    // instead of deadlocking. One thread-local read; for slow paths.
+    static bool on_poller_thread() noexcept { return detail::poller_thread_mark<Sync>().reactor; }
 
     // ---- any thread -------------------------------------------------------
 
@@ -300,6 +322,7 @@ private:
     // ---- reactor loop -----------------------------------------------------
 
     void run() noexcept {
+        detail::poller_thread_mark<Sync>().reactor = true;
         sync::pin_current_thread<Sync>(options_.cpu, "Poller");
         backend_.on_reactor_start();
         std::size_t idle_rounds = 0;

@@ -1728,6 +1728,48 @@ TEST(TlsLifetime, CloseThenUpgradeAgainWhileWriterUnwinds) { upgrade_again_while
 
 TEST(TlsLifetime, CloseThenUpgradeAgainFromFiberWhileWriterUnwinds) { upgrade_again_while_writer_unwinds(true); }
 
+// A reader parked on the transport and a second one queued behind it for
+// the read role (or about to be): close() interrupts both (the second gives
+// up as soon as it gets the role); afterwards the stream reads EBADF and
+// can be upgraded again.
+TEST(TlsLifetime, CloseWithSecondReaderWaitingForTheRole) {
+    Scheduler scheduler(options(2));
+    Established e(scheduler);
+    ASSERT_TRUE(e.ok);
+    TlsStream& client = *e.client;
+    Latch done(2);
+    std::atomic<int> first{-100};
+    std::atomic<int> second{-100};
+    fiber::go(scheduler, [&]() noexcept {
+        char buf[64];
+        first.store(client.read_some(buf, sizeof buf).error);
+        done.count_down();
+    });
+    ASSERT_TRUE(eventually([&] { return parked(client, net::Direction::kRead); }));
+    std::atomic<bool> second_started{false};
+    fiber::go(scheduler, [&]() noexcept {
+        second_started.store(true);
+        char buf[64];
+        second.store(client.read_some(buf, sizeof buf).error);
+        done.count_down();
+    });
+    ASSERT_TRUE(eventually([&] { return second_started.load(); }));
+    EXPECT_EQ(client.close(), 0);
+    ASSERT_TRUE(done.wait());
+    EXPECT_TRUE(interrupted(first.load())) << first.load();
+    EXPECT_TRUE(interrupted(second.load())) << second.load();
+    EXPECT_EQ(client.close(), EBADF);
+    std::atomic<int> after{-100};
+    Latch read_done(1);
+    fiber::go(scheduler, [&]() noexcept {
+        char buf[8];
+        after.store(client.read_some(buf, sizeof buf).error);
+        read_done.count_down();
+    });
+    ASSERT_TRUE(read_done.wait());
+    EXPECT_EQ(after.load(), EBADF);
+}
+
 
 // ---- interop with the openssl CLI -----------------------------------------------------
 
@@ -1979,6 +2021,59 @@ TEST(TlsDeathTest, StackReserveFailsFast) {
             std::_Exit(0);
         },
         "stack_reserve");
+}
+
+// upgrade_* while an operation is in flight (no close() before): fail fast
+// instead of freeing the SSL object under it.
+TEST(TlsDeathTest, UpgradeWhileOperationInFlightFailsFast) {
+    if (kSanitized) {
+        GTEST_SKIP() << "death tests with sanitizers and threads are unreliable";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            Scheduler scheduler(options(2));
+            Established e(scheduler);
+            if (!e.ok) {
+                std::abort();
+            }
+            TlsStream* client = e.client.get();
+            fiber::go(scheduler, [client]() noexcept {
+                char buf[16];
+                static_cast<void>(client->read_some(buf, sizeof buf));
+            });
+            if (!eventually([&] { return parked(*client, net::Direction::kRead); })) {
+                std::abort();
+            }
+            static_cast<void>(client->upgrade_client(e.cctx, "localhost"));
+            std::_Exit(0);
+        },
+        "upgrade_\\* while an operation");
+}
+
+// close() (here: of an open stream) in a poller callback would deadlock
+// (the transport's close needs that poller): fail fast instead.
+TEST(TlsDeathTest, CloseOnPollerThreadFailsFast) {
+    if (kSanitized) {
+        GTEST_SKIP() << "death tests with sanitizers and threads are unreliable";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            Scheduler scheduler(options(2));
+            Established e(scheduler);
+            if (!e.ok) {
+                std::abort();
+            }
+            Scheduler::Timer timer(e.client.get(),
+                                   [](void* memo, fibers::poller::TimerEvent, fibers::poller::TaskBatch&) noexcept {
+                                       static_cast<void>(static_cast<TlsStream*>(memo)->close());
+                                   });
+            scheduler.pollers().next().post(timer);
+            std::this_thread::sleep_for(10s);  // the callback dies long before
+            std::_Exit(0);
+        },
+        "poller thread");
 }
 
 }  // namespace
