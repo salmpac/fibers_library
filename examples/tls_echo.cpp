@@ -41,6 +41,7 @@
 #include "common.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/net/socket.hpp"
+#include "fibers/object_pool/pooled.hpp"
 #include "fibers/sched/scheduler.hpp"
 #include "fibers/sync/spin_lock.hpp"
 #include "fibers/tls/context.hpp"
@@ -81,7 +82,10 @@ fibers::sched::SchedulerOptions scheduler_options(const examples::Args& args, st
 
 // ---- server -----------------------------------------------------------------------
 
+// A pool of connection slots (object_pool::LeasablePool).
 struct Server {
+    using value_type = tls::TlsStream;
+
     explicit Server(std::size_t max_connections)
         : capacity(max_connections),
           streams(std::make_unique<tls::TlsStream[]>(max_connections)),
@@ -92,12 +96,12 @@ struct Server {
         }
     }
 
-    tls::TlsStream* acquire() {
+    tls::TlsStream* acquire() noexcept {
         std::lock_guard guard(lock);
         return free_count == 0 ? nullptr : &streams[free_slots[--free_count]];
     }
 
-    void release(tls::TlsStream* s) {
+    void release(tls::TlsStream* s) noexcept {
         std::lock_guard guard(lock);
         free_slots[free_count++] = static_cast<std::size_t>(s - streams.get());
     }
@@ -225,14 +229,13 @@ int run_server(const examples::Args& args) {
     fiber::go(scheduler, [&]() noexcept {
         Server& srv = *server;
         for (;;) {
-            tls::TlsStream* s = srv.acquire();
-            if (s == nullptr) {
+            auto s = fibers::object_pool::lease(srv);
+            if (!s) {
                 fiber::this_fiber::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
             const int e = s->accept(listener, ctx);
             if (e != 0) {
-                srv.release(s);
                 if (e == ECANCELED || e == EBADF) {
                     break;  // the listener was closed
                 }
@@ -241,9 +244,9 @@ int run_server(const examples::Args& args) {
             }
             srv.accepted.fetch_add(1, std::memory_order_relaxed);
             srv.active.fetch_add(1, std::memory_order_relaxed);
-            fiber::go<Scheduler>([&srv, s]() noexcept {
+            fiber::go<Scheduler>([&srv, s = std::move(s)]() mutable noexcept {
                 serve(srv, *s);
-                srv.release(s);
+                s.reset();  // the slot is free before `active` drops
                 srv.active.fetch_sub(1, std::memory_order_release);
             });
         }

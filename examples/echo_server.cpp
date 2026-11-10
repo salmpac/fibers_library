@@ -9,7 +9,8 @@
 // Runs until SIGINT / SIGTERM, then closes the listener and every open
 // connection (their fibers wake up with ECANCELED), waits for the fibers and
 // stops the scheduler. Connections live in a fixed array (no allocation per
-// connection): a free list under a spin lock hands out slots.
+// connection): a free list under a spin lock hands out slots, leased as
+// object_pool::Pooled handles that return them when dropped.
 
 #include <signal.h>
 #include <unistd.h>
@@ -24,6 +25,7 @@
 #include "common.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/net/socket.hpp"
+#include "fibers/object_pool/pooled.hpp"
 #include "fibers/sched/scheduler.hpp"
 #include "fibers/sync/spin_lock.hpp"
 
@@ -33,7 +35,10 @@ using fibers::sched::Scheduler;
 
 namespace {
 
+// A pool of connection slots (object_pool::LeasablePool).
 struct Server {
+    using value_type = net::Stream;
+
     explicit Server(std::size_t max_connections)
         : capacity(max_connections),
           streams(std::make_unique<net::Stream[]>(max_connections)),
@@ -45,7 +50,7 @@ struct Server {
     }
 
     // nullptr when all slots are taken.
-    net::Stream* acquire() {
+    net::Stream* acquire() noexcept {
         std::lock_guard guard(lock);
         if (free_count == 0) {
             return nullptr;
@@ -53,7 +58,7 @@ struct Server {
         return &streams[free_slots[--free_count]];
     }
 
-    void release(net::Stream* s) {
+    void release(net::Stream* s) noexcept {
         std::lock_guard guard(lock);
         free_slots[free_count++] = static_cast<std::size_t>(s - streams.get());
     }
@@ -138,15 +143,14 @@ int main(int argc, char** argv) {
     fiber::go(scheduler, [&]() noexcept {
         Server& srv = *server;
         for (;;) {
-            net::Stream* s = srv.acquire();
-            if (s == nullptr) {
+            auto s = fibers::object_pool::lease(srv);
+            if (!s) {
                 std::fprintf(stderr, "echo_server: out of connection slots\n");
                 fiber::this_fiber::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
             const int error = listener.accept(*s);
             if (error != 0) {
-                srv.release(s);
                 if (error == EMFILE || error == ENFILE || error == ENOBUFS || error == ENOMEM) {
                     fiber::this_fiber::sleep_for(std::chrono::milliseconds(10));
                     continue;
@@ -158,9 +162,9 @@ int main(int argc, char** argv) {
             }
             srv.accepted.fetch_add(1, std::memory_order_relaxed);
             srv.active.fetch_add(1, std::memory_order_relaxed);
-            fiber::go<Scheduler>([&srv, s]() noexcept {
+            fiber::go<Scheduler>([&srv, s = std::move(s)]() mutable noexcept {
                 serve(srv, *s);
-                srv.release(s);
+                s.reset();  // the slot is free before `active` drops
                 srv.active.fetch_sub(1, std::memory_order_release);
             });
         }
