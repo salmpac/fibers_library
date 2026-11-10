@@ -16,6 +16,7 @@
 #include <new>
 #include <optional>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -129,6 +130,10 @@ struct CountingAllocator {
 };
 static_assert(fibers::object_pool::PoolAllocator<CountingAllocator>);
 
+// p.set(args...) is a valid call.
+template <class P, class... Args>
+concept CanSet = requires(P& p, Args&&... args) { p.set(std::forward<Args>(args)...); };
+
 // A pooled state over a counting release hook, for the core tests.
 template <class T>
 struct PooledState {
@@ -169,6 +174,39 @@ TEST(ResultDeathTest, WrongAccess) {
     EXPECT_DEATH(
         {
             fw::Result<int> ok(std::in_place, 1);
+            static_cast<void>(ok.error());
+        },
+        "error\\(\\) on a value");
+}
+
+TEST(Result, Void) {
+    fw::Result<void> ok;
+    EXPECT_TRUE(ok.has_value());
+    EXPECT_TRUE(static_cast<bool>(ok));
+    ok.value();  // checks only
+    *ok;
+    const fw::Result<void> in_place(std::in_place);
+    EXPECT_TRUE(in_place);
+    fw::Result<void> bad = fw::Error::kBroken;
+    EXPECT_FALSE(bad);
+    EXPECT_EQ(bad.error(), fw::Error::kBroken);
+    bad = ok;  // copyable, like Result<T>
+    EXPECT_TRUE(bad);
+    static_assert(std::is_same_v<fw::Result<void>::value_type, void>);
+    static_assert(std::is_same_v<fiber::Result<void>, fw::Result<void>>);
+}
+
+TEST(ResultDeathTest, VoidWrongAccess) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            fw::Result<void> bad = fw::Error::kBroken;
+            bad.value();
+        },
+        "value\\(\\) on an error");
+    EXPECT_DEATH(
+        {
+            fw::Result<void> ok;
             static_cast<void>(ok.error());
         },
         "error\\(\\) on a value");
@@ -270,6 +308,39 @@ TEST(OneshotCore, DetachThenAbandon) {
     EXPECT_EQ(state->detach(), OneshotStatus::kPending);
     promise.abandon();
     EXPECT_EQ(pooled.released.load(), 1);
+}
+
+// T = void: the same protocol, the slot holds an empty tag; set() takes no
+// arguments, take() returns a Result<void>.
+TEST(OneshotCore, Void) {
+    {
+        OneshotState<void> state;
+        fw::BasicPromise<void> promise(&state);
+        Waiter w;
+        EXPECT_EQ(state.wait_or_enqueue(w.node), OneshotStatus::kPending);
+        promise.set();
+        EXPECT_FALSE(promise.valid());
+        EXPECT_EQ(w.wakes, 1);
+        fw::Result<void> r = state.take(state.status());
+        EXPECT_TRUE(r);
+    }
+    {
+        OneshotState<void> state;
+        { fw::BasicPromise<void> promise(&state); }  // broken
+        fw::Result<void> r = state.take(state.status());
+        ASSERT_FALSE(r);
+        EXPECT_EQ(r.error(), fw::Error::kBroken);
+    }
+    {  // pooled, consumer detached first: the producer frees
+        PooledState<void> pooled;
+        OneshotState<void>* state = pooled.make();
+        fw::BasicPromise<void> promise(state);
+        EXPECT_EQ(state->detach(), OneshotStatus::kPending);
+        promise.set();
+        EXPECT_EQ(pooled.released.load(), 1);
+    }
+    static_assert(!CanSet<fw::BasicPromise<void>, int>);
+    static_assert(CanSet<fw::BasicPromise<void>>);
 }
 
 TEST(OneshotCoreDeathTest, Misuse) {
@@ -501,6 +572,36 @@ TEST(Oneshot, OnPlainThreads) {
     }
 }
 
+TEST(Oneshot, VoidOnPlainThreads) {
+    {
+        fiber::Oneshot<void> done;
+        fiber::Promise<void> p = done.promise();
+        int payload = 0;  // written before set(), read after get()
+        std::thread producer([&] {
+            std::this_thread::sleep_for(1ms);
+            payload = 5;
+            p.set();
+        });
+        const fiber::Result<void> r = done.get();  // blocks this thread
+        producer.join();
+        EXPECT_TRUE(r);
+        EXPECT_EQ(payload, 5);
+    }
+    {
+        fiber::Oneshot<void> done;
+        done.promise().abandon();
+        std::optional<fiber::Result<void>> r = done.try_get();
+        ASSERT_TRUE(r.has_value());
+        ASSERT_FALSE(*r);
+        EXPECT_EQ(r->error(), fw::Error::kBroken);
+    }
+    {
+        fiber::Oneshot<void> done;
+        done.promise().set();  // never taken: fine
+        EXPECT_TRUE(done.ready());
+    }
+}
+
 TEST(OneshotDeathTest, Misuse) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_DEATH(
@@ -590,6 +691,50 @@ TEST(Future, LifetimesWithCountingAllocator) {
     EXPECT_EQ(alloc.live.load(), 0);
     EXPECT_EQ(alloc.total.load(), 7);
     EXPECT_EQ(Tracked::live.load(), 0);
+}
+
+TEST(Future, Void) {
+    CountingAllocator alloc;
+    {  // set, then get
+        auto [promise, future] = fiber::make_promise_future<void>(alloc);
+        promise.set();
+        EXPECT_TRUE(future.ready());
+        const fiber::Result<void> r = future.get();
+        EXPECT_TRUE(r);
+        EXPECT_FALSE(future.valid());
+    }
+    {  // detach before set: the producer frees
+        auto [promise, future] = fiber::make_promise_future<void>(alloc);
+        future.detach();
+        promise.set();
+    }
+    {  // broken
+        auto [promise, future] = fiber::make_promise_future<void>(alloc);
+        promise.abandon();
+        const fiber::Result<void> r = future.get();
+        ASSERT_FALSE(r);
+        EXPECT_EQ(r.error(), fw::Error::kBroken);
+    }
+    {  // set, then the Future dropped untaken
+        auto [promise, future] = fiber::make_promise_future<void>(alloc);
+        promise.set();
+    }
+    EXPECT_EQ(alloc.live.load(), 0);
+    EXPECT_EQ(alloc.total.load(), 4);
+
+    // From the scheduler's TaskMemoryPool, completed by a fiber, waited for
+    // by this (plain) thread.
+    Scheduler scheduler(options(2));
+    for (int i = 0; i < 100; ++i) {
+        auto [promise, future] = fiber::make_promise_future<void>(scheduler);
+        int payload = 0;
+        fiber::go(scheduler, [&payload, i, p = std::move(promise)]() mutable noexcept {
+            payload = i + 1;
+            p.set();
+        });
+        EXPECT_TRUE(future.get());
+        EXPECT_EQ(payload, i + 1);
+    }
 }
 
 TEST(Future, TaskMemoryPoolBlocks) {
@@ -786,6 +931,34 @@ TEST(OneshotFibers, ProducerOnPlainThread) {
     });
     ASSERT_TRUE(done.wait());
     producer.join();
+    EXPECT_EQ(bad.load(), 0);
+}
+
+// Oneshot<void> as a "done" signal between fibers: the consumer parks
+// until the producer fiber's set().
+TEST(OneshotFibers, VoidSignal) {
+    constexpr int kRounds = 2000;
+    Latch done(1);
+    std::atomic<int> bad{0};
+    Scheduler scheduler(options(4));
+    fiber::go(scheduler, [&]() noexcept {
+        for (int i = 0; i < kRounds; ++i) {
+            fiber::Oneshot<void> finished;
+            int value = 0;
+            fiber::go([&value, i, p = finished.promise()]() mutable noexcept {
+                if (i % 2 == 0) {
+                    this_fiber::yield();
+                }
+                value = i;
+                p.set();
+            });
+            if (!finished.get() || value != i) {
+                bad.fetch_add(1);
+            }
+        }
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
     EXPECT_EQ(bad.load(), 0);
 }
 

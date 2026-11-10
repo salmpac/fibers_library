@@ -16,6 +16,9 @@
 // and wakes the consumer; dropping the Promise unset (or abandon()) breaks
 // it: get() returns Error::kBroken.
 //
+// Oneshot<void>: a "done" signal without a value: set() takes no
+// arguments, get() returns a Result<void> (success or kBroken).
+//
 // Rules (fail fast where they are broken):
 //   * promise() once; get() needs it (otherwise nobody could ever complete).
 //   * get() / a successful try_get() consume the result, once: the value is

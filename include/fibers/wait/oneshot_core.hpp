@@ -108,6 +108,11 @@
 // pointer: no virtual calls). BasicPromise<T>: the producer's move-only
 // handle over a state, the same for in-place (fiber::Oneshot) and pooled
 // (fiber::Future) states.
+//
+// T = void: a completion signal without a value (Oneshot<void>,
+// Promise<void> / Future<void>): the slot holds an empty tag (detail::Unit),
+// set() takes no arguments and the consumer gets a Result<void>. The core
+// and the protocol are the same.
 
 #include <cstdint>
 #include <new>
@@ -147,6 +152,12 @@ template <class Sync>
 struct ProbeOf<Sync> {
     using type = typename Sync::HbProbe;
 };
+
+// What the value slot holds: T, or an empty tag for T = void.
+struct Unit {};
+
+template <class T>
+using SlotOf = std::conditional_t<std::is_void_v<T>, Unit, T>;
 
 }  // namespace detail
 
@@ -251,14 +262,17 @@ private:
 // destroy_value() by whoever owns the state after its final word.
 template <class T, sync::SyncPolicy Sync = sync::StdSync>
 class OneshotState {
-    static_assert(std::is_object_v<T> && !std::is_array_v<T> && !std::is_const_v<T>,
-                  "wait::OneshotState<T>: T must be a non-const object type (not a reference or array)");
-    static_assert(std::is_nothrow_move_constructible_v<T>,
+    static_assert(std::is_void_v<T> || (std::is_object_v<T> && !std::is_array_v<T> && !std::is_const_v<T>),
+                  "wait::OneshotState<T>: T must be void or a non-const object type (not a reference or array)");
+    static_assert(std::is_void_v<T> || std::is_nothrow_move_constructible_v<T>,
                   "wait::OneshotState<T>: T must be nothrow-move-constructible (no exceptions in the library)");
-    static_assert(std::is_nothrow_destructible_v<T>, "wait::OneshotState<T>: T must be nothrow-destructible");
+    static_assert(std::is_void_v<T> || std::is_nothrow_destructible_v<T>,
+                  "wait::OneshotState<T>: T must be nothrow-destructible");
 
 public:
     using ReleaseFn = void (*)(void* context, void* block) noexcept;
+    // What the slot holds: T, or detail::Unit for T = void.
+    using Slot = detail::SlotOf<T>;
 
     // In place (fiber::Oneshot): never detached, never released.
     OneshotState() noexcept {}  // NOLINT: the union member stays unconstructed
@@ -276,7 +290,7 @@ public:
     template <class... Args>
     void emplace(Args&&... args) noexcept {
         value_probe_.write();
-        ::new (static_cast<void*>(&value_)) T(std::forward<Args>(args)...);
+        ::new (static_cast<void*>(&value_)) Slot(std::forward<Args>(args)...);
     }
 
     [[nodiscard]] bool complete(OneshotStatus outcome) noexcept {
@@ -301,16 +315,21 @@ public:
             return Error::kBroken;
         }
         value_probe_.read();
-        Result<T> result(std::in_place, std::move(value_));
-        destroy_value();
-        return result;
+        if constexpr (std::is_void_v<T>) {
+            destroy_value();
+            return Result<void>(std::in_place);
+        } else {
+            Result<T> result(std::in_place, std::move(value_));
+            destroy_value();
+            return result;
+        }
     }
 
     // ---- whoever owns the state at the end ----------------------------------
 
     void destroy_value() noexcept {
         value_probe_.write();
-        value_.~T();
+        value_.~Slot();
     }
 
     bool pooled() const noexcept { return release_ != nullptr; }
@@ -333,11 +352,12 @@ private:
     [[no_unique_address]] typename detail::ProbeOf<Sync>::type value_probe_{};
     [[no_unique_address]] typename detail::ProbeOf<Sync>::type block_probe_{};
     union {
-        T value_;
+        Slot value_;
     };
 };
 
-// The producer's handle: move-only, one per state. set() delivers the value;
+// The producer's handle: move-only, one per state. set() delivers the value
+// (BasicPromise<void>: set() with no arguments, just the completion);
 // destroying (or abandon()ing) an unset Promise breaks it: the consumer gets
 // Error::kBroken. Any thread, never waits; set() may wake the consumer from
 // the calling thread (a fiber wake: one ThreadPool submit).
@@ -370,18 +390,16 @@ public:
     // Constructs the value in the state and completes it. The Promise is
     // empty afterwards; set() on an empty Promise fails fast.
     template <class... Args>
-        requires std::is_nothrow_constructible_v<T, Args&&...>
+        requires(!std::is_void_v<T>) && std::is_nothrow_constructible_v<T, Args&&...>
     void set(Args&&... args) noexcept {
-        State* const state = state_;
-        if (state == nullptr) [[unlikely]] {
-            fail::fail_fast("wait: Promise::set() on an empty Promise (already set, abandoned or moved from)");
-        }
-        state_ = nullptr;
-        state->emplace(std::forward<Args>(args)...);
-        if (state->complete(OneshotStatus::kReady)) {  // the consumer has gone
-            state->destroy_value();
-            state->release();
-        }
+        complete_with(std::forward<Args>(args)...);
+    }
+
+    // BasicPromise<void>: completes it (no value).
+    void set() noexcept
+        requires std::is_void_v<T>
+    {
+        complete_with();
     }
 
     // Breaks the promise (the consumer gets Error::kBroken); no-op on an
@@ -398,6 +416,20 @@ public:
     explicit operator bool() const noexcept { return valid(); }
 
 private:
+    template <class... Args>
+    void complete_with(Args&&... args) noexcept {
+        State* const state = state_;
+        if (state == nullptr) [[unlikely]] {
+            fail::fail_fast("wait: Promise::set() on an empty Promise (already set, abandoned or moved from)");
+        }
+        state_ = nullptr;
+        state->emplace(std::forward<Args>(args)...);
+        if (state->complete(OneshotStatus::kReady)) {  // the consumer has gone
+            state->destroy_value();
+            state->release();
+        }
+    }
+
     State* state_ = nullptr;
 };
 

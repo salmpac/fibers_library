@@ -9,6 +9,9 @@
 //   send(Request{..., std::move(promise)});
 //   wait::Result<Reply> r = future.get();            // parks until set / broken
 //
+// T = void (make_promise_future<void>): a completion without a value;
+// promise.set() takes no arguments, get() returns a Result<void>.
+//
 // Unlike fiber::Oneshot (state in the consumer's frame, which must outlive
 // the producer), either side may walk away at any time:
 //   * the producer: an unset Promise that is destroyed (or abandon()ed)
