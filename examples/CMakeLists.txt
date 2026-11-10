@@ -1,5 +1,6 @@
 # Examples (FIBERS_BUILD_EXAMPLES=ON): an echo server on fibers, a load
-# generator on fibers, and a plain epoll echo server as the reference.
+# generator on fibers, a plain epoll echo server as the reference, TLS and
+# HTTP servers, and small programs for the synchronization primitives.
 # See examples/README.md.
 foreach(example echo_server echo_client echo_epoll_baseline)
     add_executable(${example} ${example}.cpp)
@@ -29,3 +30,17 @@ if(FIBERS_HTTP)
         target_compile_options(${example} PRIVATE -Wall -Wextra)
     endforeach()
 endif()
+
+# Synchronization primitives (examples/sync/): short tutorial programs for
+# fiber::Mutex, WaitGroup, Oneshot / Future, Semaphore and Event. Each runs
+# in well under a second and exits 0 on success, so each is also a ctest
+# smoke test when the tests are configured.
+foreach(example mutex_counter wait_group_fanout promise_future semaphore_pool event_broadcast)
+    add_executable(${example} sync/${example}.cpp)
+    target_link_libraries(${example} PRIVATE fibers::fiber fibers::sync)
+    target_compile_options(${example} PRIVATE -Wall -Wextra)
+    if(FIBERS_BUILD_TESTS)
+        add_test(NAME example.sync.${example} COMMAND ${example})
+        set_tests_properties(example.sync.${example} PROPERTIES TIMEOUT 120 LABELS examples)
+    endif()
+endforeach()
