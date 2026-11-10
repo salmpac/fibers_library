@@ -12,9 +12,11 @@
 //
 // The producer (any thread: another fiber, a plain thread, a poller
 // callback, a blocking-pool call) holds a fiber::Promise<T>
-// (wait::BasicPromise): set(args...) constructs the value in the Oneshot
-// and wakes the consumer; dropping the Promise unset (or abandon()) breaks
-// it: get() returns Error::kBroken.
+// (wait::BasicPromise): set(value) / set(args...) puts the value into the
+// Oneshot and wakes the consumer (never throws: a value that may throw while
+// being built is built at the call site, e.g. p.set("text") for a
+// Promise<std::string>; see BasicPromise); dropping the Promise unset (or
+// abandon()) breaks it: get() returns Error::kBroken.
 //
 // Oneshot<void>: a "done" signal without a value: set() takes no
 // arguments, get() returns a Result<void> (success or kBroken).

@@ -15,6 +15,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -341,6 +342,69 @@ TEST(OneshotCore, Void) {
     }
     static_assert(!CanSet<fw::BasicPromise<void>, int>);
     static_assert(CanSet<fw::BasicPromise<void>>);
+}
+
+// How set() builds the value: by value at the call site (a literal, a copy,
+// a braced list), or in place when that construction is noexcept.
+TEST(OneshotCore, SetErgonomics) {
+    {
+        fiber::Oneshot<std::string> o;
+        o.promise().set("literal");  // const char[8] -> std::string at the call site
+        EXPECT_EQ(*o.get(), "literal");
+    }
+    {
+        const std::string text = "copied, not moved";
+        fiber::Oneshot<std::string> o;
+        o.promise().set(text);  // a copy at the call site (may throw there, not in set())
+        EXPECT_EQ(*o.get(), text);
+    }
+    {
+        struct Point {
+            int x;
+            int y;
+        };
+        fiber::Oneshot<Point> o;
+        o.promise().set({3, 4});  // a braced list builds the by-value argument
+        const fiber::Result<Point> r = o.get();
+        EXPECT_EQ(r->x + r->y, 7);
+    }
+    {
+        // In place (noexcept construction): no move at all; by value: one
+        // move into the state.
+        struct Counted {
+            int value = 0;
+            int* moves = nullptr;
+            Counted(int v, int* m) noexcept : value(v), moves(m) {}
+            Counted(Counted&& other) noexcept : value(other.value), moves(other.moves) { ++*moves; }
+        };
+        int moves = 0;
+        {
+            fiber::Oneshot<Counted> o;
+            o.promise().set(1, &moves);
+            EXPECT_EQ(moves, 0);
+            EXPECT_EQ(o.get()->value, 1);
+        }
+        moves = 0;
+        {
+            fiber::Oneshot<Counted> o;
+            o.promise().set(Counted(2, &moves));
+            EXPECT_EQ(moves, 1);
+        }
+    }
+    {
+        CountingAllocator alloc;
+        auto [promise, future] = fiber::make_promise_future<std::string>(alloc);
+        promise.set("pooled");
+        EXPECT_EQ(*future.get(), "pooled");
+    }
+    // set() itself is always noexcept (building a by-value argument is the
+    // call site's part of the expression). A throwing, explicit-only
+    // construction is not accepted silently: that overload exists but
+    // static_asserts (tests/oneshot/set_rejects.cpp checks the message).
+    static_assert(CanSet<fiber::Promise<std::string>, const char (&)[3]>);
+    static_assert(CanSet<fiber::Promise<std::string>, std::string&>);
+    static_assert(CanSet<fiber::Promise<std::string>, std::string>);
+    static_assert(noexcept(std::declval<fiber::Promise<std::string>&>().set(std::declval<std::string>())));
 }
 
 TEST(OneshotCoreDeathTest, Misuse) {

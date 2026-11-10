@@ -91,9 +91,9 @@ int main(int argc, char** argv) {
         // ---- (b) pooled Promise / Future: the consumer may walk away ----
         {
             auto [promise, future] = fiber::make_promise_future<std::string>(scheduler);
-            // set(args...) must be noexcept: std::string("pong") may throw
-            // (allocation), so build the value first and move it in.
-            fiber::go([p = std::move(promise)]() mutable noexcept { p.set(std::string("pong")); });
+            // set() never throws: "pong" becomes a std::string at the call
+            // site (set(T value) takes it by value), then it is moved in.
+            fiber::go([p = std::move(promise)]() mutable noexcept { p.set("pong"); });
             fiber::Result<std::string> r = future.get();  // consumes; the Future is empty afterwards
             std::printf("  %-44s -> %s (future.valid() = %d)\n", "(b) Future, get()", r ? r->c_str() : "?",
                         future.valid());
@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
             auto [promise, future] = fiber::make_promise_future<std::string>(scheduler);
             fiber::go([p = std::move(promise), &producer_done]() mutable noexcept {
                 this_fiber::sleep_for(10ms);
-                p.set(std::string("too late"));  // the consumer has gone: no leak, no use-after-free
+                p.set("too late");  // the consumer has gone: no leak, no use-after-free
                 producer_done.set();
             });
             int polls = 0;

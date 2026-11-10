@@ -159,6 +159,16 @@ struct Unit {};
 template <class T>
 using SlotOf = std::conditional_t<std::is_void_v<T>, Unit, T>;
 
+// BasicPromise<T>::set(T value) takes exactly this argument list.
+template <class T, class... Args>
+inline constexpr bool kConvertsTo = false;
+
+template <class T, class Arg>
+inline constexpr bool kConvertsTo<T, Arg> = std::is_convertible_v<Arg, T>;
+
+template <class...>
+inline constexpr bool kAlwaysFalse = false;
+
 }  // namespace detail
 
 template <sync::SyncPolicy Sync = sync::StdSync>
@@ -361,6 +371,19 @@ private:
 // destroying (or abandon()ing) an unset Promise breaks it: the consumer gets
 // Error::kBroken. Any thread, never waits; set() may wake the consumer from
 // the calling thread (a fiber wake: one ThreadPool submit).
+//
+// set() never throws, so how the value is built depends on whether that can
+// throw:
+//   * set(T value): by value. Whatever converts to T implicitly (a literal,
+//     a copy, a braced list) is turned into T at the CALL SITE, in the
+//     caller's context (where a throwing constructor is the caller's
+//     business); set() only moves it into the state (T is
+//     nothrow-move-constructible). Promise<std::string> p; p.set("pong").
+//   * set(args...): T(args...) constructed in place in the state, only if
+//     that is noexcept (no extra move).
+//   * anything else (a construction that may throw and is not one implicit
+//     conversion: an explicit constructor, several arguments) is a
+//     static_assert: build the value yourself, set(T(args...)).
 template <class T, sync::SyncPolicy Sync = sync::StdSync>
 class BasicPromise {
 public:
@@ -387,12 +410,32 @@ public:
 
     ~BasicPromise() { abandon(); }
 
-    // Constructs the value in the state and completes it. The Promise is
-    // empty afterwards; set() on an empty Promise fails fast.
+    // Moves `value` (built at the call site) into the state and completes
+    // it. The Promise is empty afterwards; set() on an empty Promise fails
+    // fast (as for every set() below).
+    void set(detail::SlotOf<T> value) noexcept
+        requires(!std::is_void_v<T>)
+    {
+        complete_with(std::move(value));
+    }
+
+    // Constructs T(args...) in the state (noexcept construction only) and
+    // completes it.
     template <class... Args>
         requires(!std::is_void_v<T>) && std::is_nothrow_constructible_v<T, Args&&...>
     void set(Args&&... args) noexcept {
         complete_with(std::forward<Args>(args)...);
+    }
+
+    // Neither of the two: a compile-time error with directions.
+    template <class... Args>
+        requires(!std::is_void_v<T>) && (!std::is_nothrow_constructible_v<T, Args&&...>) &&
+                (!detail::kConvertsTo<T, Args&&...>)
+    void set(Args&&...) noexcept {
+        static_assert(detail::kAlwaysFalse<Args...>,
+                      "wait::Promise<T>::set(args...): T is not nothrow-constructible from these arguments, and "
+                      "they are not one argument that converts to T implicitly. set() never throws: build the "
+                      "value yourself at the call site, set(T(args...)), and it is moved in");
     }
 
     // BasicPromise<void>: completes it (no value).
