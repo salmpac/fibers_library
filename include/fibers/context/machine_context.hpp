@@ -51,8 +51,10 @@
 //         __sanitizer_finish_switch_fiber after every switch, so ASan knows
 //         the stack it runs on (bounds of a context that was never set up, e.g.
 //         the thread's own stack, are learned from the finish call of the
-//         context it switched to). A fresh stack is unpoisoned in setup():
-//         a reused stack still carries redzones of frames that never returned.
+//         context it switched to). setup() unpoisons the whole stack before
+//         it writes the forged frame: a reused stack still carries redzones
+//         of frames that never returned (entry() is the topmost frame, so
+//         its redzones sit right where the forged frame goes).
 //   TSan: a TSan fiber per set-up context (__tsan_create_fiber), switched to
 //         right before every machine switch, destroyed by the context exited
 //         to (or by the destructor if the context never ran to its exit).
@@ -189,6 +191,18 @@ public:
         }
         trampoline_ = trampoline;
 
+#if FIBERS_CONTEXT_ASAN
+        // Before the forged frame is written: a reused stack still carries
+        // the redzones of the previous context's frames, which never
+        // returned (entry() and the trampoline below it exit_to instead),
+        // right where the forged frame goes.
+        __asan_unpoison_memory_region(stack.data(), stack.size());
+        asan_stack_bottom_ = stack.data();
+        asan_stack_size_ = stack.size();
+        asan_fake_stack_ = nullptr;  // first entry: no fake stack to restore
+        asan_from_ = nullptr;
+#endif
+
         std::uint32_t mxcsr = 0;
         std::uint16_t x87_cw = 0;
         asm volatile("stmxcsr %0" : "=m"(mxcsr));
@@ -215,13 +229,6 @@ public:
         std::memcpy(sp, frame, sizeof(frame));
         sp_ = sp;
 
-#if FIBERS_CONTEXT_ASAN
-        __asan_unpoison_memory_region(stack.data(), stack.size());
-        asan_stack_bottom_ = stack.data();
-        asan_stack_size_ = stack.size();
-        asan_fake_stack_ = nullptr;  // first entry: no fake stack to restore
-        asan_from_ = nullptr;
-#endif
 #if FIBERS_CONTEXT_TSAN
         if (tsan_owned_) {
             __tsan_destroy_fiber(tsan_fiber_);
