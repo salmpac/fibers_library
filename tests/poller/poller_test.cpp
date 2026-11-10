@@ -3,12 +3,14 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <sys/epoll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -957,4 +959,63 @@ TEST(Poller, FakeBackendTimersAndFds) {
     ASSERT_TRUE(wait_until([&] { return edges.load() == 1; }));
     EXPECT_TRUE(p.cancel(t));
     p.stop();
+}
+
+// ------------------------------------------------------------ EpollBackend
+
+// A timed wait() never returns before its deadline, through epoll_pwait2
+// (the libc wrapper or the raw syscall, see FIBERS_HAVE_EPOLL_PWAIT2) and
+// through the millisecond fallback (timeouts rounded UP), including
+// sub-millisecond and non-whole-millisecond timeouts. Nothing is ready, so
+// every return is a timeout.
+TEST(EpollBackend, TimedWaitNeverReturnsEarly) {
+    for (const bool pwait2 : {true, false}) {
+        poller::EpollOptions options;
+        options.use_epoll_pwait2 = pwait2;
+        poller::EpollBackend backend(options);
+        poller::ReadyEvent out[4];
+        for (const auto timeout : {200us, 900us, 1000us, 1500us, 2300us}) {
+            for (int round = 0; round < 5; ++round) {
+                const TimePoint deadline = backend.now() + timeout;
+                EXPECT_EQ(backend.wait(out, 4, deadline), 0u);
+                const TimePoint woke = backend.now();
+                EXPECT_GE(woke, deadline) << (pwait2 ? "epoll_pwait2" : "millisecond fallback") << ", timeout "
+                                          << timeout.count() << " us: woke "
+                                          << std::chrono::duration<double, std::micro>(deadline - woke).count()
+                                          << " us early";
+            }
+        }
+        // A wake() still ends a long wait at once.
+        backend.wake();
+        EXPECT_EQ(backend.wait(out, 4, backend.now() + 1h), 0u);
+    }
+}
+
+// The raw syscall (what musl gets) behaves like the wrapper: events, and a
+// timeout of at least the requested time.
+TEST(EpollBackend, Pwait2Syscall) {
+    const int epfd = ::epoll_create1(EPOLL_CLOEXEC);
+    ASSERT_GE(epfd, 0);
+    const int efd = poller::make_eventfd();
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = efd;
+    ASSERT_EQ(::epoll_ctl(epfd, EPOLL_CTL_ADD, efd, &ev), 0);
+    epoll_event events[4];
+    const timespec ts{0, 1'500'000};  // 1.5 ms
+    const auto start = Clock::now();
+    const int timed_out = poller::detail::epoll_pwait2_syscall(epfd, events, 4, &ts);
+    if (timed_out < 0 && errno == ENOSYS) {
+        ::close(efd);
+        ::close(epfd);
+        GTEST_SKIP() << "kernel without epoll_pwait2 (< 5.11)";
+    }
+    EXPECT_EQ(timed_out, 0);
+    EXPECT_GE(Clock::now() - start, 1500us);
+    poller::eventfd_signal(efd);
+    EXPECT_EQ(poller::detail::epoll_pwait2_syscall(epfd, events, 4, &ts), 1);
+    EXPECT_EQ(events[0].data.fd, efd);
+    EXPECT_EQ(poller::detail::epoll_pwait2(epfd, events, 4, &ts), 1);  // the selected one, too
+    ::close(efd);
+    ::close(epfd);
 }

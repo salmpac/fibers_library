@@ -70,10 +70,16 @@
       };
 
       # twist: null | "sim" (deterministic simulation) | "faulty" (threads + fault injection)
-      mkFibers = pkgs: { compiler ? "gcc", sanitize ? "", twist ? null }:
+      # staticMusl: a fully static build against musl (pkgsStatic) with its
+      #   default gcc instead of the pinned toolchains (nixpkgs' musl clang
+      #   wrapper cannot link -lgcc_eh). Checks the libc-portability paths
+      #   (e.g. musl has no epoll_pwait2 wrapper: the poller uses the raw
+      #   syscall there).
+      mkFibers = pkgs: { compiler ? "gcc", sanitize ? "", twist ? null, staticMusl ? false }:
         let
           lib = pkgs.lib;
-          stdenv = (toolchains pkgs).${compiler};
+          host = if staticMusl then pkgs.pkgsStatic else pkgs;
+          stdenv = if staticMusl then host.stdenv else (toolchains pkgs).${compiler};
           suffix = lib.optionalString (compiler != "gcc") "-${compiler}"
             + lib.optionalString (twist != null) "-twist-${twist}"
             + lib.optionalString (sanitize != "") "-${builtins.replaceStrings [ "," ] [ "-" ] sanitize}";
@@ -97,8 +103,10 @@
           };
 
           nativeBuildInputs = [ pkgs.cmake pkgs.ninja ];
-          buildInputs = [ pkgs.llhttp ];
-          checkInputs = [ pkgs.gtest ];
+          # gtest is linked into the tests at build time: a build input for
+          # the static (cross) stdenv, where check inputs are not.
+          buildInputs = [ host.llhttp ] ++ lib.optional staticMusl host.gtest;
+          checkInputs = lib.optional (!staticMusl) pkgs.gtest;
 
           cmakeFlags = [
             "-DFIBERS_BUILD_TESTS=ON"
@@ -124,6 +132,7 @@
         clang-asan = mkFibers pkgs { compiler = "clang"; sanitize = "address,undefined"; };
         twist-sim = mkFibers pkgs { compiler = "clang"; twist = "sim"; };
         twist-faulty-tsan = mkFibers pkgs { compiler = "clang"; twist = "faulty"; sanitize = "thread"; };
+        static-musl = mkFibers pkgs { staticMusl = true; };
       };
     in
     {
