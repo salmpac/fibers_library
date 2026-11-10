@@ -30,6 +30,10 @@ add_executable(sync_bench sync_bench.cpp)
 target_link_libraries(sync_bench PRIVATE fibers::fiber fibers::sched benchmark::benchmark_main)
 target_compile_options(sync_bench PRIVATE -Wall -Wextra)
 
+add_executable(metrics_bench metrics_bench.cpp)
+target_link_libraries(metrics_bench PRIVATE fibers::metrics benchmark::benchmark_main)
+target_compile_options(metrics_bench PRIVATE -Wall -Wextra)
+
 # TLS vs plaintext (fibers::tls; certificates generated at build time).
 if(FIBERS_TLS AND FIBERS_OPENSSL_CLI)
     include(${PROJECT_SOURCE_DIR}/cmake/FibersTlsCerts.cmake)
