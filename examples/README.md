@@ -6,6 +6,7 @@
 | `echo_client` | load generator on fibers: N connections, closed loop with D requests in flight per connection, or open loop at a fixed rate with latency from the intended send time (wrk2 style, no coordinated omission); fixed-bucket log-linear histogram |
 | `echo_epoll_baseline` | the reference: plain edge-triggered epoll, one thread per core, an `SO_REUSEPORT` listener per thread, no fibers |
 | `tls_echo` | TLS echo server (`--server`) and client (`--client`) over `fibers::tls` (OpenSSL 3): handshake per connection, optional mTLS / ALPN, handshake and round-trip percentiles; built when `FIBERS_TLS` is on |
+| `apns_send` | push notifications through APNs with `http2::ApnsClient` (fibers::http2): ES256 provider token from a `.p8` key, HTTP/2 over TLS (ALPN h2), `--count` / `--concurrency` sends multiplexed on one connection; built when `FIBERS_HTTP2` is on |
 
 `tls_echo` quick start (the build generates a throwaway PKI in
 `build/<preset>/examples/tls_certs/`; run from that directory):

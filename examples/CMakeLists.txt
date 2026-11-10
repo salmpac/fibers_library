@@ -35,6 +35,13 @@ if(FIBERS_HTTP)
     target_compile_options(metrics_server PRIVATE -Wall -Wextra)
 endif()
 
+# APNs sender (needs FIBERS_HTTP2): token auth, HTTP/2 over TLS.
+if(FIBERS_HTTP2)
+    add_executable(apns_send apns_send.cpp)
+    target_link_libraries(apns_send PRIVATE fibers::http2)
+    target_compile_options(apns_send PRIVATE -Wall -Wextra)
+endif()
+
 # Synchronization primitives (examples/sync/): short tutorial programs for
 # fiber::Mutex, WaitGroup, Oneshot / Future, Semaphore and Event. Each runs
 # in well under a second and exits 0 on success, so each is also a ctest
