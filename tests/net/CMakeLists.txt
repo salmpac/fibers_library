@@ -19,6 +19,12 @@ foreach(_t resolver connection connection_pool)
     gtest_discover_tests(${_t}_tests DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 300)
 endforeach()
 
+# Network waits under a fiber::BasicContext (cancellation, deadlines).
+add_executable(net_context_tests context_test.cpp)
+target_link_libraries(net_context_tests PRIVATE fibers::net GTest::gtest_main)
+target_compile_options(net_context_tests PRIVATE -Wall -Wextra -Wpedantic)
+gtest_discover_tests(net_context_tests DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 300)
+
 if(FIBERS_TWIST)
     add_subdirectory(twist)
 endif()

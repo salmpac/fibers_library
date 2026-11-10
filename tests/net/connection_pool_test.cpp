@@ -17,6 +17,7 @@
 #include <string_view>
 #include <thread>
 
+#include "fibers/fiber/context.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/net/connection.hpp"
 #include "fibers/net/connection_pool.hpp"
@@ -731,6 +732,138 @@ TEST(ConnectionPool, CloseWithWaitersAndLeases) {
     EXPECT_EQ(state.open_now.load(), 0);
     EXPECT_EQ(pool.stats().open, 0u);
     EXPECT_EQ(state.bad_state.load(), 0);
+}
+
+// ---- contexts (fibers/fiber/context.hpp) ----------------------------------------------
+
+// A waiting acquire under a context: cancel() ends it with ECANCELED, the
+// context's deadline with ETIMEDOUT; the waiter leaves the FIFO and the
+// capacity goes to the next one.
+TEST(ConnectionPool, ContextInterruptsWaitingAcquire) {
+    Scheduler scheduler(options(2));
+    FakeState state;
+    Pool pool(scheduler, FakeFactory{&state}, ConnectionPoolOptions{.max_open = 1});
+    fibers::Context ctx = fibers::Context::cancellable();
+    std::atomic<int> cancelled{-100};
+    std::atomic<int> timed_out{-100};
+    std::atomic<int> after{-100};
+    std::atomic<bool> held{false};
+    std::atomic<bool> release{false};
+    Latch done(2);
+    fiber::go(scheduler, [&]() noexcept {
+        Lease a;
+        if (pool.acquire(a) == 0) {
+            held.store(true);
+        }
+        while (!release.load()) {
+            this_fiber::sleep_for(1ms);
+        }
+        done.count_down();
+    });
+    fiber::go(scheduler, ctx, [&]() noexcept {
+        while (!held.load()) {
+            this_fiber::sleep_for(1ms);
+        }
+        Lease b;
+        cancelled.store(pool.acquire(b));  // parks until ctx.cancel()
+        {
+            fibers::Context deadline = fibers::Context::with_timeout(30ms);
+            fiber::ContextScope scope(deadline);
+            timed_out.store(pool.acquire(b, scheduler.now() + 1h));  // the context's deadline is earlier
+        }
+        release.store(true);
+        fiber::ContextScope none(nullptr);
+        after.store(pool.acquire(b));  // the holder's connection, handed over
+        done.count_down();
+    });
+    ASSERT_TRUE(eventually([&] { return ctx.has_dependants_approx(); }));
+    EXPECT_EQ(pool.stats().waiting, 1u);
+    ctx.cancel();
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(cancelled.load(), ECANCELED);
+    EXPECT_EQ(timed_out.load(), ETIMEDOUT);
+    EXPECT_EQ(after.load(), 0);
+    EXPECT_EQ(pool.stats().waiting, 0u);
+    EXPECT_EQ(state.opens.load(), 1);
+    ASSERT_TRUE(in_fiber(scheduler, [&]() noexcept { static_cast<void>(pool.close()); }));
+}
+
+// Under an ended context an acquire that would wait fails at once; one that
+// finds an idle connection succeeds.
+TEST(ConnectionPool, EndedContextFailsOnlyWaits) {
+    Scheduler scheduler(options(2));
+    FakeState state;
+    Pool pool(scheduler, FakeFactory{&state}, ConnectionPoolOptions{.max_open = 1});
+    ASSERT_TRUE(in_fiber(scheduler, [&]() noexcept {
+        Lease warm;
+        static_cast<void>(pool.acquire(warm));  // one idle connection afterwards
+    }));
+    fibers::Context ctx = fibers::Context::cancellable();
+    ctx.cancel();
+    std::atomic<int> idle{-100};
+    std::atomic<int> would_wait{-100};
+    Latch done(1);
+    fiber::go(scheduler, ctx, [&]() noexcept {
+        Lease a;
+        idle.store(pool.acquire(a));
+        Lease b;
+        would_wait.store(pool.acquire(b));
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(idle.load(), 0);
+    EXPECT_EQ(would_wait.load(), ECANCELED);
+    ASSERT_TRUE(in_fiber(scheduler, [&]() noexcept { static_cast<void>(pool.close()); }));
+}
+
+// Returns race with cancellations: every waiter ends either with a
+// connection or with ECANCELED, nothing is leaked or handed out twice.
+TEST(ConnectionPool, ReturnsRaceWithCancels) {
+    Scheduler scheduler(options(4));
+    FakeState state;
+    Pool pool(scheduler, FakeFactory{&state}, ConnectionPoolOptions{.max_open = 2});
+    constexpr int kRounds = 100;
+    constexpr int kWaiters = 4;
+    std::atomic<int> errors{0};
+    for (int round = 0; round < kRounds; ++round) {
+        fibers::Context ctx = fibers::Context::cancellable();
+        Latch done(kWaiters + 1);
+        std::atomic<int> got{0};
+        std::atomic<int> cancelled{0};
+        for (int w = 0; w < kWaiters; ++w) {
+            fiber::go(scheduler, ctx, [&, w]() noexcept {
+                for (int i = 0; i < w; ++i) {
+                    this_fiber::yield();
+                }
+                Lease l;
+                const int e = pool.acquire(l);
+                if (e == 0) {
+                    got.fetch_add(1);
+                    this_fiber::yield();  // hold it a moment: others wait
+                } else if (e == ECANCELED) {
+                    cancelled.fetch_add(1);
+                } else {
+                    errors.fetch_add(1);
+                }
+                done.count_down();
+            });
+        }
+        fiber::go(scheduler, [&, round]() noexcept {
+            for (int i = 0; i < round % 4; ++i) {
+                this_fiber::yield();
+            }
+            ctx.cancel();
+            done.count_down();
+        });
+        ASSERT_TRUE(done.wait()) << "round " << round;
+        ASSERT_EQ(got.load() + cancelled.load(), kWaiters);
+        ASSERT_FALSE(ctx.has_dependants_approx());
+    }
+    EXPECT_EQ(errors.load(), 0);
+    EXPECT_EQ(pool.stats().waiting, 0u);
+    EXPECT_LE(state.max_open_now.load(), 2);
+    EXPECT_EQ(state.bad_state.load(), 0);
+    ASSERT_TRUE(in_fiber(scheduler, [&]() noexcept { static_cast<void>(pool.close()); }));
 }
 
 // Destroying a pool that still has a lease out fails fast.
