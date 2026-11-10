@@ -86,6 +86,7 @@
 #include "fibers/http/response.hpp"
 #include "fibers/http/router.hpp"
 #include "fibers/http/stream.hpp"
+#include "fibers/object_pool/pooled.hpp"
 #include "fibers/object_pool/sharded_pool.hpp"
 #include "fibers/sync/spin_lock.hpp"
 
@@ -114,6 +115,10 @@ struct BodyBlock {
     BodyBlock& operator=(const BodyBlock&) = delete;
     ~BodyBlock() { ::operator delete(data, std::nothrow); }
 };
+
+using BodyPool = object_pool::DefaultPool<BodyBlock>;
+// A body block on loan from the server's pool; returned when dropped.
+using BodyLease = object_pool::Pooled<BodyPool>;
 
 }  // namespace detail
 
@@ -194,25 +199,22 @@ private:
         count_.fetch_sub(1, std::memory_order_relaxed);
     }
 
-    // nullptr if out of memory.
-    detail::BodyBlock* acquire_body() noexcept {
-        detail::BodyBlock* b = bodies_.acquire();
+    // Empty if out of memory.
+    detail::BodyLease acquire_body() noexcept {
+        detail::BodyLease b = bodies_.lease();
         if (b->data == nullptr) {
             b->data = static_cast<char*>(::operator new(options_.max_body_bytes + 1, std::nothrow));
             if (b->data == nullptr) {
-                bodies_.release(b);
-                return nullptr;
+                return {};  // b goes back to the pool
             }
         }
         return b;
     }
 
-    void release_body(detail::BodyBlock* b) noexcept { bodies_.release(b); }
-
     const ServerOptions options_;
     const Handler handler_;
     detail::ShutdownSignal signal_;
-    object_pool::DefaultPool<detail::BodyBlock> bodies_;
+    detail::BodyPool bodies_;
     sync::SpinLock<> lock_;
     detail::ConnectionNode* head_ = nullptr;
     std::atomic<std::size_t> count_{0};
@@ -361,7 +363,7 @@ private:
         body_ = nullptr;
         body_len_ = 0;
         extra_bytes_ = 0;
-        block_ = nullptr;
+        block_.reset();  // already returned by the previous request's end
         head_end_ = 0;
     }
 
@@ -480,8 +482,8 @@ private:
             }
             // Everything was consumed: the raw region restarts after the body
             // (in place) or after the head (body in a block).
-            in_len_ = parse_pos_ = head_end_ + (block_ == nullptr ? body_len_ : 0);
-            if (block_ == nullptr && chunked_ && sizes_.in - in_len_ < sizes_.in / 8) {
+            in_len_ = parse_pos_ = head_end_ + (!block_ ? body_len_ : 0);
+            if (!block_ && chunked_ && sizes_.in - in_len_ < sizes_.in / 8) {
                 // A chunked body growing in place leaves too little room to
                 // read into: move it to a block. (A Content-Length body is
                 // only in place if it fits.)
@@ -510,7 +512,7 @@ private:
     // Moves the body so far into a pooled block; false if out of memory.
     bool use_block() noexcept {
         block_ = core_->acquire_body();
-        if (block_ == nullptr) {
+        if (!block_) {
             return false;
         }
         std::memcpy(block_->data, body_, body_len_);
@@ -518,12 +520,7 @@ private:
         return true;
     }
 
-    void release_block() noexcept {
-        if (block_ != nullptr) {
-            core_->release_body(block_);
-            block_ = nullptr;
-        }
-    }
+    void release_block() noexcept { block_.reset(); }
 
     // Feeds llhttp what is buffered after parse_pos_; advances parse_pos_ to
     // where it stopped (a pause, an error) or to in_len_.
@@ -820,7 +817,7 @@ private:
     char* body_ = nullptr;
     std::size_t body_len_ = 0;
     std::size_t extra_bytes_ = 0;  // trailer fields + chunk extensions
-    BodyBlock* block_ = nullptr;
+    BodyLease block_;
     int error_status_ = 0;
     bool fresh_ = false;
     bool field_open_ = false;

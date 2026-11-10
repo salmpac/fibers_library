@@ -51,6 +51,7 @@
 #include "fibers/http/options.hpp"
 #include "fibers/http/router.hpp"
 #include "fibers/net/socket.hpp"
+#include "fibers/object_pool/pooled.hpp"
 #include "fibers/object_pool/sharded_pool.hpp"
 #include "fibers/sched/scheduler.hpp"
 
@@ -153,10 +154,9 @@ private:
                 fiber::this_fiber::sleep_for<Sched>(std::chrono::milliseconds(1));
                 continue;
             }
-            Connection* c = pool_.acquire();
+            auto c = pool_.lease();
             const int error = listener_.accept(c->stream);
             if (error != 0) {
-                pool_.release(c);
                 if (error == EMFILE || error == ENFILE || error == ENOBUFS || error == ENOMEM) {
                     fiber::this_fiber::sleep_for<Sched>(std::chrono::milliseconds(10));
                     continue;
@@ -168,9 +168,9 @@ private:
             }
             active_.fetch_add(1, std::memory_order_relaxed);
             accepted_.fetch_add(1, std::memory_order_relaxed);
-            wg_.go(scheduler_, [this, c]() noexcept {
+            wg_.go(scheduler_, [this, c = std::move(c)]() mutable noexcept {
                 serve_connection(c->stream, c->state, core_);
-                pool_.release(c);
+                c.reset();  // back in the pool before the connection stops counting
                 active_.fetch_sub(1, std::memory_order_relaxed);
             });
         }
