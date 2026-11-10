@@ -22,6 +22,14 @@ else()
     message(STATUS "promtool not found: the metrics exposition is not validated with it")
 endif()
 
+# The /metrics endpoint over real sockets (http::Server + http::Client).
+if(FIBERS_HTTP)
+    add_executable(metrics_http_tests metrics_http_test.cpp)
+    target_link_libraries(metrics_http_tests PRIVATE fibers::metrics fibers::http GTest::gtest_main)
+    target_compile_options(metrics_http_tests PRIVATE -Wall -Wextra -Wpedantic)
+    gtest_discover_tests(metrics_http_tests DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 300)
+endif()
+
 if(FIBERS_TWIST)
     add_subdirectory(twist)
 endif()
