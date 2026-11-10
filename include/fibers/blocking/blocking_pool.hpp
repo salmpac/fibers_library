@@ -206,11 +206,14 @@ public:
     std::size_t sleeping_threads() const noexcept {
         std::size_t n = 0;
         for (std::size_t i = 0; i < num_threads_; ++i) {
-            n += slots_[i].state.load(std::memory_order_relaxed) == kParked ? 1 : 0;
+            // acquire: pairs with park()'s CAS, so a thread seen parked has
+            // its sleep already included in sleeps().
+            n += slots_[i].state.load(std::memory_order_acquire) == kParked ? 1 : 0;
         }
         return n;
     }
-    // Times a thread went to sleep since construction.
+    // Times a thread decided to sleep since construction (counted just before
+    // it publishes PARKED; see park()). Diagnostics only.
     std::uint64_t sleeps() const noexcept {
         std::uint64_t n = 0;
         for (std::size_t i = 0; i < num_threads_; ++i) {
@@ -259,11 +262,16 @@ private:
         if ((idle & kStopBit) == 0) {
             op = queue_.pop();  // re-check
             if (op == nullptr) {
+                // Counted before PARKED is published (the CAS is a release),
+                // so whoever sees this thread parked (sleeping_threads(),
+                // acquire) also sees this sleep counted. If the CAS fails (a
+                // waker got here first), the count includes a sleep that was
+                // decided but not entered; sleeps() is diagnostics only.
+                self.sleeps.store(self.sleeps.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
                 std::uint32_t expected = kParking;
                 if (self.state.compare_exchange_strong(expected, kParked, std::memory_order_seq_cst,
                                                        std::memory_order_acquire)) {
-                    self.sleeps.store(self.sleeps.load(std::memory_order_relaxed) + 1,
-                                      std::memory_order_relaxed);
                     self.state.wait(kParked, std::memory_order_acquire);  // until != PARKED
                 }
                 // else: a waker moved us to RUNNING while PARKING.
