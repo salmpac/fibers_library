@@ -303,3 +303,60 @@ checked against outside test material and tools:
 - **REDbot** (MIT) on `http_hello` and `http_rest` responses (200, 404):
   no protocol findings (Date correct, Content-Length correct; the only
   notes are about caching, as the examples send no Cache-Control).
+
+# Synchronization primitives (`examples/sync/`)
+
+Small, heavily commented programs, one per primitive of `fibers/fiber/`.
+Each runs a root fiber on a `Scheduler`, prints what happened, joins
+everything, stops the scheduler and exits 0 (1 if a check failed), in a few
+tens of milliseconds. They are built with the other examples and, when the
+tests are configured too, registered as ctest smoke tests
+(`example.sync.*`, label `examples`).
+
+```sh
+cmake --preset clang-release && cmake --build --preset clang-release -j 6 \
+    --target mutex_counter wait_group_fanout promise_future semaphore_pool event_broadcast
+build/clang-release/examples/mutex_counter --workers=4 --fibers=100 --increments=1000
+ctest --preset clang-release -L examples     # or: ctest --test-dir build/clang-release -R example.sync
+```
+
+- **`mutex_counter`** (`fiber::Mutex`, flags `--workers --fibers
+  --increments --yield-every`). N fibers x M increments of shared state
+  under `std::lock_guard`, yielding inside the critical section now and then
+  while an invariant is checked on every entry. Then a fiber sleeps 20 ms
+  holding the lock while 2 x workers contenders wait for it and a ticker
+  fiber keeps running: contenders park, workers stay free. The header
+  explains why a `std::mutex` must never be held across a park, sleep or
+  I/O.
+- **`wait_group_fanout`** (`fiber::WaitGroup`, `--workers --fibers
+  --numbers --serve-ms`). Fan-out / fan-in: `wg.go(...)` N fibers that sum
+  slices into plain slots, `wg.wait()`, combine. Then graceful shutdown of a
+  toy server: the acceptor, every request and every request's child are in
+  one group; shutdown stops the acceptor and calls `wait()` while requests
+  are in flight and still adding children (legal: they hold a count).
+- **`promise_future`** (`fiber::Oneshot`, `make_promise_future`,
+  `--workers`). Request / response with `fiber::Result<T>`: (a) a
+  `Oneshot<T>` on the consumer's stack (zero allocation; it must outlive the
+  producer), (b) a pooled `Promise` / `Future` with `get()`, and with
+  `try_get()` polling followed by `detach()` (the late `set()` is harmless),
+  (c) producers on a plain `std::thread` and inside
+  `this_fiber::blocking(...)`, (d) a broken promise (dropped unset, or
+  `abandon()`) as `Error::kBroken`.
+- **`semaphore_pool`** (`fiber::Semaphore`, `SemaphoreGuard`, `--workers
+  --connections --clients --queries`). K "connections" shared by many
+  client fibers (never more than K in use), fail-fast probes with
+  `std::try_to_lock` while the pool is saturated, and the FIFO hand-off
+  with mixed sizes: a 3-permit request at the head is not overtaken by the
+  1-permit requests behind it.
+- **`event_broadcast`** (`fiber::Event`, `--workers --runners`). N fibers
+  park on one event; main (a plain thread) fires it with `set()`; a second
+  `set()` is a no-op and a late `wait()` returns at once.
+
+| primitive | when to use | key rule |
+|---|---|---|
+| `fiber::Mutex` | shared state modified by several fibers; the critical section may park (I/O, sleep, another lock) | lock only in fibers; never hold a `std::mutex` / spin lock across a park; barging, not FIFO |
+| `fiber::WaitGroup` | wait for N fibers: fan-out / fan-in, draining in-flight work on shutdown | `add()` before the work can finish (`wg.go` does it); one-shot: no `add()` after the group has finished; `wait()` only in a fiber |
+| `fiber::Oneshot<T>` | one reply to one waiting fiber, zero allocation | lives in the consumer's frame: observe the completion (`get()`) before leaving it |
+| `fiber::make_promise_future<T>` | one reply when the consumer may give up (poll, detach) | `T` must fit the scheduler's `TaskMemoryPool`; `get()` / `try_get()` consume once |
+| `fiber::Semaphore` | at most K at a time: a resource pool, a byte budget, backpressure between threads and fibers | FIFO, no overtaking (even `try_acquire` fails while anyone waits); `acquire(n)` with n > capacity waits forever |
+| `fiber::Event` | a one-shot broadcast: start gun, "ready", "shutting down" | cannot be reset; `wait()` only in a fiber unless already set; destroy after every `wait()` returned |
