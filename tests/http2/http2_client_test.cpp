@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 
+#include "fibers/fiber/context.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/fiber/wait_group.hpp"
 #include "fibers/http2/client.hpp"
@@ -312,6 +313,87 @@ TEST(Http2Mock, DeadlineResetsStream) {
     EXPECT_TRUE(wait_until([&] { return server.rst_cancel.load() >= 1; }));
     EXPECT_GE(client.stats().streams_reset, 1u);
     EXPECT_EQ(client.stats().connects, 1u);
+    bool drained = false;
+    ASSERT_TRUE(run_in_fiber(scheduler, [&] {
+        drained = h2test::fiber_wait_until([&] { return client.stream_records().first == 0; });
+        client.close();
+    }));
+    EXPECT_TRUE(drained);
+}
+
+// A request made under a context (fibers/fiber/context.hpp): cancel()
+// completes it with ECANCELED and resets its stream; the connection (shared,
+// its fibers run under no context) serves the next request.
+TEST(Http2Mock, ContextCancelResetsStream) {
+    MockH2Server server;
+    ASSERT_TRUE(server.start());
+    Scheduler scheduler(h2test::scheduler_options());
+    http2::Client client(scheduler, h2c_options(server.port()));
+    ASSERT_TRUE(run_in_fiber(scheduler, [&] { ASSERT_EQ(client.connect(), 0); }));
+    fibers::Context ctx = fibers::Context::cancellable();
+    std::atomic<int> cancelled{-1};
+    std::atomic<bool> done{false};
+    fiber::go(scheduler, ctx, [&]() noexcept {
+        http2::Response res;
+        cancelled.store(client.get("/hang", res));
+        done.store(true);
+    });
+    ASSERT_TRUE(wait_until([&] { return ctx.has_dependants_approx(); }));  // waiting for its stream
+    ctx.cancel();
+    ASSERT_TRUE(wait_until([&] { return done.load(); }));
+    EXPECT_EQ(cancelled.load(), ECANCELED);
+    EXPECT_TRUE(wait_until([&] { return server.rst_cancel.load() >= 1; }));
+    int after = -1;
+    int ended = -1;
+    ASSERT_TRUE(run_in_fiber(scheduler, [&] {
+        http2::Response res;
+        after = client.get("/echo", res);
+        fibers::Context gone = fibers::Context::cancellable();
+        gone.cancel();
+        fiber::ContextScope scope(gone);
+        ended = client.get("/echo", res);  // fails before sending anything
+    }));
+    EXPECT_EQ(after, 0);
+    EXPECT_EQ(ended, ECANCELED);
+    EXPECT_EQ(client.stats().connects, 1u);
+    bool drained = false;
+    ASSERT_TRUE(run_in_fiber(scheduler, [&] {
+        drained = h2test::fiber_wait_until([&] { return client.stream_records().first == 0; });
+        client.close();
+    }));
+    EXPECT_TRUE(drained);
+}
+
+// The context's deadline ends a request (ETIMEDOUT) whose own timeout is
+// later; many such requests at once, half of them answered in time.
+TEST(Http2Mock, ContextDeadlineEndsRequests) {
+    MockH2Server server;
+    ASSERT_TRUE(server.start());
+    Scheduler scheduler(h2test::scheduler_options());
+    http2::Client client(scheduler, h2c_options(server.port()));
+    constexpr int kRequests = 20;
+    std::atomic<int> ok{0};
+    std::atomic<int> timed_out{0};
+    std::atomic<int> other{0};
+    ASSERT_TRUE(run_in_fiber(scheduler, [&] {
+        fibers::Context ctx = fibers::Context::with_timeout(200ms);
+        fiber::ContextScope scope(ctx);
+        fiber::WaitGroup wg;
+        for (int i = 0; i < kRequests; ++i) {
+            wg.go([&, i]() noexcept {  // inherits ctx
+                http2::Response res;
+                http2::Request req;
+                req.path = i % 2 == 0 ? "/echo" : "/hang";
+                req.timeout = 1h;
+                const int e = client.request(req, res);
+                (e == 0 ? ok : e == ETIMEDOUT ? timed_out : other).fetch_add(1);
+            });
+        }
+        wg.wait();
+    }));
+    EXPECT_EQ(other.load(), 0);
+    EXPECT_GE(timed_out.load(), kRequests / 2);
+    EXPECT_EQ(ok.load() + timed_out.load(), kRequests);
     bool drained = false;
     ASSERT_TRUE(run_in_fiber(scheduler, [&] {
         drained = h2test::fiber_wait_until([&] { return client.stream_records().first == 0; });

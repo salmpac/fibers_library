@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "fibers/fiber/context.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/http/stream.hpp"
 #include "fibers/net/buffered_reader.hpp"
@@ -418,6 +419,77 @@ TEST(TlsConnection, IoTimeoutDuringAndAfterHandshake) {
             read_error.store(client.read_some(&byte, 1).error);  // silent server
             speak.store(true);
             const IoResult r = client.read_some(&byte, 1);  // TLS state intact after ETIMEDOUT
+            after.store(r.error != 0 ? r.error : (byte == 'x' ? 0 : -1));
+            static_cast<void>(client.close());
+            done.count_down();
+        });
+        ASSERT_TRUE(done.wait());
+        EXPECT_EQ(client_error.load(), 0);
+        EXPECT_EQ(read_error.load(), ETIMEDOUT);
+        EXPECT_EQ(after.load(), 0);
+    }
+}
+
+// TLS over the transport's waits under a context (fibers/fiber/context.hpp):
+// a handshake nobody answers ends with the context's cancel(); a read after
+// the handshake ends at the context's deadline, and the TLS state stays
+// intact (like after the transport's own ETIMEDOUT).
+TEST(TlsConnection, ContextCancelAndDeadline) {
+    Contexts ctx;
+    ASSERT_TRUE(ctx.ok);
+    Scheduler scheduler(options(2));
+    {
+        Pair pair;
+        Connection client;
+        ASSERT_EQ(client.adopt(scheduler, pair.fd[1]), 0);
+        fibers::Context request = fibers::Context::cancellable();
+        Latch done(1);
+        std::atomic<int> error{-100};
+        fiber::go(scheduler, request, [&]() noexcept {
+            error.store(client.start_tls_client(ctx.client, "localhost"));  // nobody answers
+            done.count_down();
+        });
+        while (!request.has_dependants_approx()) {
+            std::this_thread::sleep_for(100us);
+        }
+        request.cancel();
+        ASSERT_TRUE(done.wait());
+        EXPECT_EQ(error.load(), ECANCELED);
+        static_cast<void>(client.close());
+        ::close(pair.fd[0]);
+    }
+    {
+        Pair pair;
+        Connection server;
+        Connection client;
+        ASSERT_EQ(server.adopt(scheduler, pair.fd[0]), 0);
+        ASSERT_EQ(client.adopt(scheduler, pair.fd[1]), 0);
+        Latch done(2);
+        std::atomic<int> client_error{-100};
+        std::atomic<int> read_error{-100};
+        std::atomic<int> after{-100};
+        std::atomic<bool> speak{false};
+        fiber::go(scheduler, [&]() noexcept {
+            if (server.start_tls_server(ctx.server) == 0) {
+                while (!speak.load()) {
+                    fiber::this_fiber::sleep_for(5ms);  // silent
+                }
+                static_cast<void>(server.write_all("x", 1));
+                char byte;
+                static_cast<void>(server.read_some(&byte, 1));  // until the client closes
+            }
+            done.count_down();
+        });
+        fiber::go(scheduler, [&]() noexcept {
+            client_error.store(client.start_tls_client(ctx.client, "localhost"));
+            char byte = 0;
+            {
+                fibers::Context step = fibers::Context::with_timeout(50ms);
+                fiber::ContextScope scope(step);
+                read_error.store(client.read_some(&byte, 1).error);  // silent server
+            }
+            speak.store(true);
+            const IoResult r = client.read_some(&byte, 1);  // TLS state intact
             after.store(r.error != 0 ? r.error : (byte == 'x' ? 0 : -1));
             static_cast<void>(client.close());
             done.count_down();

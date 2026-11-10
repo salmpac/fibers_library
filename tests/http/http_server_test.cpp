@@ -24,6 +24,8 @@
 #include <thread>
 #include <vector>
 
+#include "fibers/fiber/context.hpp"
+#include "fibers/fiber/event.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/http/client.hpp"
 #include "fibers/http/router.hpp"
@@ -544,6 +546,52 @@ TEST(HttpServer, ClientRetriesStaleKeepAliveConnection) {
     ASSERT_TRUE(done.wait());
     EXPECT_EQ(failures.load(), 0);
     EXPECT_EQ(connects.load(), 2u);
+}
+
+// The HTTP/1.1 client under a context (fibers/fiber/context.hpp): a
+// response that does not come in time ends with the context's deadline
+// (ETIMEDOUT, the client's own timeout is longer); an ended context fails a
+// request that would wait.
+TEST(HttpServer, ClientUnderContext) {
+    Harness h;
+    fiber::Event release;
+    h.router.get("/slow", [&](http::Request&, http::Response& r) noexcept {
+        release.wait();
+        r.send("late");
+    });
+    h.router.get("/", [](http::Request&, http::Response& r) noexcept { r.send("ok"); });
+    h.start();
+    std::atomic<int> timed_out{-100};
+    std::atomic<int> reason{-100};
+    std::atomic<int> after{-100};
+    std::atomic<int> ended{-100};
+    Latch done(1);
+    fiber::go(h.scheduler, [&]() noexcept {
+        {
+            http::ClientOptions co;
+            co.timeout = 60s;
+            http::Client client(h.scheduler, h.endpoint(), co);
+            http::ClientResponse res;
+            fibers::Context ctx = fibers::Context::with_timeout(100ms);
+            fiber::ContextScope scope(ctx);
+            timed_out.store(client.get("/slow", res));
+            reason.store(ctx.reason() ? static_cast<int>(*ctx.reason()) : 0);
+        }
+        release.set();
+        http::Client client(h.scheduler, h.endpoint());
+        http::ClientResponse res;
+        after.store(client.get("/", res) == 0 && res.body() == "ok" ? 0 : -1);
+        fibers::Context gone = fibers::Context::cancellable();
+        gone.cancel();
+        fiber::ContextScope scope(gone);
+        ended.store(client.get("/", res));
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(timed_out.load(), ETIMEDOUT);
+    EXPECT_EQ(reason.load(), static_cast<int>(fibers::wait::Error::kTimedOut));
+    EXPECT_EQ(after.load(), 0);
+    EXPECT_EQ(ended.load(), ECANCELED);
 }
 
 TEST(HttpServer, MaxConnections) {
