@@ -106,6 +106,7 @@ fiber::go(f);  wg.go(f);           // in a fiber: inherit the current context
 fiber::go(sched, f);  wg.go(sched, f);   // explicit scheduler: NO context
 this_fiber::context();             // BasicContext* or nullptr
 this_fiber::cancelled();           // context() && context()->cancelled()
+this_fiber::context_error();       // 0 / ECANCELED / ETIMEDOUT
 fiber::ContextScope scope(ctx_or_nullptr);  // run a section under another
                                             // context (a child with a tighter
                                             // deadline; nullptr = shield)
