@@ -9,7 +9,8 @@
 // selection per operation is ShardSelect::kRoundRobin or kHome, an empty start
 // shard makes acquire() probe the others, and when all are empty the pool
 // grows (by max(grow_chunk, capacity / 16) objects; the geometric part keeps
-// the 32-bit node index space usable).
+// the 32-bit node index space usable). lease() hands an object out as a
+// Pooled handle that releases it when destroyed (pooled.hpp).
 //
 // Memory: every byte the pool owns (object chunks, chunk directory, shard
 // array, per-thread cache array) comes from `Alloc` (a PoolAllocator, see
@@ -64,6 +65,7 @@
 
 #include "fibers/object_pool/node_arena.hpp"
 #include "fibers/object_pool/pool_allocator.hpp"
+#include "fibers/object_pool/pooled.hpp"
 #include "fibers/object_pool/shard_stacks.hpp"
 #include "fibers/object_pool/sharded_object_pool.hpp"
 
@@ -133,6 +135,10 @@ public:
                                                                        node, node);
     }
 
+    // acquire() as an RAII handle that releases the object when destroyed
+    // (see pooled.hpp; same as object_pool::lease(*this)).
+    [[nodiscard]] auto lease() noexcept { return object_pool::lease(*this); }
+
     // Returns the calling thread's cached objects to one shard (one CAS), so
     // that other threads can have them: e.g. before a worker parks or exits.
     // Returns how many were moved (0 without a cache).
@@ -180,6 +186,8 @@ public:
     const Alloc& get_allocator() const noexcept { return arena_.allocator(); }
 
 private:
+    friend struct detail::LeaseAccess;
+
     struct alignas(sync::kCacheLineSize) Shard {
         explicit Shard(const PoolOptions& options) noexcept : stack(options) {}
         Stack stack;
@@ -427,6 +435,8 @@ private:
     typename Stack::Shared shared_;
     Shards shards_;
     Caches caches_;
+    // Last: checked (debug builds) before anything else is torn down.
+    [[no_unique_address]] detail::LeaseCounter<Sync> leases_;
 };
 
 // The variants, ready to use.

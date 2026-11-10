@@ -35,13 +35,15 @@
 // by another thread than the one that acquired it (fibers migrate). The
 // object pool gives the happens-before from a release() to the acquire()
 // that gets the same slot. All stacks must be released before the pool is
-// destroyed; destroying the pool unmaps every stack.
+// destroyed; destroying the pool unmaps every stack. lease() hands a stack
+// out as an object_pool::Pooled handle that releases it when destroyed.
 
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
 
 #include "fibers/fail/fail_fast.hpp"
+#include "fibers/object_pool/pooled.hpp"
 #include "fibers/object_pool/sharded_pool.hpp"
 #include "fibers/stack/stack.hpp"
 #include "fibers/sync/sync.hpp"
@@ -62,6 +64,8 @@ struct StackPoolOptions {
 template <sync::SyncPolicy Sync = sync::StdSync>
 class StackPool {
 public:
+    using value_type = Stack;
+
     explicit StackPool(StackPoolOptions options = {}) noexcept
         : stack_size_(options.stack_size),
           max_stacks_(std::max<std::size_t>(options.max_stacks, 1)),
@@ -89,6 +93,10 @@ public:
     // whatever the last fiber left in it.
     void release(Stack* stack) noexcept { slots_.release(stack); }
 
+    // acquire() as an RAII handle that releases the stack when destroyed
+    // (see object_pool/pooled.hpp; same as object_pool::lease(*this)).
+    [[nodiscard]] auto lease() noexcept { return object_pool::lease(*this); }
+
     // Hands the calling thread's cached stacks back to the shared shards.
     std::size_t flush_thread_cache() noexcept { return slots_.flush_thread_cache(); }
 
@@ -101,6 +109,8 @@ public:
     std::size_t max_stacks() const noexcept { return max_stacks_; }
 
 private:
+    friend struct object_pool::detail::LeaseAccess;
+
     static object_pool::PoolOptions pool_options(const StackPoolOptions& options,
                                                  std::size_t max_stacks) noexcept {
         object_pool::PoolOptions pool;
@@ -154,6 +164,8 @@ private:
     const std::size_t max_stacks_;
     typename Sync::template Atomic<std::size_t> mapped_{0};
     object_pool::DefaultPool<Stack, Sync> slots_;
+    // Last: checked (debug builds) before the stacks are unmapped.
+    [[no_unique_address]] object_pool::detail::LeaseCounter<Sync> leases_;
 };
 
 }  // namespace fibers::stack
