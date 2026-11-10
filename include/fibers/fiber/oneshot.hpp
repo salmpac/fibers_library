@@ -67,6 +67,7 @@ namespace fibers::fiber {
 
 using wait::Error;
 using wait::Result;
+using wait::to_string;  // to_string(Error)
 
 template <class T, class Sync = sched::Scheduler::SyncPolicy>
 using BasicPromise = wait::BasicPromise<T, Sync>;

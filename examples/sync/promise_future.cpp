@@ -57,7 +57,7 @@ void print(const char* what, const fiber::Result<int>& r) {
     if (r) {
         std::printf("  %-44s -> %d\n", what, *r);
     } else {
-        std::printf("  %-44s -> error: %s\n", what, fibers::wait::to_string(r.error()));
+        std::printf("  %-44s -> error: %s\n", what, fiber::to_string(r.error()));
     }
 }
 

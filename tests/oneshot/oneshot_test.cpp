@@ -159,6 +159,8 @@ TEST(Result, ValueAndError) {
     EXPECT_FALSE(bad);
     EXPECT_EQ(bad.error(), fw::Error::kBroken);
     EXPECT_STREQ(fw::to_string(bad.error()), "broken promise");
+    EXPECT_STREQ(fiber::to_string(bad.error()), "broken promise");  // next to fiber::Error / Result
+    EXPECT_STREQ(to_string(fiber::Error::kBroken), "broken promise");  // and found by ADL
     fw::Result<std::unique_ptr<int>> moved(std::in_place, std::make_unique<int>(3));
     std::unique_ptr<int> p = *std::move(moved);
     EXPECT_EQ(*p, 3);
