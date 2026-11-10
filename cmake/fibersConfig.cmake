@@ -8,3 +8,7 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/fibersTlsTargets.cmake")
     find_dependency(OpenSSL 3.0 COMPONENTS SSL Crypto)
     include("${CMAKE_CURRENT_LIST_DIR}/fibersTlsTargets.cmake")
 endif()
+# fibers::http2, when the package was built with FIBERS_HTTP2 (links -lnghttp2).
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/fibersHttp2Targets.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/fibersHttp2Targets.cmake")
+endif()

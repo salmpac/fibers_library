@@ -158,6 +158,33 @@ if(FIBERS_HTTP)
     endif()
 endif()
 
+# HTTP/2 client (+ APNs helper) over fibers::tls, protocol by nghttp2.
+# Optional (FIBERS_HTTP2; needs FIBERS_TLS and libnghttp2 >= 1.61 via
+# pkg-config). Its own export set: the installed package links -lnghttp2.
+option(FIBERS_HTTP2 "Build the HTTP/2 client fibers::http2 (needs fibers::tls and libnghttp2)" OFF)
+if(FIBERS_HTTP2)
+    if(NOT FIBERS_TLS)
+        message(FATAL_ERROR "FIBERS_HTTP2 needs FIBERS_TLS (OpenSSL >= 3.0)")
+    endif()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FIBERS_NGHTTP2 REQUIRED IMPORTED_TARGET libnghttp2>=1.61)
+    find_program(FIBERS_NGHTTPD nghttpd)  # interop tests
+    find_program(FIBERS_H2LOAD h2load)    # baseline load numbers
+    add_library(fibers_http2 INTERFACE)
+    add_library(fibers::http2 ALIAS fibers_http2)
+    set_target_properties(fibers_http2 PROPERTIES EXPORT_NAME http2)
+    target_include_directories(fibers_http2 INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(fibers_http2 INTERFACE cxx_std_20)
+    target_link_libraries(fibers_http2 INTERFACE fibers::tls fibers::net fibers::fiber
+        $<BUILD_INTERFACE:PkgConfig::FIBERS_NGHTTP2> $<INSTALL_INTERFACE:nghttp2>)
+    install(TARGETS fibers_http2 EXPORT fibersHttp2Targets)
+    install(EXPORT fibersHttp2Targets
+        NAMESPACE fibers::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fibers)
+endif()
+
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT fibersTargets
     NAMESPACE fibers::
