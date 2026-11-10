@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <dirent.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -946,6 +947,204 @@ TEST(NetDeadline, DeadlinePerRequest) {
     EXPECT_EQ(errors.load(), 0);
     EXPECT_EQ(a.close(), 0);
     EXPECT_EQ(b.close(), 0);
+}
+
+// ---- connect with a deadline -------------------------------------------------
+
+// Open fds of this process (/proc/self/fd, minus the directory's own).
+int count_fds() {
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        return -1;
+    }
+    int n = 0;
+    while (const dirent* e = ::readdir(dir)) {
+        if (e->d_name[0] != '.') {
+            ++n;
+        }
+    }
+    ::closedir(dir);
+    return n - 1;
+}
+
+TEST(NetConnectDeadline, PastDeadlineFailsAtOnceWithoutSocket) {
+    Latch done(1);
+    std::atomic<int> result{-1};
+    std::atomic<int> fds_before{-1};
+    std::atomic<int> fds_after{-1};
+    Scheduler scheduler(options(2));
+    Listener listener;
+    ASSERT_EQ(listener.listen(scheduler, Endpoint::loopback_v4(0)), 0);
+    const Endpoint endpoint = listener.local_endpoint();
+    Stream s;
+    fiber::go(scheduler, [&]() noexcept {
+        fds_before.store(count_fds());
+        result.store(s.connect(scheduler, endpoint, scheduler.now() - 1ms));
+        fds_after.store(count_fds());
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(result.load(), ETIMEDOUT);
+    EXPECT_FALSE(s.is_open_approx());
+    EXPECT_EQ(fds_before.load(), fds_after.load());
+}
+
+// A listener whose accept queue is full (it never accepts) drops further
+// SYNs on Linux (LISTENOVERFLOWS), so a connect stays in SYN_SENT: the
+// deadline ends it. Then the same Stream objects connect again (the
+// descriptors were closed cleanly: no fd, registration or timer left).
+TEST(NetConnectDeadline, FullBacklogTimesOut) {
+    constexpr int kMaxAttempts = 64;
+    constexpr auto kDeadline = 100ms;
+    Scheduler scheduler(options(2));
+    Listener full;
+    ASSERT_EQ(full.listen(scheduler, Endpoint::loopback_v4(0), net::ListenOptions{.backlog = 1}), 0);
+    const Endpoint endpoint = full.local_endpoint();
+    std::vector<std::unique_ptr<Stream>> filled;  // connections queued in the backlog
+    std::unique_ptr<Stream> timed_out;
+    std::atomic<int> result{-1};
+    std::atomic<int> attempts{0};
+    std::atomic<long> elapsed_ms{-1};
+    std::atomic<int> fds_before{-1};
+    std::atomic<int> fds_after{-1};
+    Latch done(1);
+    fiber::go(scheduler, [&]() noexcept {
+        for (int i = 0; i < kMaxAttempts; ++i) {
+            attempts.fetch_add(1);
+            auto s = std::make_unique<Stream>();
+            fds_before.store(count_fds());
+            const auto start = std::chrono::steady_clock::now();
+            const int e = s->connect(scheduler, endpoint, scheduler.now() + kDeadline);
+            if (e == 0) {
+                filled.push_back(std::move(s));  // queued in the backlog: keep it, try another
+                continue;
+            }
+            elapsed_ms.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                    .count());
+            fds_after.store(count_fds());
+            result.store(e);
+            timed_out = std::move(s);
+            break;
+        }
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    if (result.load() != ETIMEDOUT) {
+        GTEST_SKIP() << "no connect timed out against a full backlog (result " << result.load() << " after "
+                     << attempts.load() << " attempts): this kernel does not drop SYNs on overflow";
+    }
+    EXPECT_GE(elapsed_ms.load(), 90);
+    EXPECT_LT(elapsed_ms.load(), 5000);  // the deadline, not the kernel's SYN retries
+    EXPECT_FALSE(timed_out->is_open_approx());
+    EXPECT_EQ(fds_before.load(), fds_after.load());
+    for (auto& s : filled) {
+        EXPECT_EQ(s->close(), 0);
+    }
+    EXPECT_EQ(full.close(), 0);
+    // The timed-out Stream connects again (to a listener that accepts).
+    Listener ok;
+    ASSERT_EQ(ok.listen(scheduler, Endpoint::loopback_v4(0)), 0);
+    std::atomic<int> again{-1};
+    Latch reconnected(1);
+    fiber::go(scheduler, [&]() noexcept {
+        again.store(timed_out->connect(scheduler, ok.local_endpoint(), scheduler.now() + 5s));
+        reconnected.count_down();
+    });
+    ASSERT_TRUE(reconnected.wait());
+    EXPECT_EQ(again.load(), 0);
+    EXPECT_EQ(timed_out->close(), 0);
+    // The old deadline timers are gone: the pollers keep running timers.
+    std::this_thread::sleep_for(kDeadline);
+    Latch slept(1);
+    fiber::go(scheduler, [&]() noexcept {
+        this_fiber::sleep_for(5ms);
+        slept.count_down();
+    });
+    ASSERT_TRUE(slept.wait());
+}
+
+// An unroutable address (a blackhole on most networks): the deadline ends
+// the connect. Skipped where the network answers otherwise (ENETUNREACH in
+// a sandbox without a route, a router's ICMP, a host that answers).
+TEST(NetConnectDeadline, UnroutableAddressTimesOut) {
+    Endpoint endpoint;
+    ASSERT_TRUE(Endpoint::parse("10.255.255.1", 9, endpoint));
+    Scheduler scheduler(options(2));
+    constexpr int kStreams = 16;  // several at once, freed right after
+    std::atomic<int> timed_out{0};
+    std::atomic<int> other{0};
+    std::atomic<int> last_other{0};
+    std::atomic<long> max_ms{0};
+    const int fds_before = count_fds();
+    Latch done(kStreams);
+    for (int i = 0; i < kStreams; ++i) {
+        fiber::go(scheduler, [&, i]() noexcept {
+            auto s = std::make_unique<Stream>();
+            const auto start = std::chrono::steady_clock::now();
+            const int e = s->connect(scheduler, endpoint, scheduler.now() + 50ms + 10ms * i);
+            const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+            if (e == ETIMEDOUT) {
+                timed_out.fetch_add(1);
+                long seen = max_ms.load();
+                while (ms > seen && !max_ms.compare_exchange_weak(seen, ms)) {
+                }
+            } else {
+                other.fetch_add(1);
+                last_other.store(e);
+                static_cast<void>(s->close());
+            }
+            s.reset();  // the descriptor (and its timer nodes) go right away
+            done.count_down();
+        });
+    }
+    ASSERT_TRUE(done.wait());
+    if (other.load() != 0) {
+        GTEST_SKIP() << "10.255.255.1 is not a blackhole here (" << other.load() << " connects ended with errno "
+                     << last_other.load() << ")";
+    }
+    EXPECT_EQ(timed_out.load(), kStreams);
+    EXPECT_LT(max_ms.load(), 5000);
+    EXPECT_EQ(count_fds(), fds_before);
+    std::this_thread::sleep_for(250ms);  // past every deadline: no timer may fire into freed memory
+    Latch slept(1);
+    fiber::go(scheduler, [&]() noexcept {
+        this_fiber::sleep_for(5ms);
+        slept.count_down();
+    });
+    ASSERT_TRUE(slept.wait());
+}
+
+// A connect that succeeds before its deadline clears it: later writes are
+// not bound by it.
+TEST(NetConnectDeadline, SuccessClearsTheDeadline) {
+    Latch done(1);
+    std::atomic<int> result{-1};
+    std::atomic<int> write_error{-1};
+    std::atomic<bool> expired{true};
+    Scheduler scheduler(options(2));
+    Listener listener;
+    ASSERT_EQ(listener.listen(scheduler, Endpoint::loopback_v4(0)), 0);
+    const Endpoint endpoint = listener.local_endpoint();
+    Stream client;
+    Stream server;
+    fiber::go(scheduler, [&]() noexcept {
+        result.store(client.connect(scheduler, endpoint, scheduler.now() + 30ms));
+        if (result.load() == 0 && listener.accept(server) == 0) {
+            this_fiber::sleep_for(60ms);  // past the connect deadline
+            expired.store(client.poll_desc().expired_approx(Direction::kWrite));
+            write_error.store(client.write_all("x", 1).error);
+        }
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(result.load(), 0);
+    EXPECT_FALSE(expired.load());
+    EXPECT_EQ(write_error.load(), 0);
+    EXPECT_EQ(client.close(), 0);
+    EXPECT_EQ(server.close(), 0);
 }
 
 using NetDeathTest = ::testing::Test;

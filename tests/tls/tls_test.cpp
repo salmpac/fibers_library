@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "fibers/fiber/fiber.hpp"
+#include "fibers/net/buffered_reader.hpp"
 #include "fibers/net/socket.hpp"
 #include "fibers/sched/scheduler.hpp"
 #include "fibers/tls/context.hpp"
@@ -1133,6 +1134,164 @@ TEST(Tls, UpgradeAfterPlaintext) {
             EXPECT_GT(leftover.load(), 0u);  // the server's reader overshot into the ClientHello
         }
     }
+}
+
+static_assert(net::ReadStream<TlsStream>);
+
+// The same STARTTLS flow with net::BufferedReader: the server's reader
+// overshoots into the pipelined ClientHello, take_buffered() hands those
+// bytes to upgrade_server; then a second reader (same storage) reads lines
+// over TLS.
+TEST(Tls, BufferedReaderStartTlsHandOver) {
+    constexpr int kLines = 200;
+    Scheduler scheduler(options(2));
+    TlsContext sctx;
+    TlsContext cctx;
+    ASSERT_EQ(make_server(sctx), 0);
+    ASSERT_EQ(make_client(cctx), 0);
+    TlsStream server;
+    TlsStream client;
+    Pair pair;
+    ASSERT_EQ(server.transport().adopt(scheduler, pair.fd[0]), 0);
+    ASSERT_EQ(client.transport().adopt(scheduler, pair.fd[1]), 0);
+    Latch done(2);
+    std::atomic<int> server_error{-100};
+    std::atomic<int> client_error{-100};
+    std::atomic<std::size_t> handed_over{0};
+    std::atomic<int> lines_read{0};
+    fiber::go(scheduler, [&]() noexcept {
+        int e = 0;
+        fiber::this_fiber::sleep_for(50ms);  // the ClientHello is queued behind the line
+        std::byte storage[4096];
+        {
+            net::BufferedReader plain(server.transport(), storage);
+            const net::LineResult l = plain.read_line();
+            if (!l || l.line != "STARTTLS\n") {
+                e = l.error != 0 ? l.error : -2;
+            }
+            if (e == 0) {
+                const std::span<const std::byte> rest = plain.take_buffered();
+                handed_over.store(rest.size());
+                e = server.upgrade_server(sctx, rest);  // copies them into the TLS input
+            }
+        }
+        if (e == 0) {
+            net::BufferedReader reader(server, storage);
+            for (int i = 0; i < kLines && e == 0; ++i) {
+                const net::LineResult l = reader.read_line('\n', 256);
+                const std::string expected = "tls line " + std::to_string(i) + "\n";
+                if (!l || l.line != expected) {
+                    e = l.error != 0 ? l.error : -3;
+                    break;
+                }
+                lines_read.fetch_add(1);
+                e = server.write_all(l.line.data(), l.line.size()).error;
+            }
+            if (e == 0 && !reader.read_line().line.empty()) {
+                e = -4;  // expected close_notify (end of stream)
+            }
+        }
+        server_error.store(e);
+        done.count_down();
+    });
+    fiber::go(scheduler, [&]() noexcept {
+        int e = client.transport().write_all("STARTTLS\n", 9).error;
+        if (e == 0) {
+            e = client.upgrade_client(cctx, "localhost");
+        }
+        if (e == 0) {
+            e = client.handshake();
+        }
+        std::byte storage[1024];
+        net::BufferedReader reader(client, storage);
+        for (int i = 0; i < kLines && e == 0; ++i) {
+            const std::string line = "tls line " + std::to_string(i) + "\n";
+            e = client.write_all(line.data(), line.size()).error;
+            if (e == 0) {
+                const net::LineResult echoed = reader.read_line();
+                e = echoed.error != 0 ? echoed.error : (echoed.line == line ? 0 : -1);
+            }
+        }
+        if (e == 0) {
+            e = client.shutdown();
+        }
+        client_error.store(e);
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_EQ(server_error.load(), 0);
+    EXPECT_EQ(client_error.load(), 0);
+    EXPECT_GT(handed_over.load(), 0u);  // the reader overshot into the ClientHello
+    EXPECT_EQ(lines_read.load(), kLines);
+}
+
+// ---- connect with a deadline ------------------------------------------------------
+
+TEST(Tls, ConnectWithDeadline) {
+    Scheduler scheduler(options(2));
+    TlsContext sctx;
+    TlsContext cctx;
+    ASSERT_EQ(make_server(sctx), 0);
+    ASSERT_EQ(make_client(cctx), 0);
+    Listener listener;
+    ASSERT_EQ(listener.listen(scheduler, Endpoint::loopback_v4(0)), 0);
+    const Endpoint endpoint = listener.local_endpoint();
+    // A server that handshakes the first connection, and only accepts the
+    // second (it never answers the ClientHello).
+    TlsStream served;
+    net::Stream silent;
+    Latch accepted(1);
+    Latch release_silent(1);
+    fiber::go(scheduler, [&]() noexcept {
+        if (served.accept(listener, sctx) == 0 && served.handshake() == 0) {
+            static_cast<void>(echo(served));
+        }
+        static_cast<void>(listener.accept(silent));
+        accepted.count_down();
+    });
+    Latch done(1);
+    std::atomic<int> past{-100};
+    std::atomic<bool> past_open{true};
+    std::atomic<int> ok{-100};
+    std::atomic<int> after_deadline{-100};
+    std::atomic<int> silent_result{-100};
+    std::atomic<bool> silent_open{true};
+    std::atomic<long> silent_ms{-1};
+    fiber::go(scheduler, [&]() noexcept {
+        TlsStream c;
+        past.store(c.connect(scheduler, endpoint, cctx, "localhost", scheduler.now() - 1ms));
+        past_open.store(c.transport().is_open_approx());
+        // Connect + handshake within the deadline; then the deadline is gone.
+        ok.store(c.connect(scheduler, endpoint, cctx, "localhost", scheduler.now() + 200ms));
+        if (ok.load() == 0) {
+            fiber::this_fiber::sleep_for(250ms);
+            after_deadline.store(client_rounds(c, 5, 3, 1024));
+            static_cast<void>(c.shutdown());
+            static_cast<void>(c.close());
+        }
+        // The TCP connect succeeds, the handshake never completes: the
+        // deadline ends it and the stream is closed.
+        TlsStream d;
+        const auto start = std::chrono::steady_clock::now();
+        silent_result.store(d.connect(scheduler, endpoint, cctx, "localhost", scheduler.now() + 100ms));
+        silent_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+        silent_open.store(d.transport().is_open_approx());
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    ASSERT_TRUE(accepted.wait());
+    EXPECT_EQ(past.load(), ETIMEDOUT);
+    EXPECT_FALSE(past_open.load());
+    EXPECT_EQ(ok.load(), 0);
+    EXPECT_EQ(after_deadline.load(), 0);
+    EXPECT_EQ(silent_result.load(), ETIMEDOUT);
+    EXPECT_GE(silent_ms.load(), 90);
+    EXPECT_LT(silent_ms.load(), 5000);
+    EXPECT_FALSE(silent_open.load());
+    static_cast<void>(silent.close());
+    static_cast<void>(served.close());
+    EXPECT_EQ(listener.close(), 0);
 }
 
 // ---- close_notify vs abrupt close -------------------------------------------------
