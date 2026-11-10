@@ -236,6 +236,7 @@ public:
         const context::StackView below{view.data(), static_cast<std::size_t>(closure_at - begin)};
         auto* fiber = ::new (reinterpret_cast<void*>(fiber_at))
             BasicFiber(scheduler, stack, below, closure, &run_closure<Closure>, &destroy_closure<Closure>);
+        count_spawned(scheduler);
         scheduler.pool().submit(fiber->task());
     }
 
@@ -438,6 +439,7 @@ private:
         // else: suspended mid-run; without exceptions its frames cannot be
         // unwound, so they are abandoned (no destructors) with the stack.
         scheduler.stacks().release(stack);
+        count_finished(scheduler);
     }
 
     // After completion, on the worker's stack.
@@ -446,6 +448,19 @@ private:
         stack::Stack* stack = stack_;
         this->~BasicFiber();
         scheduler.stacks().release(stack);
+        count_finished(scheduler);
+    }
+
+    // Fiber counts, for schedulers that keep them (sched::BasicScheduler).
+    static void count_spawned(Sched& scheduler) noexcept {
+        if constexpr (requires { scheduler.count_fiber_spawned(); }) {
+            scheduler.count_fiber_spawned();
+        }
+    }
+    static void count_finished(Sched& scheduler) noexcept {
+        if constexpr (requires { scheduler.count_fiber_finished(); }) {
+            scheduler.count_fiber_finished();
+        }
     }
 
     static void on_timer(void* memo, poller::TimerEvent, poller::TaskBatch& out) noexcept {

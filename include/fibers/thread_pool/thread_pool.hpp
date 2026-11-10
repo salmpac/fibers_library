@@ -315,6 +315,18 @@ public:
 
     bool in_worker_thread() const noexcept { return detail::thread_state<Sync>().pool == this; }
 
+    // current_worker() of a thread that is not a worker of this pool.
+    static constexpr std::size_t kNotAWorker = SIZE_MAX;
+
+    // Index of the calling thread among this pool's workers, kNotAWorker if
+    // it is not one of them. One call of the thread-state accessor, nothing
+    // else (safe while the pool is being destroyed); a fiber may move to
+    // another worker at its next park, so the index is only good until then.
+    std::size_t current_worker() const noexcept {
+        const detail::ThreadState& state = detail::thread_state<Sync>();
+        return state.pool == this ? state.worker : kNotAWorker;
+    }
+
     const ThreadPoolOptions& options() const noexcept { return options_; }
 
     // Diagnostics (racy snapshots, for tests and monitoring).
@@ -334,6 +346,14 @@ public:
             n += worker->parks.load(std::memory_order_relaxed);
         }
         return n;
+    }
+
+    // Tasks queued for worker `index` (its main_box and overflow_box; the
+    // mail_box is not counted): relaxed loads, a racy snapshot.
+    std::size_t queued_tasks_approx(std::size_t index) const noexcept {
+        assert(index < workers_.size());
+        const Worker& worker = *workers_[index];
+        return worker.main_box.size_approx() + worker.overflow_box.size_approx();
     }
 
 private:

@@ -71,6 +71,9 @@ public:
         return size_.load(std::memory_order_relaxed) != 0;
     }
 
+    // Relaxed hint (diagnostics): the size after the last push / pop.
+    std::size_t size_approx() const noexcept { return size_.load(std::memory_order_relaxed); }
+
 private:
     alignas(sync::kCacheLineSize) typename Sync::template Atomic<std::size_t> size_{0};
     typename Sync::Mutex mutex_;

@@ -42,16 +42,28 @@
 //                  still parked (abandoned the same way)
 // So: let fibers finish before stopping if their frames own resources.
 //
+// Fiber counts: fiber::go counts a spawn, the fiber's end (completion, or a
+// drop of a queued fiber at stop) counts a finish (count_fiber_spawned /
+// count_fiber_finished, read with fiber_counts()). Each worker has a cache
+// line of its own with both counters, written only by that worker: an
+// increment there is a relaxed load + store (no RMW, no shared line), found
+// with one call of the pool's thread-state accessor (current_worker()).
+// Spawns from threads outside the pool (and drops at stop) go to one shared
+// slot with a relaxed fetch_add.
+//
 // Sync policy: ThreadPool and BlockingPool park threads (ParkingSyncPolicy),
 // fibers switch through Sync::ExecutionContext (ContextSyncPolicy). Under
 // Twist use FakeBackend<TwistSync> as the poller backend.
 
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <new>
 #include <type_traits>
 #include <utility>
 
 #include "fibers/blocking/blocking_pool.hpp"
+#include "fibers/fail/fail_fast.hpp"
 #include "fibers/poller/epoll_backend.hpp"
 #include "fibers/poller/poller.hpp"
 #include "fibers/poller/poller_pool.hpp"
@@ -75,6 +87,14 @@ struct SchedulerOptions {
     blocking::BlockingPoolOptions blocking{};
     stack::StackPoolOptions stacks{};
     TaskMemoryPoolOptions task_memory{};
+};
+
+// Snapshot of a scheduler's fiber counters (relaxed reads; a fiber that
+// finished may be seen before its spawn, so spawned - finished can be off by
+// the fibers in flight).
+struct FiberCounts {
+    std::uint64_t spawned = 0;   // fiber::go calls
+    std::uint64_t finished = 0;  // fibers that completed or were dropped at stop
 };
 
 template <SchedulerSyncPolicy Sync = sync::StdSync, poller::Backend B = poller::EpollBackend>
@@ -101,6 +121,11 @@ public:
           pool_(options.pool),
           blocking_(options.blocking),
           pollers_(poller::TaskSink::of(pool_), options.pollers, backend_args...) {
+        fiber_workers_ = pool_.num_workers();
+        fiber_counters_.reset(new (std::nothrow) FiberCounter[fiber_workers_ + 1]);
+        if (fiber_counters_ == nullptr) [[unlikely]] {
+            fail::fail_fast("sched: Scheduler: out of memory");
+        }
         pollers_.start();
     }
 
@@ -166,7 +191,45 @@ public:
     // Whether the calling thread is a worker of this scheduler's pool.
     bool in_worker_thread() const noexcept { return pool_.in_worker_thread(); }
 
+    // ---- fiber counts (see the top comment) ---------------------------------
+
+    // Called by fiber::go for every fiber placed on this scheduler.
+    void count_fiber_spawned() noexcept { bump(&FiberCounter::spawned); }
+
+    // Called once per fiber when it completes or is dropped unrun / unfinished.
+    void count_fiber_finished() noexcept { bump(&FiberCounter::finished); }
+
+    FiberCounts fiber_counts() const noexcept {
+        FiberCounts counts;
+        for (std::size_t i = 0; i <= fiber_workers_; ++i) {
+            counts.spawned += fiber_counters_[i].spawned.load(std::memory_order_relaxed);
+            counts.finished += fiber_counters_[i].finished.load(std::memory_order_relaxed);
+        }
+        return counts;
+    }
+
 private:
+    // Slot i < num_workers: written by worker i only; slot num_workers:
+    // shared by every other thread (RMW).
+    struct alignas(sync::kCacheLineSize) FiberCounter {
+        typename Sync::template Atomic<std::uint64_t> spawned{0};
+        typename Sync::template Atomic<std::uint64_t> finished{0};
+    };
+
+    // Also runs while pool_ is being destroyed (its queues drop fibers):
+    // current_worker() touches nothing of the pool then, and the slot count
+    // is our own copy.
+    void bump(typename Sync::template Atomic<std::uint64_t> FiberCounter::*field) noexcept {
+        const std::size_t worker = pool_.current_worker();
+        if (worker < fiber_workers_) [[likely]] {
+            // Single writer: no RMW needed.
+            auto& counter = fiber_counters_[worker].*field;
+            counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        } else {
+            (fiber_counters_[fiber_workers_].*field).fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     // [ TaskHeader | closure ] in one block.
     template <class F>
     struct CallbackNode {
@@ -196,6 +259,10 @@ private:
 
     // Declaration order = construction order; destruction runs backwards
     // (see the top comment): pools outlive the queues that hold their memory.
+    // The fiber counters come first: dropping fibers at destruction counts
+    // them. Filled in the constructor body (sized by the pool).
+    std::size_t fiber_workers_ = 0;
+    std::unique_ptr<FiberCounter[]> fiber_counters_;
     StackPool stacks_;
     TaskMemory task_memory_;
     ThreadPool pool_;
