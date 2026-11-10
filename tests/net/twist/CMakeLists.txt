@@ -9,3 +9,13 @@ target_compile_options(net_twist_tests PRIVATE -Wall -Wextra)
 gtest_discover_tests(net_twist_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 1800)
 # sure's context.S has no .note.GNU-stack section (see tests/coro/twist).
 target_link_options(net_twist_tests PRIVATE -Wl,-z,noexecstack)
+
+# net::BasicConnectionPool's waiter protocol (returns / close() vs deadline
+# timers) over TwistSync, FakeBackend pollers and a fake connection.
+add_executable(connection_pool_twist_tests connection_pool_twist_test.cpp)
+target_link_libraries(connection_pool_twist_tests PRIVATE fibers::net twist sure GTest::gtest_main)
+target_compile_features(connection_pool_twist_tests PRIVATE cxx_std_23)  # Twist headers
+target_compile_options(connection_pool_twist_tests PRIVATE -Wall -Wextra)
+
+gtest_discover_tests(connection_pool_twist_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 1800)
+target_link_options(connection_pool_twist_tests PRIVATE -Wl,-z,noexecstack)
