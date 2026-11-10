@@ -1540,6 +1540,195 @@ TEST(Tls, WriteAfterShutdown) {
     EXPECT_EQ(read_back.load(), 0);
 }
 
+// ---- lifetime: close(), then destroy / upgrade again, while operations unwind ---------
+//
+// A fiber is parked in an operation (provably: its waiter sits in the
+// transport's readiness word, and the peer never makes it ready), and
+// another party close()s the stream and then destroys it or starts TLS on it
+// again. The woken operation still has a tail after the transport returned
+// ECANCELED (commit to the ring under ssl_mu_, release the write role,
+// unlock its role mutex), so close() must not return before every operation
+// has left the TLS state. TSan reports a violation from the happens-before
+// graph alone (the tail's accesses vs. the teardown's); ASan and the mutex
+// destructor's check catch it when the two actually overlap.
+
+using Desc = net::BasicPollDesc<Scheduler>;
+
+bool parked(TlsStream& s, net::Direction dir) {
+    return s.transport().poll_desc().word_approx(dir) > Desc::kClosed;
+}
+
+// Far more than the socket buffers and the outbound ring hold.
+constexpr std::size_t kFlood = std::size_t{8} << 20;
+
+// The result of an operation interrupted by close(): ECANCELED if it was
+// parked at that moment, EBADF if a stale edge had it between syscalls.
+bool interrupted(int error) { return error == ECANCELED || error == EBADF; }
+
+// A handshaken pair; the server never reads application data, so a client
+// writer fills the socket and parks for good, and a client reader parks too.
+struct Established {
+    TlsContext sctx;
+    TlsContext cctx;
+    TlsStream server;
+    std::unique_ptr<TlsStream> client = std::make_unique<TlsStream>();
+    Duo duo;
+    bool ok = false;
+
+    explicit Established(Scheduler& scheduler) {
+        ok = make_server(sctx) == 0 && make_client(cctx) == 0 &&
+             duo.setup(scheduler, server, sctx, *client, cctx) == 0;
+        if (ok) {
+            const HandshakeResult h = handshake_both(scheduler, server, *client);
+            ok = h.server == 0 && h.client == 0;
+        }
+    }
+};
+
+// A writer parked in write_all; this (non-fiber) thread closes and destroys
+// the stream.
+TEST(TlsLifetime, CloseThenDestroyWhileWriterUnwinds) {
+    Scheduler scheduler(options(2));
+    Established e(scheduler);
+    ASSERT_TRUE(e.ok);
+    std::vector<char> flood(kFlood, 'x');
+    TlsStream* client = e.client.get();
+    Latch done(1);
+    std::atomic<int> result{-100};
+    fiber::go(scheduler, [&, client]() noexcept {
+        result.store(client->write_all(flood.data(), flood.size()).error);
+        done.count_down();  // the stream may be gone by now: not touched
+    });
+    ASSERT_TRUE(eventually([&] { return parked(*client, net::Direction::kWrite); }));
+    EXPECT_EQ(e.client->close(), 0);
+    e.client.reset();
+    ASSERT_TRUE(done.wait());
+    EXPECT_TRUE(interrupted(result.load())) << result.load();
+}
+
+// A reader and a writer parked (full duplex); the stream is destroyed
+// without an explicit close() (the destructor closes), from this thread or
+// from a watchdog fiber.
+void destroy_while_reader_and_writer_unwind(bool from_fiber) {
+    Scheduler scheduler(options(2));
+    Established e(scheduler);
+    ASSERT_TRUE(e.ok);
+    std::vector<char> flood(kFlood, 'x');
+    TlsStream* client = e.client.get();
+    Latch done(2);
+    std::atomic<int> read_result{-100};
+    std::atomic<int> write_result{-100};
+    fiber::go(scheduler, [&, client]() noexcept {
+        char buf[64];
+        read_result.store(client->read_some(buf, sizeof buf).error);
+        done.count_down();
+    });
+    fiber::go(scheduler, [&, client]() noexcept {
+        write_result.store(client->write_all(flood.data(), flood.size()).error);
+        done.count_down();
+    });
+    ASSERT_TRUE(eventually([&] {
+        return parked(*client, net::Direction::kRead) && parked(*client, net::Direction::kWrite);
+    }));
+    if (from_fiber) {
+        Latch destroyed(1);
+        fiber::go(scheduler, [&]() noexcept {
+            e.client.reset();
+            destroyed.count_down();
+        });
+        ASSERT_TRUE(destroyed.wait());
+    } else {
+        e.client.reset();
+    }
+    ASSERT_TRUE(done.wait());
+    EXPECT_TRUE(interrupted(read_result.load())) << read_result.load();
+    EXPECT_TRUE(interrupted(write_result.load())) << write_result.load();
+}
+
+TEST(TlsLifetime, DestroyWhileReaderAndWriterUnwind) { destroy_while_reader_and_writer_unwind(false); }
+
+TEST(TlsLifetime, DestroyFromFiberWhileReaderAndWriterUnwind) { destroy_while_reader_and_writer_unwind(true); }
+
+// A writer parked; the stream is closed, its transport reopened on a new
+// socket and TLS started again on the same object while the old writer
+// unwinds (close + adopt + upgrade_client from this thread or all in a
+// fiber; the handshake in a fiber). The new session must work: nothing of
+// the old one (freed SSL state, stale ciphertext) may leak into it.
+void upgrade_again_while_writer_unwinds(bool from_fiber) {
+    Scheduler scheduler(options(2));
+    Established e(scheduler);
+    ASSERT_TRUE(e.ok);
+    std::vector<char> flood(kFlood, 'x');
+    TlsStream* client = e.client.get();
+    Latch done(3);
+    std::atomic<int> write_result{-100};
+    fiber::go(scheduler, [&, client]() noexcept {
+        write_result.store(client->write_all(flood.data(), flood.size()).error);
+        done.count_down();
+    });
+    ASSERT_TRUE(eventually([&] { return parked(*client, net::Direction::kWrite); }));
+    Pair pair2;
+    ASSERT_GE(pair2.fd[0], 0);
+    TlsStream server2;
+    std::atomic<int> server2_result{-100};
+    std::atomic<int> client2_result{-100};
+    fiber::go(scheduler, [&]() noexcept {
+        int r = server2.transport().adopt(scheduler, pair2.fd[0]);
+        if (r == 0) {
+            r = server2.upgrade_server(e.sctx);
+        }
+        if (r == 0) {
+            r = server2.handshake();
+        }
+        char buf[4];
+        if (r == 0) {
+            const IoResult got = server2.read_exact(buf, 4);
+            r = !got ? got.error : (got.bytes == 4 && std::memcmp(buf, "ping", 4) == 0 ? 0 : -1);
+        }
+        if (r == 0) {
+            r = server2.write_all("pong", 4).error;
+        }
+        server2_result.store(r);
+        done.count_down();
+    });
+    const auto reopen = [&, client]() noexcept {
+        int r = client->close();
+        if (r == 0) {
+            r = client->transport().adopt(scheduler, pair2.fd[1]);
+        }
+        if (r == 0) {
+            r = client->upgrade_client(e.cctx, "localhost");
+        }
+        return r;
+    };
+    const int reopened = from_fiber ? -1 : reopen();
+    fiber::go(scheduler, [&, client, reopened]() noexcept {
+        int r = from_fiber ? reopen() : reopened;
+        if (r == 0) {
+            r = client->handshake();
+        }
+        if (r == 0) {
+            r = client->write_all("ping", 4).error;
+        }
+        char buf[4];
+        if (r == 0) {
+            const IoResult got = client->read_exact(buf, 4);
+            r = !got ? got.error : (got.bytes == 4 && std::memcmp(buf, "pong", 4) == 0 ? 0 : -1);
+        }
+        client2_result.store(r);
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_TRUE(interrupted(write_result.load())) << write_result.load();
+    EXPECT_EQ(server2_result.load(), 0);
+    EXPECT_EQ(client2_result.load(), 0);
+}
+
+TEST(TlsLifetime, CloseThenUpgradeAgainWhileWriterUnwinds) { upgrade_again_while_writer_unwinds(false); }
+
+TEST(TlsLifetime, CloseThenUpgradeAgainFromFiberWhileWriterUnwinds) { upgrade_again_while_writer_unwinds(true); }
+
+
 // ---- interop with the openssl CLI -----------------------------------------------------
 
 // Our server (echo) against `openssl s_client`, with ALPN.

@@ -17,14 +17,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/http/stream.hpp"
 #include "fibers/net/buffered_reader.hpp"
+#include "fibers/net/connection_pool.hpp"
 #include "fibers/net/socket.hpp"
 #include "fibers/sched/scheduler.hpp"
 #include "fibers/tls/connection.hpp"
@@ -459,6 +462,263 @@ TEST(TlsConnection, VerificationFailureCloses) {
     EXPECT_EQ(client_error.load(), EPROTO);
     EXPECT_FALSE(open_after.load());
     EXPECT_NE(reason.find("verify"), std::string::npos) << reason;
+}
+
+// ---- lifetime: close(), then destroy / reopen, while an operation unwinds -------------
+//
+// See TlsLifetime in tls_test.cpp: a writer parked for good (the peer does
+// not read), another party closes the connection and destroys it or opens
+// it again (TLS) while the writer is still on its way out.
+
+template <class Pred>
+bool eventually(Pred pred, std::chrono::milliseconds timeout = 60s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(50us);
+    }
+    return true;
+}
+
+bool write_parked(Connection& c) {
+    return c.transport().poll_desc().word_approx(net::Direction::kWrite) > net::BasicPollDesc<Scheduler>::kClosed;
+}
+
+constexpr std::size_t kFlood = std::size_t{8} << 20;
+
+bool interrupted(int error) { return error == ECANCELED || error == EBADF; }
+
+// TLS on both ends of a socketpair (both handshakes done).
+int tls_pair(Scheduler& scheduler, Contexts& ctx, Pair& pair, Connection& server, Connection& client) {
+    if (pair.fd[0] < 0) {
+        return EMFILE;
+    }
+    if (const int e = server.adopt(scheduler, pair.fd[0]); e != 0) {
+        return e;
+    }
+    if (const int e = client.adopt(scheduler, pair.fd[1]); e != 0) {
+        return e;
+    }
+    Latch done(1);
+    std::atomic<int> server_error{-100};
+    fiber::go(scheduler, [&]() noexcept {
+        server_error.store(server.start_tls_server(ctx.server));
+        done.count_down();
+    });
+    std::atomic<int> client_error{-100};
+    Latch client_done(1);
+    fiber::go(scheduler, [&]() noexcept {
+        client_error.store(client.start_tls_client(ctx.client, "localhost"));
+        client_done.count_down();
+    });
+    if (!done.wait() || !client_done.wait()) {
+        return ETIMEDOUT;
+    }
+    return server_error.load() != 0 ? server_error.load() : client_error.load();
+}
+
+// Echoes until an error or end of stream.
+void echo(Connection& c) {
+    char buf[4096];
+    for (;;) {
+        const IoResult r = c.read_some(buf, sizeof buf);
+        if (!r || r.bytes == 0 || !c.write_all(buf, r.bytes)) {
+            return;
+        }
+    }
+}
+
+// "ping" -> "pong" check over an echo peer that answers what it gets.
+int ping(Connection& c) {
+    if (const IoResult w = c.write_all("ping", 4); !w) {
+        return w.error;
+    }
+    char buf[4];
+    const IoResult r = c.read_exact(buf, 4);
+    if (!r) {
+        return r.error;
+    }
+    return r.bytes == 4 && std::memcmp(buf, "ping", 4) == 0 ? 0 : -1;
+}
+
+// tls::Connection: closed from a plain thread and destroyed while its writer
+// unwinds.
+TEST(TlsConnectionLifetime, CloseThenDestroyWhileWriterUnwinds) {
+    Contexts ctx;
+    ASSERT_TRUE(ctx.ok);
+    Scheduler scheduler(options(2));
+    Pair pair;
+    Connection server;
+    auto client = std::make_unique<Connection>();
+    ASSERT_EQ(tls_pair(scheduler, ctx, pair, server, *client), 0);
+    std::vector<char> flood(kFlood, 'x');
+    Connection* c = client.get();
+    Latch done(1);
+    std::atomic<int> result{-100};
+    fiber::go(scheduler, [&, c]() noexcept {
+        result.store(c->write_all(flood.data(), flood.size()).error);
+        done.count_down();
+    });
+    ASSERT_TRUE(eventually([&] { return write_parked(*c); }));
+    EXPECT_EQ(client->close(), 0);
+    client.reset();
+    ASSERT_TRUE(done.wait());
+    EXPECT_TRUE(interrupted(result.load())) << result.load();
+}
+
+// tls::Connection: a watchdog fiber closes it and opens it again (adopt +
+// start_tls_client) while the old writer unwinds; the new session works
+// (no stale ciphertext of the old session reaches the new socket).
+TEST(TlsConnectionLifetime, CloseThenReopenWhileWriterUnwinds) {
+    Contexts ctx;
+    ASSERT_TRUE(ctx.ok);
+    Scheduler scheduler(options(2));
+    Pair pair;
+    Connection server;
+    Connection client;
+    ASSERT_EQ(tls_pair(scheduler, ctx, pair, server, client), 0);
+    std::vector<char> flood(kFlood, 'x');
+    Latch done(3);
+    std::atomic<int> write_result{-100};
+    fiber::go(scheduler, [&]() noexcept {
+        write_result.store(client.write_all(flood.data(), flood.size()).error);
+        done.count_down();
+    });
+    ASSERT_TRUE(eventually([&] { return write_parked(client); }));
+    Pair pair2;
+    ASSERT_GE(pair2.fd[0], 0);
+    Connection server2;
+    ASSERT_EQ(server2.adopt(scheduler, pair2.fd[0]), 0);
+    fiber::go(scheduler, [&]() noexcept {
+        if (server2.start_tls_server(ctx.server) == 0) {
+            echo(server2);
+        }
+        done.count_down();
+    });
+    std::atomic<int> reopen_result{-100};
+    fiber::go(scheduler, [&]() noexcept {
+        int r = client.close();
+        if (r == 0) {
+            r = client.adopt(scheduler, pair2.fd[1]);  // the old writer may still be on its way out
+        }
+        if (r == 0) {
+            r = client.start_tls_client(ctx.client, "localhost");
+        }
+        if (r == 0) {
+            r = ping(client);
+        }
+        reopen_result.store(r);
+        static_cast<void>(client.close());  // ends server2's echo
+        done.count_down();
+    });
+    ASSERT_TRUE(done.wait());
+    EXPECT_TRUE(interrupted(write_result.load())) << write_result.load();
+    EXPECT_EQ(reopen_result.load(), 0);
+}
+
+// The same through net::ConnectionPool: a lease's connection is closed by a
+// watchdog while another fiber's write on it unwinds, the lease goes back
+// broken, and the next acquire reopens the same Conn object (max_open = 1)
+// with TLS (upgrade_client on the object the writer is leaving).
+struct PairFactory {
+    Scheduler* scheduler;
+    Contexts* ctx;
+    Connection* servers;  // kMaxServers
+    std::atomic<int>* opened;
+    std::atomic<int>* servers_done;
+
+    static constexpr int kMaxServers = 4;
+
+    int open(Connection& c, fibers::poller::TimePoint) noexcept {
+        const int i = opened->load();
+        if (i >= kMaxServers) {
+            return EMFILE;
+        }
+        Pair pair;
+        if (pair.fd[0] < 0) {
+            return EMFILE;
+        }
+        Connection& s = servers[i];
+        if (const int e = s.adopt(*scheduler, pair.fd[0]); e != 0) {
+            ::close(pair.fd[0]);
+            ::close(pair.fd[1]);
+            return e;
+        }
+        if (const int e = c.adopt(*scheduler, pair.fd[1]); e != 0) {
+            ::close(pair.fd[1]);
+            static_cast<void>(s.close());
+            return e;
+        }
+        opened->fetch_add(1);
+        Contexts* contexts = ctx;
+        std::atomic<int>* finished = servers_done;
+        fiber::go(*scheduler, [&s, contexts, finished]() noexcept {
+            if (s.start_tls_server(contexts->server) == 0) {
+                echo(s);
+            }
+            static_cast<void>(s.close());
+            finished->fetch_add(1);
+        });
+        return c.start_tls_client(ctx->client, "localhost");
+    }
+};
+
+TEST(TlsConnectionLifetime, PoolReopensAfterCloseWhileWriterUnwinds) {
+    using Pool = net::ConnectionPool<Connection, PairFactory>;
+    Contexts ctx;
+    ASSERT_TRUE(ctx.ok);
+    Scheduler scheduler(options(2));
+    Connection servers[PairFactory::kMaxServers];
+    std::atomic<int> opened{0};
+    std::atomic<int> servers_done{0};
+    {
+        Pool pool(scheduler, PairFactory{&scheduler, &ctx, servers, &opened, &servers_done},
+                  net::ConnectionPoolOptions{.max_open = 1});
+        Pool::Lease lease;
+        Latch acquired(1);
+        std::atomic<int> acquire_result{-100};
+        fiber::go(scheduler, [&]() noexcept {
+            acquire_result.store(pool.acquire(lease));
+            acquired.count_down();
+        });
+        ASSERT_TRUE(acquired.wait());
+        ASSERT_EQ(acquire_result.load(), 0);
+        Connection* first = &*lease;
+        std::vector<char> flood(kFlood, 'x');
+        Latch done(2);
+        std::atomic<int> write_result{-100};
+        fiber::go(scheduler, [&, first]() noexcept {
+            write_result.store(first->write_all(flood.data(), flood.size()).error);
+            done.count_down();
+        });
+        ASSERT_TRUE(eventually([&] { return write_parked(*first); }));
+        // The watchdog (this thread): close, give the lease back broken.
+        EXPECT_EQ(lease->close(), 0);
+        lease.mark_broken();
+        lease.reset();
+        std::atomic<int> again{-100};
+        std::atomic<bool> same_object{false};
+        fiber::go(scheduler, [&]() noexcept {
+            Pool::Lease next;
+            int r = pool.acquire(next);
+            if (r == 0) {
+                same_object.store(&*next == first);
+                r = ping(*next);
+            }
+            again.store(r);
+            next.reset();
+            static_cast<void>(pool.close());
+            done.count_down();
+        });
+        ASSERT_TRUE(done.wait());
+        EXPECT_TRUE(interrupted(write_result.load())) << write_result.load();
+        EXPECT_EQ(again.load(), 0);
+        EXPECT_TRUE(same_object.load());
+    }
+    ASSERT_TRUE(eventually([&] { return servers_done.load() == opened.load(); }));
+    EXPECT_EQ(opened.load(), 2);
 }
 
 }  // namespace
