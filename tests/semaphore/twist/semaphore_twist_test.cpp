@@ -245,6 +245,46 @@ TEST(SemaphoreTwist, HeadOfLineHandOff) {
         small_thread.join();
         TWIST_ASSERT_M(big_pos >= 0 && small_pos >= 0, "both granted");
         TWIST_ASSERT_M(sem.available_approx() == 0, "all three permits taken");
+        TWIST_ASSERT_M(sem.waiters_approx() == 0, "nobody queued");
+    });
+}
+
+// waiters_approx(): the queue's length, kept under the lock. Two threads
+// queue; the releaser waits until the counter alone says both are queued,
+// then each release(1) hands one permit over and the count it reads right
+// after its own release is exact. A third thread reads it concurrently: it
+// never exceeds the number of waiters.
+TEST(SemaphoreTwist, WaitersCount) {
+    check([] {
+        Core sem(0);
+        ThreadWaiter waiters[2];
+        Counter granted{0};
+        twist::ed::std::thread threads[2] = {
+            twist::ed::std::thread([&] {
+                waiters[0].acquire(sem, 1);
+                granted.fetch_add(1);
+            }),
+            twist::ed::std::thread([&] {
+                waiters[1].acquire(sem, 1);
+                granted.fetch_add(1);
+            }),
+        };
+        twist::ed::std::thread reader([&] {
+            for (int i = 0; i < 3; ++i) {
+                TWIST_ASSERT_M(sem.waiters_approx() <= 2, "more waiters counted than exist");
+            }
+        });
+        FIBERS_WAIT_BOUNDED(sem.waiters_approx() == 2, "waiters never counted");
+        TWIST_ASSERT_M(sem.has_waiters_approx(), "WAITERS set with a nonempty queue");
+        sem.release(1);
+        TWIST_ASSERT_M(sem.waiters_approx() == 1, "one waiter granted, one left");
+        sem.release(1);
+        TWIST_ASSERT_M(sem.waiters_approx() == 0, "both granted");
+        for (auto& t : threads) {
+            t.join();
+        }
+        reader.join();
+        TWIST_ASSERT_M(granted.load() == 2 && sem.available_approx() == 0, "both permits taken");
     });
 }
 

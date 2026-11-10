@@ -94,6 +94,8 @@ public:
     // Racy snapshots (tests, diagnostics, metrics).
     std::uint64_t available_approx() const noexcept { return core_.available_approx(); }
     bool has_waiters_approx() const noexcept { return core_.has_waiters_approx(); }
+    // Queued waiters (fibers and threads that have not been granted yet).
+    std::uint64_t waiters_approx() const noexcept { return core_.waiters_approx(); }
 
 private:
     [[gnu::noinline]] void acquire_slow(std::uint64_t n) noexcept {

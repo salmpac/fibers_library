@@ -27,12 +27,17 @@
 //   * acquire(n) with n larger than the capacity waits forever.
 //   * acquire() in a fiber parks the fiber; on a plain thread it blocks the
 //     thread (never do that from a plain callback on a worker).
+//   * available_approx() / waiters_approx() are racy snapshots (metrics,
+//     tests, "is the queue formed yet"), never a basis for acquiring.
 //
 // Part 1: clients compete for K connections; part 2: fail-fast probes with
 // try_to_lock while the pool is saturated; part 3: the queue order with
-// mixed request sizes. main (a plain thread) drives all three: it spawns
-// the fibers with WaitGroup::go(scheduler, f) and joins them with wait(),
-// which blocks a plain thread.
+// mixed request sizes, checked: the waiters queue one by one (main waits
+// until waiters_approx() counts each before spawning the next), and when a
+// waiter is granted no earlier arrival may still be queued. main (a plain
+// thread) drives all three: it spawns the fibers with
+// WaitGroup::go(scheduler, f) and joins them with wait(), which blocks a
+// plain thread.
 
 #include <atomic>
 #include <chrono>
@@ -160,8 +165,7 @@ int main(int argc, char** argv) {
         constexpr std::uint64_t kWant[kWaiters] = {1, 3, 1, 1, 2};
         std::chrono::steady_clock::time_point released;  // set before release(3): waiters see it
         double granted_ms[kWaiters] = {};
-        std::atomic<int> sequence{0};
-        int grant_seq[kWaiters] = {};
+        std::uint64_t queued_at_grant[kWaiters] = {};
 
         sem.acquire(3);  // main holds everything while the queue forms (free: no wait)
         fiber::WaitGroup wg;
@@ -170,26 +174,35 @@ int main(int argc, char** argv) {
                 fiber::SemaphoreGuard permits(sem, kWant[w]);  // queues in spawn order
                 const auto waited = std::chrono::steady_clock::now() - released;
                 granted_ms[w] = std::chrono::duration<double, std::milli>(waited).count();
-                grant_seq[w] = sequence.fetch_add(1);
+                // How many are still queued now that w has its permits
+                // (nobody arrives any more, so the queue only shrinks after
+                // the grant: this is at most its length at the grant).
+                queued_at_grant[w] = sem.waiters_approx();
                 this_fiber::sleep_for(2ms);  // hold them a little
             });
-            // Let waiter w queue up before w + 1 arrives. A timing
-            // assumption: on a badly overloaded machine the arrival
-            // order can differ, so the order is printed, not checked.
-            std::this_thread::sleep_for(1ms);
+            // Spawn w + 1 only once w is queued: the arrival order is the
+            // spawn order, with no timing assumption.
+            while (sem.waiters_approx() < static_cast<std::uint64_t>(w + 1)) {
+                std::this_thread::sleep_for(50us);
+            }
         }
         released = std::chrono::steady_clock::now();
         sem.release(3);  // w0 gets 1; w1 needs 3 and only 2 are free: everybody waits behind w1
         wg.wait();
 
         std::printf("fairness: 3 permits, all held while 5 fibers queue: w0(1) w1(3) w2(1) w3(1) w4(2);\n"
-                    "  after the holder released them (each waiter keeps its permits 2 ms):\n ");
-        int overtook_w1 = 0;
+                    "  after the holder released them (each waiter keeps its permits 2 ms):\n");
+        // FIFO: when w is granted, every earlier waiter has been granted
+        // already, so the queue holds later arrivals only.
+        int violations = 0;
         for (int w = 0; w < kWaiters; ++w) {
-            std::printf(" w%d +%.1f ms%s", w, granted_ms[w], w + 1 < kWaiters ? "," : "\n");
-            overtook_w1 += w > 1 && grant_seq[w] < grant_seq[1] ? 1 : 0;
+            std::printf("    w%d(%llu) granted after %.1f ms, %llu still queued behind it\n", w,
+                        static_cast<unsigned long long>(kWant[w]), granted_ms[w],
+                        static_cast<unsigned long long>(queued_at_grant[w]));
+            violations += queued_at_grant[w] > static_cast<std::uint64_t>(kWaiters - 1 - w) ? 1 : 0;
         }
-        std::printf("  later arrivals that overtook the 3-permit request w1: %d\n", overtook_w1);
+        std::printf("  FIFO violations (granted while an earlier arrival still waited): %d\n", violations);
+        status |= violations == 0 ? 0 : 1;
     }
     scheduler.stop();
     return status;

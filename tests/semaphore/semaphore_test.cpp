@@ -156,12 +156,15 @@ TEST(SemaphoreCore, ReleaseWakesSeveralInOrder) {
     for (int i = 0; i < kWaiters; ++i) {
         waiters.push_back(std::make_unique<Waiter>(i, &log));
         EXPECT_FALSE(sem.acquire_or_enqueue(waiters.back()->sn, 1));
+        EXPECT_EQ(sem.waiters_approx(), static_cast<std::uint64_t>(i + 1));
     }
     EXPECT_TRUE(sem.has_waiters_approx());
     sem.release(3);
     EXPECT_EQ(log, (std::vector<int>{0, 1, 2}));
     EXPECT_TRUE(sem.has_waiters_approx());
+    EXPECT_EQ(sem.waiters_approx(), static_cast<std::uint64_t>(kWaiters - 3));
     sem.release(kWaiters);  // 5 more waiters, 3 permits left over
+    EXPECT_EQ(sem.waiters_approx(), 0u);
     ASSERT_EQ(log.size(), static_cast<std::size_t>(kWaiters));
     for (int i = 0; i < kWaiters; ++i) {
         EXPECT_EQ(log[static_cast<std::size_t>(i)], i);
@@ -184,17 +187,22 @@ TEST(SemaphoreCore, HeadOfLineMultiPermit) {
     EXPECT_FALSE(sem.acquire_or_enqueue(small.sn, 1));  // 1 free, but queued behind big
     EXPECT_FALSE(sem.try_acquire(1));                   // no barging
     EXPECT_EQ(sem.available_approx(), 1u);
+    EXPECT_EQ(sem.waiters_approx(), 2u);
     sem.release(1);
     EXPECT_TRUE(log.empty());
     EXPECT_EQ(sem.available_approx(), 2u);
+    EXPECT_EQ(sem.waiters_approx(), 2u);  // permits held back for big
     EXPECT_FALSE(sem.acquire_or_enqueue(later.sn, 1));
+    EXPECT_EQ(sem.waiters_approx(), 3u);
     sem.release(1);  // big gets 3; small and later still wait (0 free)
     EXPECT_EQ(log, (std::vector<int>{1}));
     EXPECT_EQ(sem.available_approx(), 0u);
+    EXPECT_EQ(sem.waiters_approx(), 2u);
     sem.release(2);  // both
     EXPECT_EQ(log, (std::vector<int>{1, 2, 3}));
     EXPECT_EQ(sem.available_approx(), 0u);
     EXPECT_FALSE(sem.has_waiters_approx());
+    EXPECT_EQ(sem.waiters_approx(), 0u);
 }
 
 // Grants stop at the first waiter that does not fit, even if a later one
@@ -455,6 +463,58 @@ TEST(Semaphore, ReleaseNWakesSeveralFibers) {
     ASSERT_TRUE(done.wait()) << done.remaining() << " fibers stuck";
     EXPECT_EQ(bad.load(), 0);
     EXPECT_EQ(sem.available_approx(), 0u);
+}
+
+// FIFO without timing assumptions: each fiber is spawned only once the one
+// before it is queued (waiters_approx() counts it), so the arrival order is
+// known. Then the main thread releases one permit at a time: the grants
+// happen inside its release() (the queue is cut there), so right after it
+// waiters_approx() is exact, and exactly the FIFO prefix that fits must
+// have been granted (head-of-line blocking for the big requests).
+TEST(Semaphore, FifoOrderByWaitersCount) {
+    constexpr int kWaiters = 6;
+    constexpr std::uint64_t kWant[kWaiters] = {1, 3, 1, 2, 1, 1};
+    constexpr int kRounds = 20;
+    Scheduler scheduler(options(4));
+    for (int round = 0; round < kRounds; ++round) {
+        fiber::Semaphore sem(0);
+        Latch done(kWaiters);
+        std::atomic<bool> granted[kWaiters] = {};
+        for (int w = 0; w < kWaiters; ++w) {
+            fiber::go(scheduler, [&, w]() noexcept {
+                sem.acquire(kWant[w]);  // keeps the permits
+                granted[w].store(true);
+                done.count_down();
+            });
+            ASSERT_TRUE(eventually([&] { return sem.waiters_approx() == static_cast<std::uint64_t>(w + 1); }));
+        }
+        // The model: FIFO with direct hand-off.
+        int head = 0;
+        std::uint64_t avail = 0;
+        while (head < kWaiters) {
+            sem.release(1);
+            ++avail;
+            while (head < kWaiters && kWant[head] <= avail) {
+                avail -= kWant[head];
+                ++head;
+            }
+            ASSERT_EQ(sem.waiters_approx(), static_cast<std::uint64_t>(kWaiters - head)) << "round " << round;
+            ASSERT_EQ(sem.available_approx(), avail);
+            ASSERT_TRUE(eventually([&] {
+                for (int w = 0; w < head; ++w) {
+                    if (!granted[w].load()) {
+                        return false;
+                    }
+                }
+                return true;
+            }));
+            for (int w = head; w < kWaiters; ++w) {
+                ASSERT_FALSE(granted[w].load()) << "w" << w << " overtook the queue, round " << round;
+            }
+        }
+        ASSERT_TRUE(done.wait());
+        EXPECT_FALSE(sem.has_waiters_approx());
+    }
 }
 
 // A multi-permit acquire collects permits released one at a time by

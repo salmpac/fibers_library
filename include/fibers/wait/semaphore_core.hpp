@@ -36,6 +36,10 @@
 //   queue_ = intrusive FIFO of SemaphoreNode (head_, tail_), under lock_
 //            (a SpinLock: queue updates only, O(1) per waiter, no waiting
 //            and no syscalls while held; like PollDesc's deadline lock).
+//   waiters_ = the queue's length: written only under lock_ (relaxed
+//            stores), read without it (waiters_approx(), relaxed). A
+//            diagnostic mirror: no decision depends on it, it carries no
+//            data, so it needs no order.
 //
 //   Invariant (outside lock_): WAITERS set <=> queue nonempty, and then
 //   permits < head.need. WAITERS changes only under lock_, in an RMW of
@@ -247,6 +251,8 @@ public:
     // Racy snapshots (tests, diagnostics).
     std::uint64_t available_approx() const noexcept { return permits_of(state_.load(std::memory_order_relaxed)); }
     bool has_waiters_approx() const noexcept { return (state_.load(std::memory_order_relaxed) & kWaiters) != 0; }
+    // How many waiters are queued (enqueued and not yet granted).
+    std::uint64_t waiters_approx() const noexcept { return waiters_.load(std::memory_order_relaxed); }
 
 private:
     static constexpr std::uint64_t kWaiters = 1;
@@ -293,9 +299,12 @@ private:
                 granted = head_;
                 // Cut the granted prefix off the queue.
                 WaitNode* last = granted;
+                std::uint64_t count = 1;
                 while (last->next != rest) {
                     last = last->next;
+                    ++count;
                 }
+                waiters_.store(waiters_.load(std::memory_order_relaxed) - count, std::memory_order_relaxed);
                 last->next = nullptr;
                 head_ = rest;
                 if (rest == nullptr) {
@@ -319,12 +328,14 @@ private:
             tail_->next = &node.node;
         }
         tail_ = &node.node;
+        waiters_.store(waiters_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
 
     typename Sync::template Atomic<std::uint64_t> state_{0};
     sync::SpinLock<Sync> lock_;
     WaitNode* head_ = nullptr;  // under lock_
     WaitNode* tail_ = nullptr;  // under lock_
+    typename Sync::template Atomic<std::uint64_t> waiters_{0};  // written under lock_, read racily
 };
 
 }  // namespace fibers::wait

@@ -354,7 +354,10 @@ ctest --preset clang-release -L examples     # or: ctest --test-dir build/clang-
   client fibers (never more than K in use), fail-fast probes with
   `std::try_to_lock` while the pool is saturated, and the FIFO hand-off
   with mixed sizes: a 3-permit request at the head is not overtaken by the
-  1-permit requests behind it.
+  1-permit requests behind it. The queue forms deterministically (main
+  spawns the next waiter only once `waiters_approx()` counts the previous
+  one) and the order is checked: when a waiter is granted, no earlier
+  arrival may still be queued (exit 1 otherwise).
 - **`event_broadcast`** (`fiber::Event`, `--workers --runners`). N fibers
   park on one event; main (a plain thread) fires it with `set()`; a second
   `set()` is a no-op and a late `wait()` returns at once.
