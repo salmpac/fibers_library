@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -778,27 +779,36 @@ TEST(Http2MockTls, BadCertificate) {
 
 namespace {
 
+std::string make_big() {
+    std::string big(8 << 20, '\0');
+    for (std::size_t i = 0; i < big.size(); ++i) {
+        big[i] = static_cast<char>('0' + (i * 31) % 75);
+    }
+    return big;
+}
+
+const std::string& big_file() {
+    static const std::string data = make_big();
+    return data;
+}
+
+// Written once per process into a temporary name and renamed: ctest runs
+// the tests of this binary in parallel processes sharing the directory.
+void put_file(const std::string& path, const std::string& data) {
+    const std::string tmp = path + "." + std::to_string(::getpid());
+    std::ofstream(tmp, std::ios::binary) << data;
+    std::rename(tmp.c_str(), path.c_str());
+}
+
 const std::string& docroot() {
     static const std::string dir = [] {
         std::string d = std::string(FIBERS_HTTP2_TEST_DIR) + "/docroot";
         ::mkdir(d.c_str(), 0755);
-        std::ofstream(d + "/small.txt") << "hello from nghttpd\n";
-        std::string big(8 << 20, '\0');
-        for (std::size_t i = 0; i < big.size(); ++i) {
-            big[i] = static_cast<char>('0' + (i * 31) % 75);
-        }
-        std::ofstream(d + "/big.bin", std::ios::binary) << big;
+        put_file(d + "/small.txt", "hello from nghttpd\n");
+        put_file(d + "/big.bin", big_file());
         return d;
     }();
     return dir;
-}
-
-const std::string& big_file() {
-    static const std::string data = [] {
-        std::ifstream in(docroot() + "/big.bin", std::ios::binary);
-        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    }();
-    return data;
 }
 
 // nghttpd on 127.0.0.1:port (h2c unless tls), with extra args.
@@ -821,7 +831,10 @@ public:
         if (!child_.spawn(args)) {
             return false;
         }
-        return wait_until([&] { return h2test::port_open(port_); }, 10000ms);
+        // Ours, not another process's server on a port free_port() handed
+        // out twice: still alive once the port answers.
+        return wait_until([&] { return h2test::port_open(port_) || !child_.alive(); }, 10000ms) &&
+               child_.alive();
     }
 
     void kill() { child_.stop(); }

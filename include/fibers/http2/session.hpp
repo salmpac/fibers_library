@@ -267,8 +267,10 @@ public:
             rec->call = nullptr;
             release(rec);
             if (id == NGHTTP2_ERR_STREAM_ID_NOT_AVAILABLE) {
-                ids_exhausted_ = true;  // this connection is done for new streams
+                // Stream ids used up (2^30 requests): no new streams here; a
+                // GOAWAY lets the connection close once the live ones end.
                 goaway_sent_ = true;
+                static_cast<void>(nghttp2_submit_goaway(session_, NGHTTP2_FLAG_NONE, 0, NGHTTP2_NO_ERROR, nullptr, 0));
                 return EAGAIN;
             }
             return id == NGHTTP2_ERR_NOMEM ? ENOMEM : EINVAL;
@@ -675,7 +677,6 @@ private:
     bool dead_ = false;
     bool goaway_received_ = false;
     bool goaway_sent_ = false;
-    bool ids_exhausted_ = false;
     bool protocol_error_ = false;
 };
 

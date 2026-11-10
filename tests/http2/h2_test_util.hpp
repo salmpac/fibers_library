@@ -185,7 +185,18 @@ public:
         }
     }
 
-    bool running() const { return pid_ > 0; }
+    // Still running (not exited, e.g. because its port was taken).
+    bool alive() {
+        if (pid_ <= 0) {
+            return false;
+        }
+        int status = 0;
+        if (::waitpid(pid_, &status, WNOHANG) == pid_) {
+            pid_ = -1;
+            return false;
+        }
+        return true;
+    }
 
 private:
     pid_t pid_ = -1;
