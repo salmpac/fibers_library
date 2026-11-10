@@ -286,6 +286,7 @@ TEST(Coroutine, MigratesBetweenThreads) {
         std::set<std::thread::id> threads;  // touched only by the coroutine
         std::uint64_t counter = 0;
         std::unique_ptr<Coroutine> co;
+        std::thread::id last_resumer;  // touched only by the thread holding the task
 
         void body(SuspendContext ctx) noexcept {
             for (int i = 0; i < kSteps; ++i) {
@@ -312,15 +313,26 @@ TEST(Coroutine, MigratesBetweenThreads) {
         tasks.push_back(std::move(task));
     }
 
+    // Migration is forced, not left to chance: a thread never resumes the
+    // coroutine it resumed last (it puts it back and yields). Otherwise, on a
+    // loaded machine, one thread can do all 8'000 hand-overs (well under a
+    // millisecond) inside a single time slice and nothing migrates.
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&] {
+            const std::thread::id me = std::this_thread::get_id();
             while (scheduler.completed.load() < kCoroutines) {
                 Task* task = scheduler.pop();
                 if (task == nullptr) {
                     std::this_thread::yield();
                     continue;
                 }
+                if (task->last_resumer == me) {
+                    scheduler.push(task);
+                    std::this_thread::yield();
+                    continue;
+                }
+                task->last_resumer = me;  // handed between threads via the queue's lock
                 ResumeResult r = task->co->resume();
                 if (r.completed()) {
                     scheduler.completed.fetch_add(1);
@@ -339,9 +351,8 @@ TEST(Coroutine, MigratesBetweenThreads) {
         EXPECT_EQ(task->counter, std::uint64_t{kSteps});
         migrated += task->threads.size() > 1 ? 1 : 0;
     }
-    // With 4 threads and 500 hand-overs each, staying on one thread is
-    // practically impossible; this checks that migration was exercised.
-    EXPECT_GT(migrated, 0u);
+    // Every resume happens on a different thread than the previous one.
+    EXPECT_EQ(migrated, std::size_t{kCoroutines});
 }
 
 // --- fail-fast conditions ---
