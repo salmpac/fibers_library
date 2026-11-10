@@ -207,6 +207,34 @@ public:
         return e;
     }
 
+    // The same, with `deadline` (absolute, Scheduler::now()'s clock) for the
+    // whole of it: the TCP connect (net::Stream::connect with a deadline)
+    // and the handshake (both transport deadlines). ETIMEDOUT once it has
+    // passed (at once, with no socket, if it already has); the stream is
+    // closed again on any error. On success both deadlines are cleared.
+    // TimePoint{} / TimePoint::max(): no deadline.
+    int connect(Sched& scheduler, const net::Endpoint& peer, TlsContext& ctx, const char* server_name,
+                poller::TimePoint deadline) noexcept {
+        if (const int e = transport_.connect(scheduler, peer, deadline); e != 0) {
+            return e;
+        }
+        const bool has_deadline = deadline != poller::TimePoint{} && deadline != poller::TimePoint::max();
+        int e = has_deadline ? transport_.set_deadline(deadline) : 0;
+        if (e == 0) {
+            e = upgrade_client(ctx, server_name);
+        }
+        if (e == 0) {
+            e = handshake();
+        }
+        if (e == 0 && has_deadline) {
+            e = transport_.set_deadline(poller::TimePoint{});
+        }
+        if (e != 0) {
+            static_cast<void>(transport_.close());  // error_string() still describes a failed handshake
+        }
+        return e;
+    }
+
     // listener.accept(transport()) + upgrade_server. No handshake (run it in
     // the connection's own fiber, not in the accept loop).
     int accept(Listener& listener, TlsContext& ctx, net::Endpoint* peer = nullptr) noexcept {

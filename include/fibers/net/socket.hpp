@@ -216,8 +216,27 @@ public:
     // Connects to `peer` (non-blocking connect, then waits for write
     // readiness and reads SO_ERROR). From a fiber of `scheduler` (it waits).
     // 0 or errno (ECONNREFUSED, ETIMEDOUT, ...); on error the stream stays
-    // closed.
+    // closed. Without a deadline only the kernel's SYN retries bound the
+    // wait (about two minutes on Linux for a blackholed peer).
     int connect(Sched& scheduler, const Endpoint& peer) noexcept {
+        return connect(scheduler, peer, poller::TimePoint{});
+    }
+
+    // The same, giving up at `deadline` (absolute, on the scheduler's clock:
+    // Scheduler::now(), steady_clock) with ETIMEDOUT. TimePoint{} or
+    // TimePoint::max(): no deadline. A deadline that has already passed
+    // fails at once, before any socket is created. Otherwise it is the
+    // write deadline of the half-open socket (set_write_deadline's
+    // machinery: one timer on the socket's poller, no extra node): on
+    // expiry the wait ends, close() unregisters the fd and withdraws that
+    // timer, and the fd is closed, so nothing of the attempt is left behind
+    // (the kernel drops the SYN_SENT socket). On success the deadline is
+    // cleared again: later writes are not bound by it.
+    int connect(Sched& scheduler, const Endpoint& peer, poller::TimePoint deadline) noexcept {
+        const bool has_deadline = deadline != poller::TimePoint{} && deadline != poller::TimePoint::max();
+        if (has_deadline && deadline <= scheduler.now()) {
+            return ETIMEDOUT;
+        }
         const int fd = ::socket(peer.family(), SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) {
             return errno;
@@ -236,6 +255,12 @@ public:
         int error = 0;
         {
             typename PollDesc::Guard guard(desc_);  // cannot fail: nobody else has it
+            if (has_deadline) {
+                // 0: not closing (nobody else has the descriptor). Expires at
+                // once if the deadline passed meanwhile: io() then fails
+                // before its first attempt.
+                static_cast<void>(desc_.set_deadline(Direction::kWrite, deadline));
+            }
             const ssize_t r = desc_.io(Direction::kWrite, [this, fd]() noexcept -> ssize_t {
                 // A failed connect is reported with EPOLLERR, and the poller
                 // takes SO_ERROR into the descriptor's sticky error then.
@@ -260,6 +285,11 @@ public:
                 return errno == ENOTCONN ? -EAGAIN : -static_cast<ssize_t>(errno);
             });
             error = r < 0 ? static_cast<int>(-r) : 0;
+            if (error == 0 && has_deadline) {
+                // Clears `expired` too, should the timer have fired just now;
+                // a still pending timer finds no deadline when it fires.
+                static_cast<void>(desc_.set_deadline(Direction::kWrite, poller::TimePoint{}));
+            }
         }
         if (error != 0) {
             static_cast<void>(close());
