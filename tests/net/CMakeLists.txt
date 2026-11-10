@@ -10,6 +10,14 @@ target_compile_options(buffered_reader_tests PRIVATE -Wall -Wextra -Wpedantic)
 
 gtest_discover_tests(buffered_reader_tests DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 300)
 
+# Resolver.
+foreach(_t resolver)
+    add_executable(${_t}_tests ${_t}_test.cpp)
+    target_link_libraries(${_t}_tests PRIVATE fibers::net GTest::gtest_main)
+    target_compile_options(${_t}_tests PRIVATE -Wall -Wextra -Wpedantic)
+    gtest_discover_tests(${_t}_tests DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 300)
+endforeach()
+
 if(FIBERS_TWIST)
     add_subdirectory(twist)
 endif()
