@@ -118,6 +118,15 @@
         "CMAKE_BUILD_TYPE": "Release",
         "FIBERS_BUILD_EXAMPLES": "ON"
       }
+    },
+    {
+      "name": "gcc-asan",
+      "displayName": "GCC ASan + UBSan (optimised)",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "FIBERS_SANITIZE": "address,undefined"
+      }
     }
   ],
   "buildPresets": [
@@ -144,6 +153,10 @@
     {
       "name": "gcc-release",
       "configurePreset": "gcc-release"
+    },
+    {
+      "name": "gcc-asan",
+      "configurePreset": "gcc-asan"
     },
     {
       "name": "clang-twist-sim",
@@ -194,6 +207,11 @@
       "name": "gcc-release",
       "inherits": "base",
       "configurePreset": "gcc-release"
+    },
+    {
+      "name": "gcc-asan",
+      "inherits": "base",
+      "configurePreset": "gcc-asan"
     },
     {
       "name": "clang-twist-sim",
@@ -272,6 +290,23 @@
         {
           "type": "test",
           "name": "clang-twist-faulty-tsan"
+        }
+      ]
+    },
+    {
+      "name": "gcc-asan",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "gcc-asan"
+        },
+        {
+          "type": "build",
+          "name": "gcc-asan"
+        },
+        {
+          "type": "test",
+          "name": "gcc-asan"
         }
       ]
     }
