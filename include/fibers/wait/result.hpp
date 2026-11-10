@@ -32,13 +32,21 @@ enum class Error : std::uint8_t {
     // The producer side went away without delivering a value (a Promise
     // destroyed or abandon()ed before set()).
     kBroken = 1,
-    // Reserved for later: kTimedOut, kCancelled.
+    // The wait's context was cancelled (fiber::BasicContext::cancel(), or
+    // a parent context's cancellation).
+    kCancelled = 2,
+    // The wait's context reached its deadline.
+    kTimedOut = 3,
 };
 
 inline const char* to_string(Error error) noexcept {
     switch (error) {
         case Error::kBroken:
             return "broken promise";
+        case Error::kCancelled:
+            return "cancelled";
+        case Error::kTimedOut:
+            return "timed out";
     }
     return "unknown error";
 }

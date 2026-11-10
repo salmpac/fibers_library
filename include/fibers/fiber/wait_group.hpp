@@ -16,6 +16,12 @@
 //   ... on shutdown: stop accepting, then wg.wait() (requests may still
 //   spawn children: add() before their own done())
 //
+// Contexts (fibers/fiber/context.hpp): wg.go(f) from a fiber inherits its
+// context, wg.go(scheduler, f) runs the child under none. wait() is a join
+// and is NOT interrupted by a cancelled context (docs/cancellation.md): the
+// children reference the waiter's frame, and under the same context they
+// are cancelled too and return.
+//
 // A one-shot wait: the count may cross zero any number of times before the
 // first wait(); wait() closes the group, which finishes when the count next
 // reaches zero (or at once if it is zero). After that add() fails fast.
@@ -94,7 +100,19 @@ public:
         fiber::go(scheduler, member(std::forward<F>(f)));
     }
 
-    // From inside a fiber: the same on the current fiber's scheduler.
+    // The same, the new fiber running under `context` (fibers/fiber/
+    // context.hpp), which must outlive it.
+    template <class F>
+        requires std::is_nothrow_invocable_v<std::decay_t<F>&> &&
+                 std::is_nothrow_constructible_v<std::decay_t<F>, F&&> &&
+                 std::is_nothrow_move_constructible_v<std::decay_t<F>>
+    void go(Sched& scheduler, BasicContext<Sched>& context, F&& f) noexcept {
+        add(1);
+        BasicFiber<Sched>::spawn(scheduler, &context, member(std::forward<F>(f)));
+    }
+
+    // From inside a fiber: the same on the current fiber's scheduler, under
+    // the current fiber's context (if any), like fiber::go(f).
     template <class F>
         requires std::is_nothrow_invocable_v<std::decay_t<F>&> &&
                  std::is_nothrow_constructible_v<std::decay_t<F>, F&&> &&
@@ -102,7 +120,7 @@ public:
     void go(F&& f) noexcept {
         BasicFiber<Sched>& self = BasicFiber<Sched>::current_or_die("fiber: WaitGroup::go(f) outside a fiber");
         add(1);
-        fiber::go(self.scheduler(), member(std::forward<F>(f)));
+        BasicFiber<Sched>::spawn(self.scheduler(), self.context(), member(std::forward<F>(f)));
     }
 
     // Racy snapshot (tests, diagnostics).

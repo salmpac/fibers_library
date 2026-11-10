@@ -9,6 +9,9 @@
 //       fiber::this_fiber::sleep_for(1ms);      // a timer of the poller
 //       std::lock_guard guard(mutex);           // fiber::Mutex (mutex.hpp)
 //   });
+//   fiber::go(scheduler, ctx, f);               // under a request context
+//                                               // (context.hpp); go(f) from
+//                                               // a fiber inherits its context
 //
 // Layout. A fiber lives at the TOP of its own stack (from the scheduler's
 // StackPool), together with the user's closure:
@@ -196,6 +199,7 @@ public:
     using SuspendContext = coro::BasicSuspendContext<SyncPolicy>;
     using Header = sched::BasicTaskHeader<Sched>;
     using Handle = BasicFiberHandle<Sched>;
+    using Context = BasicContext<Sched>;
 
     // State word values (see the top comment).
     static constexpr std::uint32_t kParked = 0;
@@ -214,6 +218,14 @@ public:
         requires std::is_nothrow_invocable_v<std::decay_t<F>&> &&
                  std::is_nothrow_constructible_v<std::decay_t<F>, F&&>
     static void spawn(Sched& scheduler, F&& f) noexcept {
+        spawn(scheduler, nullptr, std::forward<F>(f));
+    }
+
+    // The same, the new fiber running under `ctx` (nullptr: none).
+    template <class F>
+        requires std::is_nothrow_invocable_v<std::decay_t<F>&> &&
+                 std::is_nothrow_constructible_v<std::decay_t<F>, F&&>
+    static void spawn(Sched& scheduler, Context* ctx, F&& f) noexcept {
         using Closure = std::decay_t<F>;
         stack::Stack* stack = scheduler.stacks().acquire();
         const context::StackView view = stack->view();
@@ -235,7 +247,7 @@ public:
         Closure* closure = ::new (reinterpret_cast<void*>(closure_at)) Closure(std::forward<F>(f));
         const context::StackView below{view.data(), static_cast<std::size_t>(closure_at - begin)};
         auto* fiber = ::new (reinterpret_cast<void*>(fiber_at))
-            BasicFiber(scheduler, stack, below, closure, &run_closure<Closure>, &destroy_closure<Closure>);
+            BasicFiber(scheduler, ctx, stack, below, closure, &run_closure<Closure>, &destroy_closure<Closure>);
         count_spawned(scheduler);
         scheduler.pool().submit(fiber->task());
     }
@@ -292,6 +304,12 @@ public:
 
     Handle handle() noexcept { return Handle(this); }
     const Header& header() const noexcept { return header_; }
+
+    // The context this fiber runs under (nullptr: none). The fiber's own
+    // business: read and changed only on the fiber itself (see
+    // ContextScope in context.hpp), set at spawn otherwise.
+    Context* context() const noexcept { return header_.context; }
+    void set_context(Context* ctx) noexcept { header_.context = ctx; }
     Sched& scheduler() const noexcept { return *header_.scheduler; }
 
     // The Task that runs (resumes) this fiber. Only for the party that owns
@@ -347,9 +365,9 @@ private:
 
     using RunClosure = void (*)(void* closure) noexcept;
 
-    BasicFiber(Sched& scheduler, stack::Stack* stack, context::StackView below, void* closure,
+    BasicFiber(Sched& scheduler, Context* ctx, stack::Stack* stack, context::StackView below, void* closure,
                RunClosure run, typename Coroutine::Drop destroy) noexcept
-        : header_{&scheduler, this},
+        : header_{&scheduler, this, ctx},
           stack_(stack),
           closure_(closure),
           run_(run),
@@ -482,19 +500,32 @@ private:
 
 // ---- spawning ------------------------------------------------------------------
 
-// A new fiber running f() on `scheduler`. Any thread.
+// A new fiber running f() on `scheduler`, under no context (also when
+// called from a fiber that has one: an explicit scheduler starts a new root
+// of work, e.g. a library's background fiber). Any thread.
 template <FiberScheduler Sched, class F>
     requires std::is_nothrow_invocable_v<std::decay_t<F>&>
 void go(Sched& scheduler, F&& f) noexcept {
-    BasicFiber<Sched>::spawn(scheduler, std::forward<F>(f));
+    BasicFiber<Sched>::spawn(scheduler, nullptr, std::forward<F>(f));
 }
 
-// From inside a fiber: a sibling on the same scheduler.
+// A new fiber running f() on `scheduler` under `context` (see context.hpp):
+// its network waits end with ECANCELED / ETIMEDOUT when the context does,
+// and fibers it spawns with go(f) inherit the context. `context` must
+// outlive the fiber. Any thread.
+template <FiberScheduler Sched, class F>
+    requires std::is_nothrow_invocable_v<std::decay_t<F>&>
+void go(Sched& scheduler, BasicContext<Sched>& context, F&& f) noexcept {
+    BasicFiber<Sched>::spawn(scheduler, &context, std::forward<F>(f));
+}
+
+// From inside a fiber: a sibling on the same scheduler, under the same
+// context as the calling fiber (if any).
 template <FiberScheduler Sched = sched::Scheduler, class F>
     requires std::is_nothrow_invocable_v<std::decay_t<F>&>
 void go(F&& f) noexcept {
     BasicFiber<Sched>& self = BasicFiber<Sched>::current_or_die("fiber: go(f) outside a fiber");
-    BasicFiber<Sched>::spawn(self.scheduler(), std::forward<F>(f));
+    BasicFiber<Sched>::spawn(self.scheduler(), self.context(), std::forward<F>(f));
 }
 
 // ---- the running fiber ---------------------------------------------------------
