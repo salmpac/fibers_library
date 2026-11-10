@@ -9,6 +9,7 @@
 //       wg.go(scheduler, [&]() noexcept { ... });   // add(1) + go + done()
 //   }
 //   wg.wait();                                       // in a fiber: parks
+//                                                    // (a plain thread: blocks)
 //
 //   // or by hand, e.g. in-flight requests of a server:
 //   wg.add();  fiber::go(...{ handle(request); wg.done(); });
@@ -24,11 +25,14 @@
 // wait() parks the fiber, not the worker thread: a WaitNode on the fiber's
 // own stack goes into the group's event, then the fiber parks; a wake that
 // arrives before the fiber has left its stack is absorbed by its state word
-// (NOTIFIED). Outside a fiber of a scheduler of type Sched, wait() returns
-// if the group has finished and fails fast otherwise (it never blocks a
-// thread); try_wait() is the non-blocking form for any thread. add() and
-// done() work from anywhere; the last done() wakes the waiters (one submit
-// each, from the thread that calls it).
+// (NOTIFIED). Outside a fiber of a scheduler of type Sched it blocks the
+// calling thread on an atomic (wait::ThreadWaiter, one wake: the group
+// finishes once): fine for a plain thread (main joining the fibers it
+// started, a foreign event loop's thread), never from a plain callback on a
+// worker (it would block the worker, and maybe the very fibers that would
+// call done()). try_wait() is the non-blocking form for any thread. add()
+// and done() work from anywhere; the last done() wakes the waiters (one
+// submit per fiber, one notify per thread, from the thread that calls it).
 
 #include <cstdint>
 #include <optional>
@@ -38,6 +42,8 @@
 #include "fibers/fail/fail_fast.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/sched/scheduler.hpp"
+#include "fibers/sync/sync.hpp"
+#include "fibers/wait/thread_waiter.hpp"
 #include "fibers/wait/wait_group_core.hpp"
 #include "fibers/wait/wait_node.hpp"
 
@@ -61,14 +67,13 @@ public:
     // never waits.
     bool try_wait() noexcept { return core_.try_wait(); }
 
-    // Closes the group and parks the calling fiber until it finishes.
+    // Closes the group and waits until it finishes: parks the calling fiber,
+    // or blocks the calling thread outside a fiber (see the top comment).
     void wait() noexcept {
         BasicFiber<Sched>* self = BasicFiber<Sched>::current();
         if (self == nullptr) [[unlikely]] {
-            if (core_.try_wait()) {
-                return;
-            }
-            fail::fail_fast("fiber: WaitGroup::wait() outside a fiber");
+            wait_thread();
+            return;
         }
         wait::WaitNode node = self->wait_node();
         if (!core_.wait_or_enqueue(node)) {
@@ -104,6 +109,21 @@ public:
     std::uint64_t count_approx() const noexcept { return core_.count_approx(); }
 
 private:
+    // Not a fiber: block the thread (a node on its stack, one wake).
+    [[gnu::noinline]] void wait_thread() noexcept {
+        using Sync = typename Sched::SyncPolicy;
+        if constexpr (sync::ParkingSyncPolicy<Sync>) {
+            wait::ThreadWaiter<Sync> waiter;
+            if (!core_.wait_or_enqueue(waiter.node)) {
+                waiter.wait();
+            }
+        } else {
+            if (!core_.try_wait()) {
+                fail::fail_fast("fiber: WaitGroup::wait() outside a fiber needs a parking Sync policy");
+            }
+        }
+    }
+
     // The fiber's closure: f in an optional, reset before done().
     template <class F>
     auto member(F&& f) noexcept {

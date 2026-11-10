@@ -339,4 +339,46 @@ TEST(WaitTwist, FiberEventSetFromThread) {
     });
 }
 
+// A plain thread blocks in WaitGroup::wait() (ThreadWaiter) while fibers
+// call done(); the group lives on its stack and goes right after wait().
+TEST(WaitTwist, ThreadWaitsOnWaitGroup) {
+    map_test_stacks();
+    check([] {
+        constexpr int kChildren = 2;
+        twist::assist::Shared<int> cells[kChildren] = {0, 0};
+        MiniScheduler scheduler(2);
+        {
+            WaitGroup wg;
+            for (int i = 0; i < kChildren; ++i) {
+                wg.go(scheduler, [&cells, i]() noexcept { cells[i].Write(1); });
+            }
+            wg.wait();  // not a fiber: blocks this thread
+            for (auto& cell : cells) {
+                TWIST_ASSERT_M(cell.Read() == 1, "child's write visible after wait");
+            }
+        }
+        scheduler.pool().stop();
+    });
+}
+
+// A plain thread blocks in Event::wait() (ThreadWaiter) while a fiber sets
+// it; the event lives on the thread's stack and goes right after wait().
+TEST(WaitTwist, ThreadWaitsOnEvent) {
+    map_test_stacks();
+    check([] {
+        twist::assist::Shared<int> payload{0};
+        MiniScheduler scheduler(1);
+        {
+            Event event;
+            fiber::go(scheduler, [&]() noexcept {
+                payload.Write(1);
+                event.set();
+            });
+            event.wait();  // not a fiber: blocks this thread
+            TWIST_ASSERT_M(payload.Read() == 1, "setter's write visible after wait");
+        }
+        scheduler.pool().stop();
+    });
+}
+
 }  // namespace

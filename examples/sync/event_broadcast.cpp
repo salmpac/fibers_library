@@ -5,6 +5,7 @@
 //
 //   fiber::Event start;
 //   start.wait();   // in fibers: parks until set(); returns at once if already set
+//                   // (on a plain thread: blocks the thread until set())
 //   start.set();    // anywhere (fiber, plain thread, callback): wakes every waiter
 //
 // Hot path: wait() on a set event is one atomic load. Otherwise the fiber
@@ -16,11 +17,12 @@
 //   * One-shot: it cannot be reset. A second set() is a no-op (returns
 //     false). For repeated signals use a new Event per round.
 //   * Everything done before the first set() is visible after wait().
-//   * wait() must run in a fiber unless the event is already set (a plain
-//     thread that would have to wait fails fast).
+//   * wait() in a fiber parks the fiber; on a plain thread it blocks the
+//     thread: never do that from a plain callback running on a worker.
 //   * Destroy it only after every wait() has returned.
 //
-// Here N runner fibers park on one event, and main (a plain thread) fires it.
+// Here N runner fibers park on one event, and main (a plain thread) fires it,
+// then joins the runners with a WaitGroup.
 
 #include <atomic>
 #include <chrono>
@@ -31,7 +33,6 @@
 #include "../common.hpp"
 #include "fibers/fiber/event.hpp"
 #include "fibers/fiber/fiber.hpp"
-#include "fibers/fiber/oneshot.hpp"
 #include "fibers/fiber/wait_group.hpp"
 #include "fibers/sched/scheduler.hpp"
 
@@ -68,22 +69,16 @@ int main(int argc, char** argv) {
     std::chrono::steady_clock::time_point fired;  // written before set(): every runner sees it after wait()
     std::atomic<std::int64_t> first_ns{INT64_MAX}, last_ns{0};
 
-    fiber::Oneshot<bool> late_wait;  // main blocks on it until the root fiber is done
-    fiber::go(scheduler, [&, done = late_wait.promise()]() mutable noexcept {
-        fiber::WaitGroup wg;
-        for (int r = 0; r < runners; ++r) {
-            wg.go([&]() noexcept {
-                at_the_line.fetch_add(1, std::memory_order_relaxed);
-                start.wait();  // parks: no worker is held while the runners wait
-                const std::int64_t ns = (std::chrono::steady_clock::now() - fired).count();
-                store_min(first_ns, ns);
-                store_max(last_ns, ns);
-            });
-        }
-        wg.wait();
-        start.wait();  // a late waiter: the event is set, this returns at once
-        done.set(start.is_set());
-    });
+    fiber::WaitGroup wg;
+    for (int r = 0; r < runners; ++r) {
+        wg.go(scheduler, [&]() noexcept {
+            at_the_line.fetch_add(1, std::memory_order_relaxed);
+            start.wait();  // parks: no worker is held while the runners wait
+            const std::int64_t ns = (std::chrono::steady_clock::now() - fired).count();
+            store_min(first_ns, ns);
+            store_max(last_ns, ns);
+        });
+    }
 
     // Fire from main (Event::set() works from any thread) once every runner
     // is at the line (some may still be on their way into wait(): fine,
@@ -94,7 +89,9 @@ int main(int argc, char** argv) {
     fired = std::chrono::steady_clock::now();
     const bool first_set = start.set();   // wakes every parked runner
     const bool second_set = start.set();  // a no-op: false
-    const fiber::Result<bool> late_ok = late_wait.get();
+    wg.wait();                            // main blocks until every runner is done
+    start.wait();                         // a late waiter: the event is set, this returns at once
+    const bool late_ok = start.is_set();
     scheduler.stop();
 
     std::printf("event_broadcast: %d runners on %zu workers waited on one Event; main fired it\n", runners,
@@ -102,6 +99,6 @@ int main(int argc, char** argv) {
     std::printf("  every runner was running again within %.3f ms (the first after %.3f ms)\n",
                 static_cast<double>(last_ns.load()) / 1e6, static_cast<double>(first_ns.load()) / 1e6);
     std::printf("  set() returned %d, the second set() %d; a late wait() returned at once: %d\n", first_set,
-                second_set, late_ok && *late_ok);
-    return first_set && !second_set && late_ok && *late_ok ? 0 : 1;
+                second_set, late_ok);
+    return first_set && !second_set && late_ok ? 0 : 1;
 }

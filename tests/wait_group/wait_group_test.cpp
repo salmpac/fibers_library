@@ -430,14 +430,55 @@ TEST(Event, FreshEventPerRoundOnWaiterStack) {
     EXPECT_EQ(bad.load(), 0);
 }
 
-TEST(EventDeathTest, WaitOutsideFiberWhenNotSet) {
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    EXPECT_DEATH(
-        {
-            fiber::Event event;
-            event.wait();
-        },
-        "outside a fiber");
+// wait() outside a fiber blocks the thread (ThreadWaiter) until a fiber
+// sets the event; several plain threads and fibers wait at once. Each round
+// a fresh event on the main thread's stack, destroyed right after the
+// waits return (set() lets go of it before waking anybody).
+TEST(Event, PlainThreadsWaitForFiber) {
+    constexpr int kRounds = 200;
+    constexpr int kThreads = 3;
+    constexpr int kFibers = 4;
+    std::atomic<int> bad{0};
+    Scheduler scheduler(options(2));
+    for (int round = 0; round < kRounds; ++round) {
+        fiber::Event event;
+        int payload = 0;  // written before set(), read after wait()
+        Latch fibers_done(kFibers);
+        for (int f = 0; f < kFibers; ++f) {
+            fiber::go(scheduler, [&]() noexcept {
+                event.wait();
+                if (payload != round + 1) {
+                    bad.fetch_add(1);
+                }
+                fibers_done.count_down();
+            });
+        }
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&] {
+                event.wait();  // not a fiber: blocks this thread
+                if (payload != round + 1) {
+                    bad.fetch_add(1);
+                }
+            });
+        }
+        fiber::go(scheduler, [&]() noexcept {
+            if (round % 2 == 0) {
+                this_fiber::yield();  // let some waiters enqueue first
+            }
+            payload = round + 1;
+            event.set();
+        });
+        event.wait();  // the main thread too
+        if (payload != round + 1) {
+            bad.fetch_add(1);
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+        ASSERT_TRUE(fibers_done.wait()) << fibers_done.remaining() << " fibers stuck";
+    }
+    EXPECT_EQ(bad.load(), 0);
 }
 
 // ------------------------------------------------------------ fiber::WaitGroup
@@ -708,15 +749,50 @@ TEST(WaitGroup, WaiterWokenWhileStillSwitchingOut) {
     EXPECT_EQ(notified_seen, kRounds);
 }
 
-TEST(WaitGroupDeathTest, WaitOutsideFiberWhenNotFinished) {
-    GTEST_FLAG_SET(death_test_style, "threadsafe");
-    EXPECT_DEATH(
-        {
-            fiber::WaitGroup wg;
-            wg.add();
+// wait() outside a fiber blocks the thread (ThreadWaiter): main fans out
+// with wg.go(scheduler, f) and joins, no root fiber. Each round a fresh
+// group on main's stack, destroyed right after wait() returns (the last
+// done() lets go of it before the wake), plus a second plain thread and a
+// fiber waiting on the same group.
+TEST(WaitGroup, PlainThreadWaits) {
+    constexpr int kRounds = 200;
+    constexpr int kChildren = 16;
+    std::atomic<int> bad{0};
+    Scheduler scheduler(options(4));
+    for (int round = 0; round < kRounds; ++round) {
+        int slots[kChildren] = {};  // plain: ordered by done() -> wait()
+        Latch fiber_waiter(1);
+        fiber::WaitGroup wg;
+        for (int i = 0; i < kChildren; ++i) {
+            wg.go(scheduler, [&slots, i, round]() noexcept {
+                if (i % 4 == 0) {
+                    this_fiber::yield();
+                }
+                slots[i] = round + i;
+            });
+        }
+        auto check = [&] {
+            for (int i = 0; i < kChildren; ++i) {
+                if (slots[i] != round + i) {
+                    bad.fetch_add(1);
+                }
+            }
+        };
+        fiber::go(scheduler, [&]() noexcept {
             wg.wait();
-        },
-        "outside a fiber");
+            check();
+            fiber_waiter.count_down();
+        });
+        std::thread other([&] {
+            wg.wait();
+            check();
+        });
+        wg.wait();  // not a fiber: blocks main
+        check();
+        other.join();
+        ASSERT_TRUE(fiber_waiter.wait());
+    }
+    EXPECT_EQ(bad.load(), 0);
 }
 
 TEST(WaitGroupDeathTest, AddAfterFinishedInFibers) {

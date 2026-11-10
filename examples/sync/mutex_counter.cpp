@@ -33,7 +33,9 @@
 // entry. Part 2: a fiber sleeps 20 ms holding the lock while 2 x workers
 // fibers wait for it and an unrelated ticker fiber keeps running: if lock()
 // blocked threads, the contenders would occupy every worker and the ticker
-// would never run.
+// would never run. main (a plain thread) never touches the mutex: it spawns
+// the fibers with WaitGroup::go(scheduler, f) and joins them with wait(),
+// which blocks a plain thread.
 
 #include <atomic>
 #include <chrono>
@@ -45,7 +47,6 @@
 #include "fibers/fiber/event.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/fiber/mutex.hpp"
-#include "fibers/fiber/oneshot.hpp"
 #include "fibers/fiber/wait_group.hpp"
 #include "fibers/sched/scheduler.hpp"
 
@@ -80,59 +81,59 @@ int main(int argc, char** argv) {
     Scheduler scheduler(options);
 
     Counter counter;
-    double part1_ms = 0;                  // written by the root fiber before it finishes
     std::uint64_t contenders_served = 0;  // guarded by counter.mutex
     std::atomic<int> ticks{0};
 
-    // main() is a plain thread: it cannot lock a fiber::Mutex or wait on a
-    // WaitGroup. So the program runs in a root fiber, and main waits for it
-    // on a Oneshot (get() outside a fiber blocks the calling thread).
-    // Everything the root fiber wrote before set() is visible after get().
-    fiber::Oneshot<bool> finished;
-    fiber::go(scheduler, [&, done = finished.promise()]() mutable noexcept {
-        // ---- part 1: many fibers, one counter ----
-        const auto start = std::chrono::steady_clock::now();
-        {
-            fiber::WaitGroup wg;
-            for (std::uint64_t f = 0; f < num_fibers; ++f) {
-                wg.go([&]() noexcept {
-                    for (std::uint64_t i = 1; i <= increments; ++i) {
-                        std::lock_guard guard(counter.mutex);
-                        if (counter.a != counter.b) {
-                            ++counter.violations;
-                        }
-                        ++counter.a;
-                        if (yield_every != 0 && i % yield_every == 0) {
-                            // Descheduled WITH the lock held: other fibers
-                            // that want it park, the worker runs the rest.
-                            this_fiber::yield();
-                        }
-                        ++counter.b;
+    // main() is a plain thread: it must not lock a fiber::Mutex (lock()
+    // fails fast if it would have to wait outside a fiber), so only fibers
+    // touch the counter. main joins them with WaitGroup::wait(), which blocks
+    // a plain thread; everything the fibers wrote before their done() is
+    // visible after it.
+    // ---- part 1: many fibers, one counter ----
+    const auto start = std::chrono::steady_clock::now();
+    {
+        fiber::WaitGroup wg;
+        for (std::uint64_t f = 0; f < num_fibers; ++f) {
+            wg.go(scheduler, [&]() noexcept {
+                for (std::uint64_t i = 1; i <= increments; ++i) {
+                    std::lock_guard guard(counter.mutex);
+                    if (counter.a != counter.b) {
+                        ++counter.violations;
                     }
-                });
-            }
-            wg.wait();  // parks the root fiber until every worker fiber is done
+                    ++counter.a;
+                    if (yield_every != 0 && i % yield_every == 0) {
+                        // Descheduled WITH the lock held: other fibers that
+                        // want it park, the worker runs the rest.
+                        this_fiber::yield();
+                    }
+                    ++counter.b;
+                }
+            });
         }
-        part1_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        wg.wait();  // main blocks until every fiber is done
+    }
+    const double part1_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 
-        // ---- part 2: the holder sleeps, the workers stay free ----
+    // ---- part 2: the holder sleeps, the workers stay free ----
+    {
         fiber::Event locked;
         std::atomic<bool> released{false};
         fiber::WaitGroup wg;
-        wg.go([&]() noexcept {
+        wg.go(scheduler, [&]() noexcept {
             std::lock_guard guard(counter.mutex);
             locked.set();
             this_fiber::sleep_for(20ms);  // parks holding the lock: fine for fiber::Mutex
             released.store(true, std::memory_order_relaxed);
         });
         for (std::size_t c = 0; c < 2 * workers; ++c) {
-            wg.go([&]() noexcept {
+            wg.go(scheduler, [&]() noexcept {
                 locked.wait();
                 std::lock_guard guard(counter.mutex);  // parks ~20 ms, its worker does not
                 ++contenders_served;
             });
         }
-        wg.go([&]() noexcept {  // never touches the mutex
+        wg.go(scheduler, [&]() noexcept {  // never touches the mutex
             locked.wait();
             while (!released.load(std::memory_order_relaxed)) {
                 this_fiber::sleep_for(1ms);
@@ -140,10 +141,8 @@ int main(int argc, char** argv) {
             }
         });
         wg.wait();
-        done.set(true);
-    });
-    static_cast<void>(finished.get());  // main blocks here (a plain thread may)
-    scheduler.stop();                   // every fiber has finished: nothing is abandoned
+    }
+    scheduler.stop();  // every fiber has finished: nothing is abandoned
 
     const std::uint64_t expected = num_fibers * increments;
     std::printf("mutex_counter: %zu workers, %llu fibers x %llu increments, a yield inside the lock every %llu\n",

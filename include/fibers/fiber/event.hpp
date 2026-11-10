@@ -6,6 +6,7 @@
 //
 //   fiber::Event ready;
 //   ... in fibers:            ready.wait();   // parks until set()
+//   ... on a plain thread:    ready.wait();   // blocks the thread until set()
 //   ... anywhere (any thread, a poller callback, a fiber): ready.set();
 //
 // set() wakes every waiting fiber and makes all later wait()s return at
@@ -16,19 +17,25 @@
 // wait() parks the fiber, not the worker thread: a WaitNode on the fiber's
 // own stack is published with the core's push CAS, then the fiber parks. A
 // set() that arrives before the fiber has left its stack is absorbed by the
-// fiber's state word (NOTIFIED). wait() must be called from a fiber of a
-// scheduler of type Sched when the event is not set yet: outside such a
-// fiber it fails fast (it never blocks a thread). set() and is_set() work
-// from anywhere. set() wakes the fibers one submit each: into the setting
-// worker's own queue (others steal from it), or from outside the pool into
-// the workers' mailboxes, round robin.
+// fiber's state word (NOTIFIED). Outside a fiber of a scheduler of type
+// Sched, wait() on an unset event blocks the calling thread on an atomic
+// (wait::ThreadWaiter, one wake: set() is one-shot): fine for a plain thread
+// (main, a foreign event loop's thread), never from a plain callback on a
+// worker (it would block the worker, and maybe the very fiber that would
+// set the event). set() and is_set() work from anywhere. set() wakes the
+// fibers one submit each: into the setting worker's own queue (others steal
+// from it), or from outside the pool into the workers' mailboxes, round
+// robin; a waiting thread gets a notify, from the setting thread.
 //
 // The event may be destroyed once every wait() has returned (set() does not
 // touch it after its exchange); destroying it with waiters fails fast.
 
+#include "fibers/fail/fail_fast.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/sched/scheduler.hpp"
+#include "fibers/sync/sync.hpp"
 #include "fibers/wait/event_core.hpp"
+#include "fibers/wait/thread_waiter.hpp"
 #include "fibers/wait/wait_node.hpp"
 
 namespace fibers::fiber {
@@ -45,7 +52,9 @@ public:
 
     bool is_set() const noexcept { return core_.is_set(); }
 
-    // Until the event is set (returns at once if it is).
+    // Until the event is set (returns at once if it is): parks the calling
+    // fiber, or blocks the calling thread outside a fiber (see the top
+    // comment).
     void wait() noexcept {
         if (core_.is_set()) [[likely]] {
             return;
@@ -55,10 +64,22 @@ public:
 
 private:
     [[gnu::noinline]] void wait_slow() noexcept {
-        BasicFiber<Sched>& self = BasicFiber<Sched>::current_or_die("fiber: Event::wait() outside a fiber");
-        wait::WaitNode node = self.wait_node();
-        if (!core_.wait_or_enqueue(node)) {
-            self.park();  // exactly one wake per publication: set() is one-shot
+        BasicFiber<Sched>* self = BasicFiber<Sched>::current();
+        if (self != nullptr) {
+            wait::WaitNode node = self->wait_node();
+            if (!core_.wait_or_enqueue(node)) {
+                self->park();  // exactly one wake per publication: set() is one-shot
+            }
+            return;
+        }
+        using Sync = typename Sched::SyncPolicy;
+        if constexpr (sync::ParkingSyncPolicy<Sync>) {
+            wait::ThreadWaiter<Sync> waiter;
+            if (!core_.wait_or_enqueue(waiter.node)) {
+                waiter.wait();
+            }
+        } else {
+            fail::fail_fast("fiber: Event::wait() outside a fiber needs a parking Sync policy");
         }
     }
 

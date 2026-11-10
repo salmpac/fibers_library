@@ -307,9 +307,15 @@ checked against outside test material and tools:
 # Synchronization primitives (`examples/sync/`)
 
 Small, heavily commented programs, one per primitive of `fibers/fiber/`.
-Each runs a root fiber on a `Scheduler`, prints what happened, joins
-everything, stops the scheduler and exits 0 (1 if a check failed), in a few
-tens of milliseconds. They are built with the other examples and, when the
+Each runs fibers on a `Scheduler`, prints what happened, joins everything,
+stops the scheduler and exits 0 (1 if a check failed), in a few tens of
+milliseconds. `main` is a plain thread: it spawns fibers with
+`WaitGroup::go(scheduler, f)` / `fiber::go(scheduler, f)` and waits for them
+with `WaitGroup::wait()`, `Event::wait()`, `Oneshot::get()` /
+`Future::get()` or `Semaphore::acquire()`, which park a fiber but block a
+plain thread (never call them from a plain callback running on a worker:
+that blocks the worker). Only `promise_future` keeps a root fiber, to show
+a fiber consumer parking. They are built with the other examples and, when the
 tests are configured too, registered as ctest smoke tests
 (`example.sync.*`, label `examples`).
 
@@ -329,11 +335,12 @@ ctest --preset clang-release -L examples     # or: ctest --test-dir build/clang-
   explains why a `std::mutex` must never be held across a park, sleep or
   I/O.
 - **`wait_group_fanout`** (`fiber::WaitGroup`, `--workers --fibers
-  --numbers --serve-ms`). Fan-out / fan-in: `wg.go(...)` N fibers that sum
-  slices into plain slots, `wg.wait()`, combine. Then graceful shutdown of a
-  toy server: the acceptor, every request and every request's child are in
-  one group; shutdown stops the acceptor and calls `wait()` while requests
-  are in flight and still adding children (legal: they hold a count).
+  --numbers --serve-ms`). Fan-out / fan-in: `wg.go(scheduler, ...)` N
+  fibers that sum slices into plain slots, `wg.wait()` on main, combine.
+  Then graceful shutdown of a toy server: the acceptor, every request and
+  every request's child are in one group; shutdown stops the acceptor and
+  calls `wait()` (on main) while requests are in flight and still adding
+  children (legal: they hold a count).
 - **`promise_future`** (`fiber::Oneshot`, `make_promise_future`,
   `--workers`). Request / response with `fiber::Result<T>`: (a) a
   `Oneshot<T>` on the consumer's stack (zero allocation; it must outlive the
@@ -355,8 +362,8 @@ ctest --preset clang-release -L examples     # or: ctest --test-dir build/clang-
 | primitive | when to use | key rule |
 |---|---|---|
 | `fiber::Mutex` | shared state modified by several fibers; the critical section may park (I/O, sleep, another lock) | lock only in fibers; never hold a `std::mutex` / spin lock across a park; barging, not FIFO |
-| `fiber::WaitGroup` | wait for N fibers: fan-out / fan-in, draining in-flight work on shutdown | `add()` before the work can finish (`wg.go` does it); one-shot: no `add()` after the group has finished; `wait()` only in a fiber |
+| `fiber::WaitGroup` | wait for N fibers: fan-out / fan-in, draining in-flight work on shutdown | `add()` before the work can finish (`wg.go` does it); one-shot: no `add()` after the group has finished; `wait()` parks a fiber, blocks a plain thread |
 | `fiber::Oneshot<T>` | one reply to one waiting fiber, zero allocation | lives in the consumer's frame: observe the completion (`get()`) before leaving it |
 | `fiber::make_promise_future<T>` | one reply when the consumer may give up (poll, detach) | `T` must fit the scheduler's `TaskMemoryPool`; `get()` / `try_get()` consume once |
 | `fiber::Semaphore` | at most K at a time: a resource pool, a byte budget, backpressure between threads and fibers | FIFO, no overtaking (even `try_acquire` fails while anyone waits); `acquire(n)` with n > capacity waits forever |
-| `fiber::Event` | a one-shot broadcast: start gun, "ready", "shutting down" | cannot be reset; `wait()` only in a fiber unless already set; destroy after every `wait()` returned |
+| `fiber::Event` | a one-shot broadcast: start gun, "ready", "shutting down" | cannot be reset; `wait()` parks a fiber, blocks a plain thread; destroy after every `wait()` returned |

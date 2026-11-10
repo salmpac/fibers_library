@@ -7,10 +7,12 @@
 // draining in-flight work on shutdown.
 //
 //   wg.go(f)      add(1), spawn a fiber running f, done() after f (and its
-//                 captures) are gone. Nothing is allocated.
+//                 captures) are gone. Nothing is allocated. In a fiber:
+//                 on its scheduler; anywhere: wg.go(scheduler, f).
 //   wg.add(n)     count += n           (any thread)
 //   wg.done()     count -= 1           (any thread; the last one wakes the waiters)
-//   wg.wait()     parks the calling fiber until the count is zero
+//   wg.wait()     parks the calling fiber until the count is zero (a plain
+//                 thread, like main here: blocks the thread)
 //
 // On the hot path add() / done() are one atomic RMW each; wait() puts a node
 // on the waiting fiber's stack and parks it (its worker runs other fibers).
@@ -24,24 +26,26 @@
 //     reaches zero, and add() after that fails fast. While the count is still
 //     above zero, add() is fine: a request in flight may add its children
 //     during the shutdown join, because it holds a count itself.
-//   * wait() must run in a fiber (outside one it only succeeds if the group
-//     has already finished); try_wait() never waits.
+//   * wait() in a fiber parks the fiber; on a plain thread (main) it blocks
+//     the thread: never do that from a plain callback running on a worker.
+//     try_wait() never waits.
 //
-// Part 1: fan-out / fan-in, a sum computed in slices by N fibers. Part 2: a
-// toy server. An acceptor spawns a request fiber every 200 us for
-// --serve-ms; some requests spawn a child (an "audit write") that outlives
-// them. Shutdown stops the acceptor and calls wait() while requests and
-// children are still in flight.
+// Both parts run on main, a plain thread: wg.go(scheduler, f) spawns onto
+// the scheduler, wg.wait() blocks main. Part 1: fan-out / fan-in, a sum
+// computed in slices by N fibers. Part 2: a toy server. An acceptor spawns
+// a request fiber every 200 us for --serve-ms; some requests spawn a child
+// (an "audit write") that outlives them. Shutdown stops the acceptor and
+// calls wait() while requests and children are still in flight.
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 #include "../common.hpp"
 #include "fibers/fiber/fiber.hpp"
-#include "fibers/fiber/oneshot.hpp"
 #include "fibers/fiber/wait_group.hpp"
 #include "fibers/sched/scheduler.hpp"
 
@@ -92,77 +96,70 @@ int main(int argc, char** argv) {
     options.blocking.num_threads = 1;
     Scheduler scheduler(options);
 
-    // main() cannot wait on a WaitGroup (it is not a fiber): it runs a root
-    // fiber and blocks on a Oneshot until the root fiber is done.
-    fiber::Oneshot<int> exit_code;
-    fiber::go(scheduler, [&, done = exit_code.promise()]() mutable noexcept {
-        int status = 0;
+    int status = 0;
 
-        // ---- part 1: fan-out / fan-in ----
-        {
-            const auto start = std::chrono::steady_clock::now();
-            std::vector<std::uint64_t> partial(num_fibers);  // slot i is written only by fiber i
-            fiber::WaitGroup wg;
-            for (std::uint64_t i = 0; i < num_fibers; ++i) {
-                wg.go([&, i]() noexcept {
-                    const std::uint64_t lo = numbers * i / num_fibers + 1, hi = numbers * (i + 1) / num_fibers;
-                    std::uint64_t sum = 0;
-                    for (std::uint64_t n = lo; n <= hi; ++n) {
-                        sum += n;
-                    }
-                    partial[i] = sum;  // a plain write: done() publishes it
-                });
-            }
-            wg.wait();  // every partial[i] is visible now
-            std::uint64_t total = 0;
-            for (const std::uint64_t p : partial) {
-                total += p;
-            }
-            const std::uint64_t expected = numbers * (numbers + 1) / 2;
-            std::printf("fan-out: %llu fibers summed 1..%llu in slices: %llu (expected %llu), %.2f ms\n",
-                        static_cast<unsigned long long>(num_fibers), static_cast<unsigned long long>(numbers),
-                        static_cast<unsigned long long>(total), static_cast<unsigned long long>(expected),
-                        ms_since(start));
-            status |= total == expected ? 0 : 1;
-        }
-
-        // ---- part 2: graceful shutdown of a toy server ----
-        {
-            Server server;
-            // The acceptor is in the group too: while it runs, the count is
-            // at least 1, so its add()s are always legal, even during wait().
-            server.in_flight.go([&server]() noexcept {
-                for (std::uint64_t id = 0; !server.stopping.load(std::memory_order_relaxed); ++id) {
-                    server.started.fetch_add(1, std::memory_order_relaxed);
-                    server.in_flight.go([&server, id]() noexcept { server.handle(id); });
-                    this_fiber::sleep_for(200us);  // the next "connection"
+    // ---- part 1: fan-out / fan-in ----
+    {
+        const auto start = std::chrono::steady_clock::now();
+        std::vector<std::uint64_t> partial(num_fibers);  // slot i is written only by fiber i
+        fiber::WaitGroup wg;
+        for (std::uint64_t i = 0; i < num_fibers; ++i) {
+            wg.go(scheduler, [&, i]() noexcept {
+                const std::uint64_t lo = numbers * i / num_fibers + 1, hi = numbers * (i + 1) / num_fibers;
+                std::uint64_t sum = 0;
+                for (std::uint64_t n = lo; n <= hi; ++n) {
+                    sum += n;
                 }
+                partial[i] = sum;  // a plain write: done() publishes it
             });
-
-            this_fiber::sleep_for(std::chrono::milliseconds(serve_ms));
-            server.stopping.store(true, std::memory_order_relaxed);  // stop accepting
-            const auto start = std::chrono::steady_clock::now();
-            const std::uint64_t requests_open = server.started.load() - server.finished.load();
-            const std::uint64_t children_open = server.children_started.load() - server.children_finished.load();
-            server.in_flight.wait();  // the acceptor exits, the requests and their children drain
-
-            std::printf("server: ran %lld ms; at shutdown ~%llu requests and ~%llu children were in flight\n",
-                        static_cast<long long>(serve_ms), static_cast<unsigned long long>(requests_open),
-                        static_cast<unsigned long long>(children_open));
-            std::printf("server: wait() returned after %.1f ms: %llu/%llu requests and %llu/%llu children finished\n",
-                        ms_since(start), static_cast<unsigned long long>(server.finished.load()),
-                        static_cast<unsigned long long>(server.started.load()),
-                        static_cast<unsigned long long>(server.children_finished.load()),
-                        static_cast<unsigned long long>(server.children_started.load()));
-            status |= server.finished.load() == server.started.load() &&
-                              server.children_finished.load() == server.children_started.load()
-                          ? 0
-                          : 1;
         }
-        done.set(status);
-    });
+        wg.wait();  // main blocks; every partial[i] is visible afterwards
+        std::uint64_t total = 0;
+        for (const std::uint64_t p : partial) {
+            total += p;
+        }
+        const std::uint64_t expected = numbers * (numbers + 1) / 2;
+        std::printf("fan-out: %llu fibers summed 1..%llu in slices: %llu (expected %llu), %.2f ms\n",
+                    static_cast<unsigned long long>(num_fibers), static_cast<unsigned long long>(numbers),
+                    static_cast<unsigned long long>(total), static_cast<unsigned long long>(expected),
+                    ms_since(start));
+        status |= total == expected ? 0 : 1;
+    }
 
-    const fiber::Result<int> status = exit_code.get();  // main blocks here
+    // ---- part 2: graceful shutdown of a toy server ----
+    {
+        Server server;
+        // The acceptor is in the group too: while it runs, the count is at
+        // least 1, so its add()s are always legal, even during wait().
+        server.in_flight.go(scheduler, [&server]() noexcept {
+            for (std::uint64_t id = 0; !server.stopping.load(std::memory_order_relaxed); ++id) {
+                server.started.fetch_add(1, std::memory_order_relaxed);
+                server.in_flight.go([&server, id]() noexcept { server.handle(id); });
+                this_fiber::sleep_for(200us);  // the next "connection"
+            }
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(serve_ms));
+        server.stopping.store(true, std::memory_order_relaxed);  // stop accepting
+        const auto start = std::chrono::steady_clock::now();
+        const std::uint64_t requests_open = server.started.load() - server.finished.load();
+        const std::uint64_t children_open = server.children_started.load() - server.children_finished.load();
+        server.in_flight.wait();  // the acceptor exits, the requests and their children drain
+
+        std::printf("server: ran %lld ms; at shutdown ~%llu requests and ~%llu children were in flight\n",
+                    static_cast<long long>(serve_ms), static_cast<unsigned long long>(requests_open),
+                    static_cast<unsigned long long>(children_open));
+        std::printf("server: wait() returned after %.1f ms: %llu/%llu requests and %llu/%llu children finished\n",
+                    ms_since(start), static_cast<unsigned long long>(server.finished.load()),
+                    static_cast<unsigned long long>(server.started.load()),
+                    static_cast<unsigned long long>(server.children_finished.load()),
+                    static_cast<unsigned long long>(server.children_started.load()));
+        status |= server.finished.load() == server.started.load() &&
+                          server.children_finished.load() == server.children_started.load()
+                      ? 0
+                      : 1;
+    }
+
     scheduler.stop();
-    return status ? *status : 1;
+    return status;
 }

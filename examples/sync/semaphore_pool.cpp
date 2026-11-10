@@ -30,18 +30,20 @@
 //
 // Part 1: clients compete for K connections; part 2: fail-fast probes with
 // try_to_lock while the pool is saturated; part 3: the queue order with
-// mixed request sizes.
+// mixed request sizes. main (a plain thread) drives all three: it spawns
+// the fibers with WaitGroup::go(scheduler, f) and joins them with wait(),
+// which blocks a plain thread.
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "../common.hpp"
 #include "fibers/fiber/fiber.hpp"
-#include "fibers/fiber/oneshot.hpp"
 #include "fibers/fiber/semaphore.hpp"
 #include "fibers/fiber/wait_group.hpp"
 #include "fibers/sched/scheduler.hpp"
@@ -89,112 +91,106 @@ int main(int argc, char** argv) {
     options.blocking.num_threads = 1;
     Scheduler scheduler(options);
 
-    fiber::Oneshot<int> exit_code;  // main blocks on it until the root fiber is done
-    fiber::go(scheduler, [&, done = exit_code.promise()]() mutable noexcept {
-        int status = 0;
+    int status = 0;
 
-        // ---- parts 1 and 2: K connections, many clients, fail-fast probes ----
-        {
-            ConnectionPool pool(connections);
-            std::atomic<int> probes{0}, rejected{0};
-            fiber::WaitGroup clients_wg;
-            for (int c = 0; c < clients; ++c) {
-                clients_wg.go([&]() noexcept {
-                    for (int q = 0; q < queries; ++q) {
-                        fiber::SemaphoreGuard permit(pool.permits);  // parks while all K are taken
-                        const std::size_t conn = pool.claim();
-                        const int now = pool.in_use.fetch_add(1) + 1;
-                        for (int seen = pool.max_in_use.load(); now > seen;) {
-                            pool.max_in_use.compare_exchange_weak(seen, now);
-                        }
-                        pool.uses[conn].fetch_add(1, std::memory_order_relaxed);
-                        this_fiber::sleep_for(1ms);  // the "query", holding the connection
-                        pool.in_use.fetch_sub(1);
-                        pool.unclaim(conn);
-                    }  // ~SemaphoreGuard: release(1), handed to the next waiter
-                });
-            }
-            // A health check that must not queue behind the clients: it
-            // either gets a connection right now or reports "busy".
-            std::atomic<bool> clients_done{false};
-            fiber::WaitGroup probe_wg;
-            probe_wg.go([&]() noexcept {
-                while (!clients_done.load(std::memory_order_relaxed)) {
-                    probes.fetch_add(1, std::memory_order_relaxed);
-                    {
-                        fiber::SemaphoreGuard permit(pool.permits, 1, std::try_to_lock);
-                        if (permit) {
-                            pool.unclaim(pool.claim());  // "ping" a connection
-                        } else {
-                            rejected.fetch_add(1, std::memory_order_relaxed);
-                        }
+    // ---- parts 1 and 2: K connections, many clients, fail-fast probes ----
+    {
+        ConnectionPool pool(connections);
+        std::atomic<int> probes{0}, rejected{0};
+        fiber::WaitGroup clients_wg;
+        for (int c = 0; c < clients; ++c) {
+            clients_wg.go(scheduler, [&]() noexcept {
+                for (int q = 0; q < queries; ++q) {
+                    fiber::SemaphoreGuard permit(pool.permits);  // parks while all K are taken
+                    const std::size_t conn = pool.claim();
+                    const int now = pool.in_use.fetch_add(1) + 1;
+                    for (int seen = pool.max_in_use.load(); now > seen;) {
+                        pool.max_in_use.compare_exchange_weak(seen, now);
                     }
-                    this_fiber::sleep_for(500us);
-                }
+                    pool.uses[conn].fetch_add(1, std::memory_order_relaxed);
+                    this_fiber::sleep_for(1ms);  // the "query", holding the connection
+                    pool.in_use.fetch_sub(1);
+                    pool.unclaim(conn);
+                }  // ~SemaphoreGuard: release(1), handed to the next waiter
             });
-            clients_wg.wait();
-            clients_done.store(true, std::memory_order_relaxed);
-            probe_wg.wait();
-            // The pool is idle now: the same probe succeeds at once.
-            const fiber::SemaphoreGuard idle(pool.permits, 1, std::try_to_lock);
-
-            std::printf("pool: %zu connections, %d clients x %d queries\n", connections, clients, queries);
-            std::printf("  max connections in use at once: %d (limit %zu); queries per connection:",
-                        pool.max_in_use.load(), connections);
-            int total = 0;
-            for (std::size_t i = 0; i < connections; ++i) {
-                std::printf(" c%zu=%d", i, pool.uses[i].load());
-                total += pool.uses[i].load();
-            }
-            std::printf("\n  fail-fast probes (try_to_lock) while the clients ran: %d tried, %d rejected as busy;"
-                        " on the idle pool: %s\n",
-                        probes.load(), rejected.load(), idle ? "got one" : "rejected");
-            const bool ok = pool.max_in_use.load() <= static_cast<int>(connections) && total == clients * queries && idle;
-            status |= ok ? 0 : 1;
         }
-
-        // ---- part 3: FIFO hand-off with mixed request sizes ----
-        {
-            fiber::Semaphore sem(3);
-            constexpr int kWaiters = 5;
-            constexpr std::uint64_t kWant[kWaiters] = {1, 3, 1, 1, 2};
-            std::chrono::steady_clock::time_point released;  // set before release(3): waiters see it
-            double granted_ms[kWaiters] = {};
-            std::atomic<int> sequence{0};
-            int grant_seq[kWaiters] = {};
-
-            sem.acquire(3);  // hold everything while the queue forms
-            fiber::WaitGroup wg;
-            for (int w = 0; w < kWaiters; ++w) {
-                wg.go([&, w]() noexcept {
-                    fiber::SemaphoreGuard permits(sem, kWant[w]);  // queues in spawn order
-                    const auto waited = std::chrono::steady_clock::now() - released;
-                    granted_ms[w] = std::chrono::duration<double, std::milli>(waited).count();
-                    grant_seq[w] = sequence.fetch_add(1);
-                    this_fiber::sleep_for(2ms);  // hold them a little
-                });
-                // Let waiter w queue up before w + 1 arrives. A timing
-                // assumption: on a badly overloaded machine the arrival
-                // order can differ, so the order is printed, not checked.
-                this_fiber::sleep_for(1ms);
+        // A health check that must not queue behind the clients: it
+        // either gets a connection right now or reports "busy".
+        std::atomic<bool> clients_done{false};
+        fiber::WaitGroup probe_wg;
+        probe_wg.go(scheduler, [&]() noexcept {
+            while (!clients_done.load(std::memory_order_relaxed)) {
+                probes.fetch_add(1, std::memory_order_relaxed);
+                {
+                    fiber::SemaphoreGuard permit(pool.permits, 1, std::try_to_lock);
+                    if (permit) {
+                        pool.unclaim(pool.claim());  // "ping" a connection
+                    } else {
+                        rejected.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                this_fiber::sleep_for(500us);
             }
-            released = std::chrono::steady_clock::now();
-            sem.release(3);  // w0 gets 1; w1 needs 3 and only 2 are free: everybody waits behind w1
-            wg.wait();
+        });
+        clients_wg.wait();
+        clients_done.store(true, std::memory_order_relaxed);
+        probe_wg.wait();
+        // The pool is idle now: the same probe succeeds at once.
+        const fiber::SemaphoreGuard idle(pool.permits, 1, std::try_to_lock);
 
-            std::printf("fairness: 3 permits, all held while 5 fibers queue: w0(1) w1(3) w2(1) w3(1) w4(2);\n"
-                        "  after the holder released them (each waiter keeps its permits 2 ms):\n ");
-            int overtook_w1 = 0;
-            for (int w = 0; w < kWaiters; ++w) {
-                std::printf(" w%d +%.1f ms%s", w, granted_ms[w], w + 1 < kWaiters ? "," : "\n");
-                overtook_w1 += w > 1 && grant_seq[w] < grant_seq[1] ? 1 : 0;
-            }
-            std::printf("  later arrivals that overtook the 3-permit request w1: %d\n", overtook_w1);
+        std::printf("pool: %zu connections, %d clients x %d queries\n", connections, clients, queries);
+        std::printf("  max connections in use at once: %d (limit %zu); queries per connection:",
+                    pool.max_in_use.load(), connections);
+        int total = 0;
+        for (std::size_t i = 0; i < connections; ++i) {
+            std::printf(" c%zu=%d", i, pool.uses[i].load());
+            total += pool.uses[i].load();
         }
-        done.set(status);
-    });
+        std::printf("\n  fail-fast probes (try_to_lock) while the clients ran: %d tried, %d rejected as busy;"
+                    " on the idle pool: %s\n",
+                    probes.load(), rejected.load(), idle ? "got one" : "rejected");
+        const bool ok = pool.max_in_use.load() <= static_cast<int>(connections) && total == clients * queries && idle;
+        status |= ok ? 0 : 1;
+    }
 
-    const fiber::Result<int> status = exit_code.get();
+    // ---- part 3: FIFO hand-off with mixed request sizes ----
+    {
+        fiber::Semaphore sem(3);
+        constexpr int kWaiters = 5;
+        constexpr std::uint64_t kWant[kWaiters] = {1, 3, 1, 1, 2};
+        std::chrono::steady_clock::time_point released;  // set before release(3): waiters see it
+        double granted_ms[kWaiters] = {};
+        std::atomic<int> sequence{0};
+        int grant_seq[kWaiters] = {};
+
+        sem.acquire(3);  // main holds everything while the queue forms (free: no wait)
+        fiber::WaitGroup wg;
+        for (int w = 0; w < kWaiters; ++w) {
+            wg.go(scheduler, [&, w]() noexcept {
+                fiber::SemaphoreGuard permits(sem, kWant[w]);  // queues in spawn order
+                const auto waited = std::chrono::steady_clock::now() - released;
+                granted_ms[w] = std::chrono::duration<double, std::milli>(waited).count();
+                grant_seq[w] = sequence.fetch_add(1);
+                this_fiber::sleep_for(2ms);  // hold them a little
+            });
+            // Let waiter w queue up before w + 1 arrives. A timing
+            // assumption: on a badly overloaded machine the arrival
+            // order can differ, so the order is printed, not checked.
+            std::this_thread::sleep_for(1ms);
+        }
+        released = std::chrono::steady_clock::now();
+        sem.release(3);  // w0 gets 1; w1 needs 3 and only 2 are free: everybody waits behind w1
+        wg.wait();
+
+        std::printf("fairness: 3 permits, all held while 5 fibers queue: w0(1) w1(3) w2(1) w3(1) w4(2);\n"
+                    "  after the holder released them (each waiter keeps its permits 2 ms):\n ");
+        int overtook_w1 = 0;
+        for (int w = 0; w < kWaiters; ++w) {
+            std::printf(" w%d +%.1f ms%s", w, granted_ms[w], w + 1 < kWaiters ? "," : "\n");
+            overtook_w1 += w > 1 && grant_seq[w] < grant_seq[1] ? 1 : 0;
+        }
+        std::printf("  later arrivals that overtook the 3-permit request w1: %d\n", overtook_w1);
+    }
     scheduler.stop();
-    return status ? *status : 1;
+    return status;
 }
