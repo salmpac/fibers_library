@@ -418,7 +418,7 @@ tests are configured too, registered as ctest smoke tests
 
 ```sh
 cmake --preset clang-release && cmake --build --preset clang-release -j 6 \
-    --target mutex_counter wait_group_fanout promise_future semaphore_pool event_broadcast
+    --target mutex_counter wait_group_fanout promise_future semaphore_pool event_broadcast context_deadline
 build/clang-release/examples/mutex_counter --workers=4 --fibers=100 --increments=1000
 ctest --preset clang-release -L examples     # or: ctest --test-dir build/clang-release -R example.sync
 ```
@@ -458,6 +458,44 @@ ctest --preset clang-release -L examples     # or: ctest --test-dir build/clang-
 - **`event_broadcast`** (`fiber::Event`, `--workers --runners`). N fibers
   park on one event; main (a plain thread) fires it with `set()`; a second
   `set()` is a no-op and a late `wait()` returns at once.
+- **`context_deadline`** (`fibers::Context`, `--workers --fast --slow
+  --deadline-ms`). A request handler with a deadline fans out (`wg.go`,
+  which inherits the context) to backends over loopback sockets: the fast
+  calls answer, the slow ones never do, and a CPU-bound fiber loops on
+  `this_fiber::cancelled()`. At the deadline the slow reads return
+  `ETIMEDOUT`, the loop stops, `wg.wait()` (a join, not interrupted) returns
+  and the handler returns right after the deadline. Part 2: the same under
+  `Context::cancellable()`, cancelled by main ("the client went away"):
+  `ECANCELED`. Part 3: a per-step budget with `Context::child_of(ctx, t)` +
+  `fiber::ContextScope`; the request lives on. See
+  [docs/cancellation.md](../docs/cancellation.md) for what is cancellable.
+
+## Request contexts: cancellation and deadlines
+
+`fibers::Context` gives a tree of fibers one deadline / one cancel switch,
+cooperatively (nothing is killed, nothing throws):
+
+```cpp
+fibers::Context ctx = fibers::Context::with_timeout(sched, 200ms);  // or cancellable(), child_of(parent, t)
+fiber::go(sched, ctx, [&]() noexcept {                // runs under ctx; go(f) / wg.go(f) inherit it
+    net::IoResult r = conn.read_some(buf, n);         // ETIMEDOUT at the deadline, ECANCELED on cancel()
+    if (fiber::this_fiber::cancelled()) return;       // the cooperative check for CPU loops
+});
+ctx.cancel();                                         // any thread
+```
+
+| wait | under an ended context |
+|---|---|
+| socket read / write / accept / connect, TLS, `net::Connection`, `BufferedReader`, HTTP/1.1 and HTTP/2 client calls | `ECANCELED` / `ETIMEDOUT`; effective deadline = min(socket deadline, context deadline) |
+| `net::ConnectionPool::acquire` | `ECANCELED` / `ETIMEDOUT` |
+| `Mutex`, `Event`, `WaitGroup`, `Oneshot` / `Future`, `Semaphore`, `sleep_for`, `blocking` / file ops, `resolve` | not interrupted: poll `this_fiber::cancelled()`, or wait for fibers whose network calls are interrupted |
+
+An operation that does not have to wait (data already buffered, an idle
+pooled connection) still succeeds. One poller timer per context with a
+deadline (none per wait). The context must outlive every fiber under it:
+keep it on the handler's stack and join the children before returning
+(destroying it while a fiber is parked under it fails fast). Design and
+memory orders: [docs/cancellation.md](../docs/cancellation.md).
 
 | primitive | when to use | key rule |
 |---|---|---|

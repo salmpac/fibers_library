@@ -55,3 +55,13 @@ foreach(example mutex_counter wait_group_fanout promise_future semaphore_pool ev
         set_tests_properties(example.sync.${example} PROPERTIES TIMEOUT 120 LABELS examples)
     endif()
 endforeach()
+
+# fibers::Context: a deadline / cancel for a request's tree of fibers, over
+# loopback sockets (the cancellable waits are the network ones).
+add_executable(context_deadline sync/context_deadline.cpp)
+target_link_libraries(context_deadline PRIVATE fibers::net fibers::sync)
+target_compile_options(context_deadline PRIVATE -Wall -Wextra)
+if(FIBERS_BUILD_TESTS)
+    add_test(NAME example.sync.context_deadline COMMAND context_deadline)
+    set_tests_properties(example.sync.context_deadline PROPERTIES TIMEOUT 120 LABELS examples)
+endif()
