@@ -69,6 +69,7 @@
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/poller/sources.hpp"
 #include "fibers/poller/task_batch.hpp"
+#include "fibers/queue/lock_free_spmc_queue.hpp"
 #include "fibers/sched/scheduler.hpp"
 #include "fibers/sync/sync.hpp"
 #include "fibers/wait/context_core.hpp"
@@ -104,6 +105,11 @@ struct ContextTimers {
     typename Sched::SyncPolicy::template Atomic<std::uint32_t> done{0};
     bool armed = false;               // `timer` was scheduled
     wait::WaitNode* destroyer = nullptr;  // woken by the retire callback
+    // Checker only (Twist simulator): written by the timer's callback
+    // before `done` and by the destructor after its retirement (stands for
+    // the callback's accesses of the context and for freeing it), so a
+    // missing release / acquire on `done` shows up as a race.
+    [[no_unique_address]] typename queue::detail::HbProbeOf<typename Sched::SyncPolicy>::type probe{};
 };
 
 }  // namespace detail
@@ -283,6 +289,7 @@ private:
         // acquire: the callback's accesses of *this (its cancel walk)
         // happen-before we go on.
         if (t.done.load(std::memory_order_acquire) != 0) {
+            t.probe.write();
             return;  // fired and finished: the poller holds no reference
         }
         auto* poller = static_cast<typename Sched::Poller*>(t.timer.poller());
@@ -294,6 +301,7 @@ private:
             t.destroyer = &node;
             poller->post(t.retire);
             self->park();  // one wake: on_retire
+            t.probe.write();
             return;
         }
         if constexpr (sync::ParkingSyncPolicy<SyncPolicy>) {
@@ -301,6 +309,7 @@ private:
             t.destroyer = &waiter.node;
             poller->post(t.retire);
             waiter.wait();
+            t.probe.write();
         } else {
             fail::fail_fast("context: destroying a context with a pending deadline outside a fiber needs a "
                             "parking Sync policy");
@@ -314,6 +323,7 @@ private:
         if (event == poller::TimerEvent::kFired) {
             static_cast<void>(ctx->core_.cancel(wait::Error::kTimedOut));
         }
+        ctx->timers_.probe.write();
         // release: our accesses of *ctx before its destructor goes on.
         ctx->timers_.done.store(1, std::memory_order_release);  // last touch of *ctx
     }

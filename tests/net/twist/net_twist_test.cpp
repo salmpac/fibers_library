@@ -38,6 +38,7 @@
 #endif
 
 #include "fibers/context/twist_context.hpp"
+#include "fibers/fiber/context.hpp"
 #include "fibers/fiber/fiber.hpp"
 #include "fibers/net/poll_desc.hpp"
 #include "fibers/poller/fake_backend.hpp"
@@ -181,6 +182,8 @@ public:
     TestStackPool& stacks() noexcept { return stacks_; }
     PollerPool& pollers() noexcept { return pollers_; }
     fibers::poller::FakeBackend<TwistSync>& backend() noexcept { return pollers_.at(0).backend(); }
+    // The pollers' clock (simulated time): contexts with deadlines.
+    fibers::poller::TimePoint now() noexcept { return pollers_.at(0).now(); }
 
 private:
     TestStackPool stacks_;
@@ -190,7 +193,10 @@ private:
 
 static_assert(net::NetScheduler<NetScheduler>);
 
+static_assert(fiber::DeadlineScheduler<NetScheduler>);
+
 using PollDesc = net::BasicPollDesc<NetScheduler>;
+using Context = fiber::BasicContext<NetScheduler>;
 using net::Direction;
 
 // A reader fiber takes kMessages messages, parking whenever none is
@@ -507,6 +513,118 @@ TEST(NetTwist, EdgesRacingClose) {
         scheduler.backend().signal(fd);  // an edge for the unwatched fd: ignored
         scheduler.stop();
     });
+}
+
+// ---- contexts (fibers/fiber/context.hpp) ----------------------------------------
+
+// A reader parked under a context: data (producer thread + edge) races
+// with cancel() (another thread). The readiness callback and the context's
+// hook race for the waiter in the word, first CAS wins: the reader gets
+// the message or ECANCELED, never hangs, is woken once (the fiber's state
+// word fails fast on a second wake), and its waiter's fields reach the
+// hook (IoWaiter's probe). Afterwards nothing is enlisted.
+TEST(NetTwist, ContextCancelRacesData) {
+    map_test_stacks();
+    check([] {
+        Counter done{0};
+        twist::ed::std::atomic<int> available{0};
+        twist::assist::Shared<int> payload{0};
+        NetScheduler scheduler(2);
+        const int fd = scheduler.backend().create_event();
+        {
+            Context ctx = Context::cancellable();
+            PollDesc desc;
+            TWIST_ASSERT_M(desc.open(scheduler, fd) == 0, "open");
+            fiber::go(scheduler, ctx, [&]() noexcept {
+                PollDesc::Guard guard(desc);
+                const ssize_t r = desc.io(Direction::kRead, [&]() noexcept -> ssize_t {
+                    return available.load(std::memory_order_acquire) > 0 ? 1 : -EAGAIN;
+                });
+                if (r == 1) {
+                    TWIST_ASSERT_M(payload.Read() == 1, "the message's data");
+                } else {
+                    TWIST_ASSERT_M(r == -ECANCELED, "data or the context's error");
+                }
+                done.fetch_add(1);
+            });
+            twist::ed::std::thread producer([&] {
+                payload.Write(1);
+                available.store(1, std::memory_order_release);
+                scheduler.backend().signal(fd);
+            });
+            twist::ed::std::thread canceller([&] { ctx.cancel(); });
+            producer.join();
+            canceller.join();
+            FIBERS_WAIT_BOUNDED(done.load() == 1, "reader never woken");
+            TWIST_ASSERT_M(!ctx.has_dependants_approx(), "the reader delisted");
+            TWIST_ASSERT_M(desc.close() == 0, "close");
+        }
+        scheduler.stop();
+    });
+}
+
+// The context's deadline (its own poller timer, 1 ms of simulated time)
+// races with data: the message or ETIMEDOUT. Then the context is destroyed
+// by the reader fiber while its timer may still be pending (the destructor
+// posts the retire node and parks), or has fired (no round trip): the
+// timer's accesses of the context happen-before the destructor returns
+// (the timer's probe).
+TEST(NetTwist, ContextDeadlineRacesData) {
+    map_test_stacks();
+    check(
+        [] {
+            Counter done{0};
+            twist::ed::std::atomic<int> available{0};
+            NetScheduler scheduler(2);
+            const int fd = scheduler.backend().create_event();
+            {
+                PollDesc desc;
+                TWIST_ASSERT_M(desc.open(scheduler, fd) == 0, "open");
+                fiber::go(scheduler, [&]() noexcept {
+                    {
+                        Context ctx = Context::with_timeout(std::chrono::milliseconds(1));
+                        fiber::BasicContextScope<NetScheduler> scope(ctx);
+                        PollDesc::Guard guard(desc);
+                        const ssize_t r = desc.io(Direction::kRead, [&]() noexcept -> ssize_t {
+                            return available.load(std::memory_order_acquire) > 0 ? 1 : -EAGAIN;
+                        });
+                        TWIST_ASSERT_M(r == 1 || r == -ETIMEDOUT, "data or the context's deadline");
+                        if (r == -ETIMEDOUT) {
+                            TWIST_ASSERT_M(ctx.reason() == fibers::wait::Error::kTimedOut, "the deadline");
+                        }
+                    }  // ~Context: retires its timer
+                    done.fetch_add(1);
+                });
+                twist::ed::std::thread producer([&] {
+                    available.store(1, std::memory_order_release);
+                    scheduler.backend().signal(fd);
+                });
+                producer.join();
+                FIBERS_WAIT_BOUNDED(done.load() == 1, "reader never woken");
+                TWIST_ASSERT_M(desc.close() == 0, "close");
+            }
+            scheduler.stop();
+        },
+        500);
+}
+
+// A context with a deadline right now-ish is destroyed by a plain thread
+// (ThreadWaiter) while its timer may be firing: either the timer has
+// finished (done, acquire) or the retire withdraws it on the poller thread.
+TEST(NetTwist, ContextDestroyRacesItsTimer) {
+    map_test_stacks();
+    check(
+        [] {
+            NetScheduler scheduler(1);
+            twist::ed::std::thread owner([&] {
+                Context root = Context::with_deadline(scheduler, scheduler.now() + std::chrono::microseconds(1));
+                Context child = Context::child_of(root);
+                twist::ed::std::this_thread::yield();
+            });  // ~child, then ~root (retire or not)
+            owner.join();
+            scheduler.stop();
+        },
+        500);
 }
 
 }  // namespace
