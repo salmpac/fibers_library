@@ -176,6 +176,9 @@
               pkgs.llhttp # fibers::http's parser
               pkgs.wrk # HTTP load generators (examples/README.md)
               pkgs.wrk2
+              # promtool: tests/metrics validates the exposition format with
+              # `promtool check metrics` (skipped when it is not on PATH).
+              pkgs.prometheus.cli
             ];
             hardeningDisable = [ "fortify" ];
             FIBERS_TLSFUZZER = "${inputs.tlsfuzzer}";

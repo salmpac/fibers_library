@@ -107,6 +107,10 @@ fibers_add_component(fs fibers::fiber fibers::blocking fibers::sched fibers::fai
 # Sockets for fibers: PollDesc (per-fd readiness words, Go-netpoller style),
 # Stream, Listener, Endpoint; resolver, Connection, ConnectionPool.
 fibers_add_component(net fibers::fiber fibers::sched fibers::poller fibers::object_pool)
+# Metrics: sharded counters / gauges / histograms, a registry with the
+# Prometheus text exposition, collectors for the scheduler's parts.
+# (fibers/metrics/http.hpp, the /metrics handler, also needs fibers::http.)
+fibers_add_component(metrics fibers::sync fibers::fail fibers::poller)
 
 # TLS over net::Stream (OpenSSL 3 with memory BIOs). Optional: on by default
 # when OpenSSL >= 3.0 is found, off under Twist (OpenSSL is not instrumented
