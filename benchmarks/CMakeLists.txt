@@ -30,6 +30,10 @@ add_executable(sync_bench sync_bench.cpp)
 target_link_libraries(sync_bench PRIVATE fibers::fiber fibers::sched benchmark::benchmark_main)
 target_compile_options(sync_bench PRIVATE -Wall -Wextra)
 
+add_executable(context_bench context_bench.cpp)
+target_link_libraries(context_bench PRIVATE fibers::net benchmark::benchmark_main)
+target_compile_options(context_bench PRIVATE -Wall -Wextra)
+
 add_executable(metrics_bench metrics_bench.cpp)
 target_link_libraries(metrics_bench PRIVATE fibers::metrics benchmark::benchmark_main)
 target_compile_options(metrics_bench PRIVATE -Wall -Wextra)
