@@ -660,10 +660,12 @@ TEST(Poller, ManyTimersFromManyThreads) {
 // poller reclaim them.
 TEST(Poller, ManyCancellationsWakeASleepingPoller) {
     InlineSink sink;
-    Poller p(TaskSink::of(sink));
-    p.start();
+    // The pool and the counters outlive the poller: ~Poller hands the
+    // timers still pending (the far one, cancelled ones) back into them.
     TimerPool pool;
     std::atomic<std::size_t> fired{0}, cancelled{0};
+    Poller p(TaskSink::of(sink));
+    p.start();
     auto make = [&](TimePoint deadline) {
         PooledTimer* node = pool.acquire();
         node->pool = &pool;
