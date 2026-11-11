@@ -38,18 +38,21 @@
 // for a child whose deadline is not earlier than its parent's: the parent's
 // timer reaches it). Its callback, on the poller thread, cancels the
 // context with kTimedOut (running the hooks there). A deadline in the past
-// ends the context at construction (no timer).
+// ends the context at construction (no timer). The timer node lives in a
+// deadline record (detail::DeadlineRecord): a block of the scheduler's
+// TaskMemoryPool that the context and the poller share, returned to the
+// pool by whichever of them lets go last.
 //
 // Lifetime (fail fast where it can be seen): the context must outlive
 // every fiber that runs under it and every child context; its destructor
 // fails fast while a fiber is parked under it or a child exists. A
 // user's cancel() must have returned before the destructor runs. The
-// destructor of a context whose timer is still pending takes the timer
-// back from its poller (a posted retire node withdraw()s it on the poller
-// thread) and waits for that: it parks a fiber, or blocks a plain thread;
-// not from a poller callback, and the scheduler's pollers must still run
-// (destroy contexts before stopping the scheduler). Contexts without a
-// deadline, and those whose timer has fired, are destroyed at once.
+// destructor of a context whose timer is still pending cancels the timer
+// (lazily: the poller drops the node, and frees the record, later) and
+// returns at once; only if the deadline is firing at that very moment does
+// it wait (spinning) for the callback's cancel walk to finish. Any thread,
+// a poller callback included. Destroy contexts before the scheduler is
+// destroyed (after stop() is fine).
 //
 // Fibers: fiber::go(sched, ctx, f) runs f under ctx; go(f) and wg.go(f)
 // from a fiber inherit the caller's context; go(sched, f) (an explicit
@@ -61,9 +64,13 @@
 // docs/cancellation.md section 3.3.
 
 #include <cerrno>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
+#include <new>
 #include <optional>
 #include <type_traits>
+#include <utility>
 
 #include "fibers/fail/fail_fast.hpp"
 #include "fibers/fiber/fiber.hpp"
@@ -74,8 +81,6 @@
 #include "fibers/sync/sync.hpp"
 #include "fibers/wait/context_core.hpp"
 #include "fibers/wait/result.hpp"
-#include "fibers/wait/thread_waiter.hpp"
-#include "fibers/wait/wait_node.hpp"
 
 namespace fibers::fiber {
 
@@ -84,31 +89,111 @@ inline int errno_of(wait::Error reason) noexcept {
     return reason == wait::Error::kTimedOut ? ETIMEDOUT : ECANCELED;
 }
 
-// A scheduler whose pollers can run the deadline timer of a context.
+// A scheduler whose pollers can run the deadline timer of a context, and
+// whose TaskMemoryPool holds the timer's record (see DeadlineRecord).
 template <class S>
-concept DeadlineScheduler = FiberScheduler<S> && requires(S& s, typename S::Timer& timer) {
+concept DeadlineScheduler = FiberScheduler<S> && requires(S& s, typename S::Timer& timer, void* block) {
     typename S::Poller;
     { s.now() } -> std::same_as<poller::TimePoint>;
     s.pollers().schedule(timer);
+    { s.task_memory().template acquire<128>() } -> std::same_as<void*>;
+    s.task_memory().template release<128>(block);
 };
 
 namespace detail {
 
 struct NoContextTimers {};
 
-// The deadline timer and the node that retires it (see the top comment).
+// The deadline record: a context's poller timer in a TaskMemoryPool block
+// of its scheduler, owned jointly by the context and by the poller (the
+// timer's callback); the second of them to let go returns the block. The
+// context only points at it, so the context can go while the poller still
+// references the node (Poller::cancel() is lazy).
+//
+//   state   kArmed        both own it (initial)
+//           kContextGone  the context has gone (its destructor cancelled
+//                         the timer first: the callback is kCancelled and
+//                         does not touch the context)
+//           kTimerDone    the callback has finished (with the context too,
+//                         if it fired)
+//
+//   destructor:  if poller.cancel(timer)           the timer will not fire
+//                    if exchange(kContextGone) == kTimerDone: free
+//                else                              kFired is being / has
+//                                                  been delivered
+//                    wait until state == kTimerDone (acquire); free
+//   callback:    if kFired: context.cancel(kTimedOut)
+//                if exchange(kTimerDone) == kContextGone: free
+//
+// The claim between the deadline and the destructor is the timer's own
+// state word in the poller: fire (pending -> idle) and cancel() (pending ->
+// cancelled) are CASes on it, exactly one wins. So a kFired callback always
+// runs against a live context (the destructor waits for it) and a
+// kCancelled one never touches the context. The destructor cancels BEFORE
+// it lets go of the record: the record is still ours while cancel() reads
+// it (the callback frees it only after kContextGone). kCancelled also comes
+// from ~Poller for a timer still pending when the poller is destroyed (not
+// cancelled by us): the callback then sees kArmed and leaves the record to
+// the context, which must be destroyed before the TaskMemoryPool is (the
+// scheduler); its destructor sees cancel() fail and kTimerDone set.
+//
+// Memory orders
+//   * both exchanges acq_rel: release, so that the side letting go first
+//     has finished with the record (and the callback with the context)
+//     before the other side frees it; acquire, so that the side that frees
+//     has seen those accesses.
+//   * the destructor's wait loads state with acquire: the callback's cancel
+//     walk (its accesses of the context) and its reads of the record
+//     happen-before the destructor frees both.
+//   * the poller's CASes (acq_rel) only decide who wins; no data rides on
+//     them here.
+// Checked under Twist (tests/net/twist/net_twist_test.cpp): the record's
+// probe is read by the side that lets go first and written by the one that
+// frees it; the context's probe is read by a kFired callback after its walk
+// and written by the destructor.
+template <class Sched>
+struct DeadlineRecord {
+    using Sync = typename Sched::SyncPolicy;
+    using Pool = std::remove_reference_t<decltype(std::declval<Sched&>().task_memory())>;
+    using Probe = typename queue::detail::HbProbeOf<Sync>::type;
+
+    enum : std::uint32_t { kArmed = 0, kContextGone = 1, kTimerDone = 2 };
+
+    DeadlineRecord(Pool& pool, void* context) noexcept : pool(&pool), context(context) {}
+    DeadlineRecord(const DeadlineRecord&) = delete;
+    DeadlineRecord& operator=(const DeadlineRecord&) = delete;
+
+    typename Sched::Timer timer;
+    Pool* pool;     // where the block goes back
+    void* context;  // the BasicContext; read by a kFired callback only
+    typename Sync::template Atomic<std::uint32_t> state{kArmed};
+    [[no_unique_address]] Probe probe{};
+
+    static constexpr std::size_t block_size() noexcept { return Pool::block_size_for(sizeof(DeadlineRecord)); }
+
+    static DeadlineRecord* create(Pool& pool, void* context) noexcept {
+        static_assert(block_size() != 0, "context: the deadline record does not fit a TaskMemoryPool block");
+        static_assert(alignof(DeadlineRecord) <= Pool::kBlockAlign);
+        return ::new (pool.template acquire<block_size()>()) DeadlineRecord(pool, context);
+    }
+
+    // By whichever side lets go last.
+    void destroy() noexcept {
+        probe.write();  // stands for the block's reuse
+        Pool* const p = pool;
+        this->~DeadlineRecord();
+        p->template release<block_size()>(this);
+    }
+};
+
+// The context's side: its record (nullptr without a timer of its own).
 template <class Sched>
 struct ContextTimers {
-    typename Sched::Timer timer;   // fires at the deadline: cancel(kTimedOut)
-    typename Sched::Timer retire;  // posted by the destructor: withdraws `timer`
-    // 1 once the timer's callback has finished with the context (release).
-    typename Sched::SyncPolicy::template Atomic<std::uint32_t> done{0};
-    bool armed = false;               // `timer` was scheduled
-    wait::WaitNode* destroyer = nullptr;  // woken by the retire callback
-    // Checker only (Twist simulator): written by the timer's callback
-    // before `done` and by the destructor after its retirement (stands for
-    // the callback's accesses of the context and for freeing it), so a
-    // missing release / acquire on `done` shows up as a race.
+    DeadlineRecord<Sched>* record = nullptr;
+    // Checker only (Twist simulator): read by a kFired callback after its
+    // cancel walk, written by the destructor (stands for freeing the
+    // context), so a missing release / acquire on the record's state shows
+    // up as a race.
     [[no_unique_address]] typename queue::detail::HbProbeOf<typename Sched::SyncPolicy>::type probe{};
 };
 
@@ -271,75 +356,62 @@ private:
             static_cast<void>(core_.cancel(wait::Error::kTimedOut));
             return;
         }
-        auto& t = timers_;
-        t.timer.memo = this;
-        t.timer.callback = &on_timer;
-        t.timer.deadline = deadline;
-        t.armed = true;
-        scheduler_->pollers().schedule(t.timer);
+        Record* record = Record::create(scheduler_->task_memory(), this);
+        record->timer.memo = record;
+        record->timer.callback = &on_timer;
+        record->timer.deadline = deadline;
+        timers_.record = record;
+        scheduler_->pollers().schedule(record->timer);
     }
 
-    // The destructor: no timer callback may run (or be running) once it
-    // returns.
+    // The destructor: no timer callback touches *this once it returns; the
+    // record goes back to the pool here or from the callback (see
+    // detail::DeadlineRecord).
     void retire_timer() noexcept {
-        auto& t = timers_;
-        if (!t.armed) {
+        Record* record = timers_.record;
+        if (record == nullptr) {
             return;
         }
-        // acquire: the callback's accesses of *this (its cancel walk)
-        // happen-before we go on.
-        if (t.done.load(std::memory_order_acquire) != 0) {
-            t.probe.write();
-            return;  // fired and finished: the poller holds no reference
-        }
-        auto* poller = static_cast<typename Sched::Poller*>(t.timer.poller());
-        t.retire.memo = this;
-        t.retire.callback = &on_retire;
-        Fiber* self = Fiber::current();
-        if (self != nullptr) {
-            wait::WaitNode node = self->wait_node();
-            t.destroyer = &node;
-            poller->post(t.retire);
-            self->park();  // one wake: on_retire
-            t.probe.write();
+        auto* poller = static_cast<typename Sched::Poller*>(record->timer.poller());
+        if (poller->cancel(record->timer)) {
+            // It will not fire: its callback (kCancelled, later, on the
+            // poller thread) does not touch *this.
+            record->probe.read();  // our last plain access of the record
+            // acq_rel: see DeadlineRecord.
+            if (record->state.exchange(Record::kContextGone, std::memory_order_acq_rel) == Record::kTimerDone) {
+                record->destroy();  // the callback has run already
+            }
+            timers_.probe.write();
             return;
         }
-        if constexpr (sync::ParkingSyncPolicy<SyncPolicy>) {
-            wait::ThreadWaiter<SyncPolicy> waiter;
-            t.destroyer = &waiter.node;
-            poller->post(t.retire);
-            waiter.wait();
-            t.probe.write();
-        } else {
-            fail::fail_fast("context: destroying a context with a pending deadline outside a fiber needs a "
-                            "parking Sync policy");
+        // Fired (or handed back by ~Poller): wait until the callback is done
+        // with *this. Its cancel walk is short and never blocks; on the
+        // poller's own thread it has returned already. acquire: its
+        // accesses of *this and of the record happen-before.
+        while (record->state.load(std::memory_order_acquire) != Record::kTimerDone) {
+            SyncPolicy::spin_hint();
         }
+        timers_.probe.write();
+        record->destroy();
     }
 
-    // Poller thread: the deadline. (kCancelled: the poller is being
-    // destroyed with the timer pending; nothing to cancel then.)
+    // Poller thread: the deadline (kFired), or the record's release
+    // (kCancelled: the destructor cancelled the timer, or the poller is being
+    // destroyed with it pending; the context is not touched then).
     static void on_timer(void* memo, poller::TimerEvent event, poller::TaskBatch&) noexcept {
-        auto* ctx = static_cast<BasicContext*>(memo);
+        auto* record = static_cast<Record*>(memo);
         if (event == poller::TimerEvent::kFired) {
+            // The destructor's cancel() lost: it waits for us, *ctx lives.
+            auto* ctx = static_cast<BasicContext*>(record->context);
             static_cast<void>(ctx->core_.cancel(wait::Error::kTimedOut));
+            ctx->timers_.probe.read();
         }
-        ctx->timers_.probe.write();
-        // release: our accesses of *ctx before its destructor goes on.
-        ctx->timers_.done.store(1, std::memory_order_release);  // last touch of *ctx
-    }
-
-    // Poller thread (the timer's poller): the destructor waits for this.
-    // If the timer's callback has run, it has also returned (one thread):
-    // withdraw() finds the node idle. Otherwise it takes it back.
-    static void on_retire(void* memo, poller::TimerEvent event, poller::TaskBatch&) noexcept {
-        auto* ctx = static_cast<BasicContext*>(memo);
-        auto& t = ctx->timers_;
-        if (event == poller::TimerEvent::kFired) {
-            static_cast<void>(static_cast<typename Sched::Poller*>(t.timer.poller())->withdraw(t.timer));
+        record->probe.read();  // our last plain access of the record
+        // acq_rel: see DeadlineRecord. Our last touch of *ctx, and of the
+        // record unless the context has gone.
+        if (record->state.exchange(Record::kTimerDone, std::memory_order_acq_rel) == Record::kContextGone) {
+            record->destroy();
         }
-        // kCancelled: the poller is being destroyed and releases every
-        // pending timer itself (the deadline timer included).
-        t.destroyer->notify();  // last touch of *ctx (and of the node)
     }
 
     // A parent's canceller (any thread): we end with the parent's reason.
@@ -348,6 +420,7 @@ private:
     }
 
     using Timers = std::conditional_t<kHasTimers, detail::ContextTimers<Sched>, detail::NoContextTimers>;
+    using Record = detail::DeadlineRecord<Sched>;
 
     Core core_;
     Interrupt link_;                  // ours, in parent_'s list

@@ -43,6 +43,7 @@
 #include "fibers/net/poll_desc.hpp"
 #include "fibers/poller/fake_backend.hpp"
 #include "fibers/poller/poller_pool.hpp"
+#include "fibers/sched/task_memory_pool.hpp"
 #include "fibers/stack/stack_pool.hpp"
 #include "fibers/sync/twist_sync.hpp"
 #include "fibers/thread_pool/thread_pool.hpp"
@@ -158,7 +159,9 @@ private:
 };
 
 // What a PollDesc needs: a ThreadPool, stacks, and a PollerPool of
-// FakeBackend pollers.
+// FakeBackend pollers; contexts with deadlines also a TaskMemoryPool (their
+// timer records), declared before the pollers so that it outlives them
+// (~Poller hands pending records back).
 class NetScheduler {
 public:
     using SyncPolicy = TwistSync;
@@ -167,7 +170,10 @@ public:
     using Timer = PollerPool::Timer;
 
     explicit NetScheduler(std::size_t workers)
-        : pool_(tiny(workers)), pollers_(fibers::poller::TaskSink::of(pool_), {.num_pollers = 1}) {
+        : task_memory_(fibers::sched::TaskMemoryPoolOptions{.initial_blocks = 4, .grow_chunk = 4, .shards = 1,
+                                                            .thread_cache_capacity = 2, .max_cached_threads = 8}),
+          pool_(tiny(workers)),
+          pollers_(fibers::poller::TaskSink::of(pool_), {.num_pollers = 1}) {
         pollers_.start();
     }
 
@@ -184,9 +190,11 @@ public:
     fibers::poller::FakeBackend<TwistSync>& backend() noexcept { return pollers_.at(0).backend(); }
     // The pollers' clock (simulated time): contexts with deadlines.
     fibers::poller::TimePoint now() noexcept { return pollers_.at(0).now(); }
+    fibers::sched::TaskMemoryPool<TwistSync>& task_memory() noexcept { return task_memory_; }
 
 private:
     TestStackPool stacks_;
+    fibers::sched::TaskMemoryPool<TwistSync> task_memory_;
     tp::ThreadPool<TwistSync> pool_;
     PollerPool pollers_;
 };
@@ -566,9 +574,10 @@ TEST(NetTwist, ContextCancelRacesData) {
 // The context's deadline (its own poller timer, 1 ms of simulated time)
 // races with data: the message or ETIMEDOUT. Then the context is destroyed
 // by the reader fiber while its timer may still be pending (the destructor
-// posts the retire node and parks), or has fired (no round trip): the
-// timer's accesses of the context happen-before the destructor returns
-// (the timer's probe).
+// cancels it and leaves the record to the poller), be firing (it waits for
+// the callback) or have fired: the callback's accesses of the context
+// happen-before the destructor returns, and each side's accesses of the
+// record happen-before the other side frees it (the probes).
 TEST(NetTwist, ContextDeadlineRacesData) {
     map_test_stacks();
     check(
@@ -592,7 +601,7 @@ TEST(NetTwist, ContextDeadlineRacesData) {
                         if (r == -ETIMEDOUT) {
                             TWIST_ASSERT_M(ctx.reason() == fibers::wait::Error::kTimedOut, "the deadline");
                         }
-                    }  // ~Context: retires its timer
+                    }  // ~Context: cancels its timer, or waits for its callback
                     done.fetch_add(1);
                 });
                 twist::ed::std::thread producer([&] {
@@ -609,8 +618,10 @@ TEST(NetTwist, ContextDeadlineRacesData) {
 }
 
 // A context with a deadline right now-ish is destroyed by a plain thread
-// (ThreadWaiter) while its timer may be firing: either the timer has
-// finished (done, acquire) or the retire withdraws it on the poller thread.
+// while its timer may be firing: either the destructor's cancel() wins (the
+// record goes back from the kCancelled callback, or from the destructor if
+// that callback ran first), or the deadline does and the destructor waits
+// for the callback's cancel walk (which reaches the child) to end.
 TEST(NetTwist, ContextDestroyRacesItsTimer) {
     map_test_stacks();
     check(
@@ -619,11 +630,73 @@ TEST(NetTwist, ContextDestroyRacesItsTimer) {
             twist::ed::std::thread owner([&] {
                 Context root = Context::with_deadline(scheduler, scheduler.now() + std::chrono::microseconds(1));
                 Context child = Context::child_of(root);
-                twist::ed::std::this_thread::yield();
-            });  // ~child, then ~root (retire or not)
+                // Lets simulated time reach the deadline (or not).
+                twist::ed::std::this_thread::sleep_for(std::chrono::microseconds(1));
+            });  // ~child, then ~root
             owner.join();
             scheduler.stop();
         },
+        500);
+}
+
+// A context with a far deadline is destroyed (its cancel() wins) while
+// another thread makes the poller run an iteration (a posted no-op timer),
+// which may drain the cancelled node at once: the kCancelled callback's
+// exchange races with the destructor's, and whichever comes second frees
+// the record (the record's probe: the first one's accesses happen-before
+// the free). Only the nudge fires.
+TEST(NetTwist, ContextDestroyRacesRecordRelease) {
+    map_test_stacks();
+    check(
+        [] {
+            NetScheduler scheduler(1);
+            auto& poller = scheduler.pollers().at(0);
+            Counter nudged{0};
+            NetScheduler::Timer nudge(&nudged, [](void* memo, fibers::poller::TimerEvent,
+                                                  fibers::poller::TaskBatch&) noexcept {
+                static_cast<Counter*>(memo)->fetch_add(1);
+            });
+            twist::ed::std::atomic<bool> created{false};
+            twist::ed::std::thread owner([&] {
+                Context root = Context::with_deadline(scheduler, scheduler.now() + std::chrono::hours(1));
+                created.store(true, std::memory_order_release);
+                twist::ed::std::this_thread::yield();
+            });  // ~root: cancel() wins (the deadline is far)
+            twist::ed::std::thread nudger([&] {
+                FIBERS_WAIT_BOUNDED(created.load(std::memory_order_acquire), "never created");
+                poller.post(nudge);
+            });
+            owner.join();
+            nudger.join();
+            FIBERS_WAIT_BOUNDED(nudged.load() == 1, "the nudge never ran");
+            scheduler.stop();
+            TWIST_ASSERT_M(poller.stats().timers_fired == 1, "only the nudge fired");
+        },
+        500);
+}
+
+// Contexts may outlive the scheduler's stop() (not its destruction): one
+// with a pending deadline is destroyed after the pollers stopped (cancel()
+// on a stopped poller wins; ~Poller hands the node back as kCancelled and
+// the callback frees the record), others while the pollers are stopping
+// (a child's near deadline may fire meanwhile).
+TEST(NetTwist, ContextDestroyedAroundSchedulerStop) {
+    map_test_stacks();
+    check(
+        [] {
+            NetScheduler scheduler(1);
+            {
+                Context early = Context::with_deadline(scheduler, scheduler.now() + std::chrono::hours(1));
+                twist::ed::std::thread owner([&] {
+                    Context racing = Context::with_deadline(scheduler, scheduler.now() + std::chrono::hours(1));
+                    Context child = Context::child_of(racing, scheduler.now() + std::chrono::microseconds(1));
+                    twist::ed::std::this_thread::yield();
+                });  // ~child, ~racing
+                scheduler.stop();
+                owner.join();
+                TWIST_ASSERT_M(!early.cancelled(), "a far deadline");
+            }  // ~early: after the stop
+        },  // ~NetScheduler: ~Poller hands the records back while the TaskMemoryPool lives
         500);
 }
 
