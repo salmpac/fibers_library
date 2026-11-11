@@ -228,18 +228,69 @@ socket's own `set_read_deadline` timer and the context's).
 * `child_of(parent, t)`: effective deadline `min(t, parent.deadline())`; a
   timer of its own only if `t` is earlier than the parent's, otherwise the
   parent's cancellation reaches it (with the parent's reason, kTimedOut).
-* destructor with a pending timer: the timer node lives in the context, so
-  the poller must let go of it first. `Poller::cancel()` would not do (lazy
-  removal keeps referencing the node). As in `ConnectionPool`, the
-  destructor posts a second node (`retire_`) to the timer's poller and waits
-  (parks a fiber, or blocks a plain thread on a `ThreadWaiter`); the retire
-  callback `withdraw()`s the timer on the poller thread (if its callback has
-  run already, it has also finished: same thread) and wakes the destroyer.
-  When the timer has already fired (its callback stores `timer_done_`
-  (release) as its last touch; the destructor loads it with acquire) no
-  round trip is needed. The common case (request finished before its
-  deadline) costs one poller round trip at destruction; contexts without a
-  deadline pay nothing.
+* the timer node does not live in the context but in a **deadline record**
+  (`detail::DeadlineRecord`): a block of the scheduler's `TaskMemoryPool`
+  (128 bytes: the poller's timer node, a back-pointer to the context, the
+  pool, a state word), owned jointly by the context and by the poller until
+  both have let go; the second one returns the block. So the context can go
+  while the poller still references the node, and destroying a context
+  whose deadline has not come yet (the common case: the request finished
+  in time) is a lazy `Poller::cancel()` and one exchange, with no poller
+  round trip and no waiting.
+
+#### The deadline record protocol
+
+```
+state: kArmed (both own it) | kContextGone | kTimerDone
+
+~Context (timer armed):
+    if poller.cancel(timer)                      // pending -> cancelled: it will not fire
+        if state.exchange(kContextGone) == kTimerDone: free the record
+        return                                   // the callback (kCancelled, later) frees it
+    else                                         // fire won: kFired delivered / being delivered
+        wait until state == kTimerDone (acquire)
+        free the record
+timer callback (poller thread):
+    if kFired: context.cancel(kTimedOut)         // the destructor waits for us: it lives
+    if state.exchange(kTimerDone) == kContextGone: free the record
+```
+
+* **The claim is the poller's own timer word.** Firing (pending -> idle)
+  and `cancel()` (pending -> cancelled) are CASes on the timer's state in
+  the poller: exactly one wins. A kFired callback therefore always runs
+  against a live context, and a kCancelled one never touches it. No
+  separate claim word (ARMED -> ORPHANED / FIRING) is needed, and the
+  context does not have to clear a back-pointer.
+* **Cancel before letting go.** The destructor calls `cancel()` while the
+  record is still certainly alive: the callback frees it only after
+  `kContextGone`, which the destructor stores after `cancel()`. (Orphaning
+  first and cancelling afterwards would race with a callback that frees
+  the record in between.)
+* **The wait is rare and short.** The destructor waits only if the deadline
+  fired at the very moment of destruction; then the callback is running
+  its cancel walk on the poller thread (short, never blocks), so it spins
+  (as `delist` does). On the poller's own thread the callback has returned
+  already (one thread), so a context may be destroyed from a poller
+  callback.
+* **Reclamation.** A cancelled node stays in the poller's queue / heap until
+  the poller's next iteration (drain, compaction, or the top of the heap),
+  and so does its record. A poller that sleeps until a far deadline would
+  let them pile up while requests keep coming and finishing early, so every
+  `Poller::kCancelsPerWake`-th (256) cancel since the poller's last
+  iteration wakes it if it sleeps (best effort); busy pollers (sockets)
+  iterate anyway. In the heap, compaction keeps cancelled nodes to about a
+  third of the live ones.
+* **Poller destruction.** `~Poller` hands every timer still pending back
+  with kCancelled. A record the context has let go of (cancelled) is freed
+  there; the callback of a record whose context still lives sees `kArmed`
+  and leaves it to the context, whose `cancel()` then fails and which finds
+  `kTimerDone`. The `TaskMemoryPool` outlives the pollers in `Scheduler`.
+
+Cost: create + destroy a context with a live deadline is ~0.2 us (was
+~11 us with the posted retire node and the wait for it), most of it the
+record's trip to the poller thread and back to the pool; a context with a
+deadline that has fired, or without a deadline, is destroyed with no
+round trip at all.
 
 ### 3.5 Lifetimes (fail fast)
 
@@ -254,14 +305,19 @@ join them (`wg.wait()`, which is deliberately not interrupted), return.
   until that finished).
 * `cancel()` called by user code must have returned before the destructor
   runs (like `Event::set`). Cancels the library issues itself (the deadline
-  timer, a parent's walk) are covered by the retire round trip and by
-  `delist`.
+  timer, a parent's walk) are covered by the deadline record protocol and
+  by `delist`.
 * Fibers running under a context are not counted: a counter decremented at
   fiber exit would race with the parent's join (the child signals `done()`
   inside its body, before it exits). A fiber that touches a destroyed
   context is a bug the destructor cannot see unless it is parked.
-* Destroy a context with a pending deadline before stopping the scheduler's
-  pollers (the retire is a posted timer).
+* Destroy contexts before the scheduler is **destroyed** (the record
+  belongs to its `TaskMemoryPool`, and `cancel()` reaches its poller).
+  Stopping the scheduler first is fine: `cancel()` works on a stopped
+  poller, and `~Poller` hands the node back later. (The former rule,
+  "destroy before stopping the pollers", came from the posted retire node
+  and is gone with it.) Destroying a context from a poller callback is
+  fine as well.
 
 ### 3.6 Memory orders
 
@@ -274,11 +330,13 @@ join them (`wg.wait()`, which is deliberately not interrupted), return.
 | `done` store (canceller) | release | the canceller's last accesses of the hook and of the waiter it claimed (or failed to claim) happen-before the waiter's `delist` returns and its frame is reused |
 | `done` load (`delist`) | acquire | pairs with the store above |
 | PollDesc claim `CAS(&waiter -> EMPTY)` | relaxed | the waiter's fields were published by the arm CAS (release) *and* by the enlist's unlock, which the canceller's lock acquires before the claim; the result and the wake go to the fiber through its wake (state word / queue) |
-| `timer_done_` store / load | release / acquire | the timer callback's accesses of the context before the destructor frees it |
+| deadline record: `state.exchange` (destructor, callback) | acq_rel | release: the side that lets go first has finished with the record (the callback also with the context); acquire: the side that frees the record has seen those accesses |
+| deadline record: `state` load (the destructor's wait) | acquire | the callback's cancel walk (its accesses of the context) and its reads of the record happen-before the destructor frees both |
+| poller timer word: fire CAS / `cancel()` CAS | acq_rel (the poller's) | only decides who wins; no data of the context rides on it |
 
 The Twist tests (tests/fiber/twist/context_twist_test.cpp,
 tests/net/twist/net_twist_test.cpp) check each non-relaxed order: weakening
-it makes a simulator test fail (see the table in the commit message).
+it makes a simulator test fail (see the tables in the commit messages).
 
 ## 4. Cost when unused
 
@@ -290,6 +348,9 @@ it makes a simulator test fail (see the table in the commit message).
   syscall returned EAGAIN (the fiber is about to park anyway); without a
   context the park path is unchanged after one null check.
 * No change at all to Mutex / Event / WaitGroup / Oneshot / Semaphore / sleep.
+* A context without a deadline of its own holds no record (a null
+  pointer); the context object itself got smaller (it held two timer
+  nodes before).
 
 ## 5. Later
 

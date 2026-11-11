@@ -9,11 +9,13 @@
 //                         delist of the interrupt hook per parked wait.
 //   ContextLifecycle/K    in a fiber, create + destroy one context per
 //                         iteration: K = 0 cancellable(), 1 child_of(a
-//                         live parent), 2 with_timeout(1 h) (schedules the
-//                         poller timer; the destructor takes it back with
-//                         a posted retire node: one poller round trip),
-//                         3 with_timeout(0) (ends at construction, no
-//                         timer). per_op = one create + destroy.
+//                         live parent), 2 with_timeout(1 h) (a deadline
+//                         record from the TaskMemoryPool, its poller timer
+//                         scheduled; the destructor cancels it lazily and
+//                         the poller hands the record back to the pool
+//                         later: no round trip, no waiting), 3
+//                         with_timeout(0) (ends at construction, no timer).
+//                         per_op = one create + destroy.
 //
 // Run pinned to CPUs 0-9: `taskset -c 0-9 context_bench`.
 
