@@ -652,6 +652,54 @@ TEST(Poller, ManyTimersFromManyThreads) {
                 static_cast<unsigned long long>(p.stats().compactions));
 }
 
+// Owners that keep scheduling and cancelling timers later than the one the
+// poller sleeps until (a request context destroyed before its deadline) do
+// not wake it with the schedule; every kCancelsPerWake-th cancel does, so
+// the cancelled nodes are handed back while it would otherwise sleep for
+// an hour. No other wake-up source here: only those cancels can make the
+// poller reclaim them.
+TEST(Poller, ManyCancellationsWakeASleepingPoller) {
+    InlineSink sink;
+    Poller p(TaskSink::of(sink));
+    p.start();
+    TimerPool pool;
+    std::atomic<std::size_t> fired{0}, cancelled{0};
+    auto make = [&](TimePoint deadline) {
+        PooledTimer* node = pool.acquire();
+        node->pool = &pool;
+        node->fired = &fired;
+        node->cancelled = &cancelled;
+        node->timer.memo = node;
+        node->timer.callback = &PooledTimer::callback;
+        node->timer.deadline = deadline;
+        return node;
+    };
+    // The poller sleeps (no deadline), is woken by this one (an hour away)
+    // and goes to sleep until it.
+    ASSERT_TRUE(wait_until([&] { return p.stats().sleeps >= 1; }));
+    const std::uint64_t sleeps = p.stats().sleeps;
+    p.schedule(make(p.now() + 1h)->timer);
+    ASSERT_TRUE(wait_until([&] { return p.stats().sleeps > sleeps; }));
+    // Batches of kCancelsPerWake later timers, scheduled (no wake: later)
+    // and cancelled, until the poller has handed some back. The wake is
+    // best effort (an iteration racing with the batch resets the count),
+    // so keep going; without it nothing would come back for an hour.
+    const auto give_up = Clock::now() + 30s;
+    std::size_t batches = 0;
+    while (cancelled.load() == 0 && Clock::now() < give_up) {
+        for (std::size_t i = 0; i < Poller::kCancelsPerWake; ++i) {
+            PooledTimer* node = make(p.now() + 2h);
+            p.schedule(node->timer);
+            ASSERT_TRUE(p.cancel(node->timer));
+        }
+        ++batches;
+        wait_until([&] { return cancelled.load() != 0; }, 10ms);
+    }
+    EXPECT_NE(cancelled.load(), 0u) << batches << " batches";
+    EXPECT_EQ(fired.load(), 0u);
+    p.stop();
+}
+
 TEST(Poller, StopWhileSleeping) {
     InlineSink sink;
     for (int variant = 0; variant < 3; ++variant) {

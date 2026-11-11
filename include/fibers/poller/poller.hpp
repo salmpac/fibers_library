@@ -215,8 +215,23 @@ public:
         schedule(timer);
     }
 
+    // Every kCancelsPerWake-th cancel() since the poller's last iteration
+    // wakes it if it sleeps (see cancel()).
+    static constexpr std::size_t kCancelsPerWake = 256;
+
     // true: the timer will not fire; kCancelled is delivered later (see
     // timer.hpp for when the node is released). false: too late, or idle.
+    //
+    // A cancellation does not wake a sleeping poller by itself, except that
+    // every kCancelsPerWake-th one counted since the poller's last iteration
+    // does: owners that keep scheduling and cancelling timers later than
+    // the one the poller sleeps until (a context's deadline, destroyed
+    // before it fires) would otherwise pile up cancelled nodes, and the
+    // memory behind them, for as long as it sleeps. A heuristic, not a hard
+    // bound: an iteration racing with the cancels resets the count, so
+    // normally about kCancelsPerWake cancelled nodes wait in the queue of a
+    // sleeping poller, occasionally up to a few times that; in the heap,
+    // compaction keeps them to about a third of the live ones.
     bool cancel(Timer& timer) noexcept {
         std::uint32_t expected = Timer::kPending;
         if (!timer.state_.compare_exchange_strong(expected, Timer::kCancelled,
@@ -224,7 +239,10 @@ public:
                                                   std::memory_order_relaxed)) {
             return false;
         }
-        cancels_.fetch_add(1, std::memory_order_relaxed);
+        const std::size_t count = cancels_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count % kCancelsPerWake == 0) [[unlikely]] {
+            wake_if_sleeping();
+        }
         return true;
     }
 
@@ -485,6 +503,20 @@ private:
     }
 
     // ---- timers -----------------------------------------------------------
+
+    // As schedule()'s wake, without the Dekker half (nothing is lost if this
+    // misses a poller that is just going to sleep: the next batch of
+    // cancellations tries again). The CAS lets one caller per sleep pay
+    // for the wake; wake() is sticky, so a poller between S1 and its wait
+    // returns at once.
+    void wake_if_sleeping() noexcept {
+        std::int64_t sleeping = sleep_until_.load(std::memory_order_relaxed);
+        if (sleeping != kAwake &&
+            sleep_until_.compare_exchange_strong(sleeping, kAwake, std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+            backend_.wake();
+        }
+    }
 
     void drain_queue() noexcept {
         while (auto* node = queue_.pop()) {

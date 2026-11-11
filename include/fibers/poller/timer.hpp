@@ -28,7 +28,10 @@
 // pass that runs as soon as cancelled nodes make up >= 1/4 of the heap (Go's
 // runtime uses the same rule). Each compaction is O(n) and happens after
 // >= n/4 cancellations, i.e. amortised O(1) per cancel. A cancellation does not
-// wake a sleeping poller: reclamation then waits for its next iteration.
+// wake a sleeping poller: reclamation then waits for its next iteration --
+// except that every Poller::kCancelsPerWake-th cancellation since its last
+// iteration wakes it (see Poller::cancel), so that a long sleep does not
+// let cancelled nodes pile up.
 
 #include <atomic>
 #include <cstddef>
